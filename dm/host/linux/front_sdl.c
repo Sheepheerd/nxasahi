@@ -5,6 +5,7 @@
 #include "hle.h"
 #include "front.h"
 #include "vk_window.h"
+#include "vk_dev.h"
 #include <SDL3/SDL.h>
 
 typedef struct { void (*fn)(void); } guest_arg;
@@ -15,8 +16,13 @@ static void *guest_tramp(void *p) {
 }
 
 void front_run(void (*guest)(void)) {
-    if (!getenv("DM_WINDOW") || !atoi(getenv("DM_WINDOW"))) { guest(); return; }
+    // The Vulkan device exists before the game runs: guest memory is backed with device memory as the game commits it (vk_mem.c). DM_VK=0: none (headless only)
+    if (!getenv("DM_WINDOW") || !atoi(getenv("DM_WINDOW"))) {
+        if (!getenv("DM_VK") || atoi(getenv("DM_VK"))) vkd_init(0);
+        guest(); return;
+    }
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) die("SDL_Init: %s", SDL_GetError());
+    if (!vkd_init(1)) die("no Vulkan device for the window (see the vulkan lines above)");
     SDL_Window *w = SDL_CreateWindow(DM_GAME_NAME, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!w) die("SDL_CreateWindow: %s", SDL_GetError());
     if (getenv("DM_FULLSCREEN") && atoi(getenv("DM_FULLSCREEN"))) SDL_SetWindowFullscreen(w, true);

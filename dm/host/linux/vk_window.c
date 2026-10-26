@@ -5,6 +5,7 @@
 // a dark field with a bar that moves one step per presented game frame, which shows that the window, the swapchain and the frame pacing work
 #include "dm.h"
 #include "vk_window.h"
+#include "vk_dev.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
@@ -14,35 +15,18 @@
 #define VK_OK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { LOG("[RED] vulkan: %s failed (%d)", #x, (int)r_); return 0; } } while (0)
 
 static SDL_Window *g_win;
-static VkInstance g_inst; static VkSurfaceKHR g_surf; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_q; static uint32_t g_qf;
+static VkSurfaceKHR g_surf;   // the device is the shared one (vk_dev.c)
+#define g_inst g_vkd.inst
+#define g_pd g_vkd.pd
+#define g_dev g_vkd.dev
+#define g_q g_vkd.q
+#define g_qf g_vkd.qf
 static VkSwapchainKHR g_sc; static VkFormat g_fmt; static VkExtent2D g_ext; static uint32_t g_nimg; static VkImage g_img[8]; static VkImageView g_view[8];
 static VkSemaphore g_present_done[8];   // per swapchain image: the GPU finished drawing it (presentation waits on it)
 static VkCommandPool g_pool; static VkCommandBuffer g_cmd[VKW_FRAMES]; static VkSemaphore g_acquired[VKW_FRAMES]; static VkFence g_done[VKW_FRAMES];
 static _Atomic int g_active, g_resize, g_suspended;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_want, g_handed;   // newest ticket asked for / newest handed to the GPU (under g_mu)
-
-static int pick_device(void) {
-    uint32_t n = 0; vkEnumeratePhysicalDevices(g_inst, &n, NULL);
-    VkPhysicalDevice pds[8]; if (n > 8) n = 8; vkEnumeratePhysicalDevices(g_inst, &n, pds);
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, NULL);
-        VkQueueFamilyProperties qp[16]; if (nq > 16) nq = 16; vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, qp);
-        for (uint32_t f = 0; f < nq; f++) {
-            VkBool32 pres = 0; vkGetPhysicalDeviceSurfaceSupportKHR(pds[i], f, g_surf, &pres);
-            if ((qp[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) {
-                VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i], &p);
-                if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && n > 1) break;   // llvmpipe only when nothing else presents
-                g_pd = pds[i]; g_qf = f;
-                LOG("vulkan: %s (driver %u.%u.%u, API %u.%u), queue family %u", p.deviceName, VK_VERSION_MAJOR(p.driverVersion), VK_VERSION_MINOR(p.driverVersion), VK_VERSION_PATCH(p.driverVersion),
-                    VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), f);
-                return 1;
-            }
-        }
-    }
-    LOG("[RED] vulkan: no device can present to the window");
-    return 0;
-}
 
 static void swapchain_drop(void) {
     for (uint32_t i = 0; i < g_nimg; i++) { vkDestroyImageView(g_dev, g_view[i], NULL); vkDestroySemaphore(g_dev, g_present_done[i], NULL); }
@@ -64,7 +48,7 @@ static int swapchain_make(void) {
         .imageExtent = g_ext, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = cap.currentTransform, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE, .oldSwapchain = old};
     VK_OK(vkCreateSwapchainKHR(g_dev, &ci, NULL, &g_sc));
-    if (old) { vkDeviceWaitIdle(g_dev); swapchain_drop(); vkDestroySwapchainKHR(g_dev, old, NULL); }
+    if (old) { { pthread_mutex_lock(&g_vkd_qlock); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_vkd_qlock); } swapchain_drop(); vkDestroySwapchainKHR(g_dev, old, NULL); }
     g_nimg = 8; VK_OK(vkGetSwapchainImagesKHR(g_dev, g_sc, &g_nimg, g_img));
     for (uint32_t i = 0; i < g_nimg; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_img[i], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = g_fmt,
@@ -102,7 +86,7 @@ static void record(VkCommandBuffer c, uint32_t i, uint64_t ticket) {
 }
 // One present: 1 = shown, 0 = skipped (minimized, or the swapchain is being made again)
 static int present_one(uint64_t ticket, unsigned slot) {
-    if (atomic_exchange(&g_resize, 0) || !g_nimg) { vkDeviceWaitIdle(g_dev); if (!swapchain_make()) return 0; }
+    if (atomic_exchange(&g_resize, 0) || !g_nimg) { { pthread_mutex_lock(&g_vkd_qlock); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_vkd_qlock); } if (!swapchain_make()) return 0; }
     vkWaitForFences(g_dev, 1, &g_done[slot], VK_TRUE, UINT64_MAX);
     uint32_t i; VkResult r = vkAcquireNextImageKHR(g_dev, g_sc, UINT64_MAX, g_acquired[slot], VK_NULL_HANDLE, &i);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { atomic_store(&g_resize, 1); return 0; }
@@ -112,9 +96,10 @@ static int present_one(uint64_t ticket, unsigned slot) {
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_acquired[slot], .pWaitDstStageMask = &ws,
         .commandBufferCount = 1, .pCommandBuffers = &g_cmd[slot], .signalSemaphoreCount = 1, .pSignalSemaphores = &g_present_done[i]};
-    if ((r = vkQueueSubmit(g_q, 1, &si, g_done[slot])) != VK_SUCCESS) { LOG("[RED] vulkan: submit failed (%d)", (int)r); return 0; }
+    pthread_mutex_lock(&g_vkd_qlock); r = vkQueueSubmit(g_q, 1, &si, g_done[slot]); pthread_mutex_unlock(&g_vkd_qlock);
+    if (r != VK_SUCCESS) { LOG("[RED] vulkan: submit failed (%d)", (int)r); return 0; }
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_present_done[i], .swapchainCount = 1, .pSwapchains = &g_sc, .pImageIndices = &i};
-    r = vkQueuePresentKHR(g_q, &pi);
+    pthread_mutex_lock(&g_vkd_qlock); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_vkd_qlock);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&g_resize, 1);
     else if (r != VK_SUCCESS) LOG("[RED] vulkan: present failed (%d)", (int)r);
     return 1;
@@ -135,20 +120,10 @@ static void *present_thread(void *arg) {
 
 int vkw_init(SDL_Window *w) {
     g_win = w;
-    Uint32 ne = 0; const char *const *ext = SDL_Vulkan_GetInstanceExtensions(&ne);
-    if (!ext) { LOG("[RED] vulkan: SDL has no Vulkan instance extensions (%s)", SDL_GetError()); return 0; }
-    VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = DM_GAME_NAME, .pEngineName = "nxasahi", .apiVersion = VK_API_VERSION_1_3};
-    VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai, .enabledExtensionCount = ne, .ppEnabledExtensionNames = ext};
-    VK_OK(vkCreateInstance(&ii, NULL, &g_inst));
+    if (!vkd_ok() || !g_vkd.window) { LOG("[RED] vulkan: the window needs the device made for it (vkd_init(1))"); return 0; }
     if (!SDL_Vulkan_CreateSurface(w, g_inst, NULL, &g_surf)) { LOG("[RED] vulkan: no window surface (%s)", SDL_GetError()); return 0; }
-    if (!pick_device()) return 0;
-    float prio = 1;
-    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_qf, .queueCount = 1, .pQueuePriorities = &prio};
-    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .dynamicRendering = VK_TRUE};
-    const char *dext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f13, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi, .enabledExtensionCount = 1, .ppEnabledExtensionNames = dext};
-    VK_OK(vkCreateDevice(g_pd, &di, NULL, &g_dev));
-    vkGetDeviceQueue(g_dev, g_qf, 0, &g_q);
+    VkBool32 pres = 0; vkGetPhysicalDeviceSurfaceSupportKHR(g_pd, g_qf, g_surf, &pres);
+    if (!pres) { LOG("[RED] vulkan: queue family %u cannot present to the window", g_qf); return 0; }
     VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_qf};
     VK_OK(vkCreateCommandPool(g_dev, &pci, NULL, &g_pool));
     VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = VKW_FRAMES};

@@ -27,6 +27,11 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
 
+// A GPU backend whose GPU cannot read host memory directly (Linux: linux/vk_mem.c) backs these regions with GPU memory as they are committed:
+// the regions are named once, and each commit is announced before its pages open. Metal reads host memory as it is, so nothing is done by default
+__attribute__((weak)) void dm_gpu_region(void *base, size_t size) { (void)base; (void)size; }
+__attribute__((weak)) void dm_gpu_commit(void *addr, size_t size) { (void)addr; (void)size; }
+
 static void *alias_windows_thread(void *arg);
 static void mem_init_once(void) {
     size_t pg = (size_t)getpagesize();
@@ -48,6 +53,7 @@ static void mem_init_once(void) {
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
     if (!(g_alias_exposed = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_exposed))) die("alias exposure bitmap calloc");
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack);
+    dm_gpu_region(g_heap, g_heap_cap); dm_gpu_region(g_alias, g_alias_cap);
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
 }
@@ -280,7 +286,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         int rc = 0;
-        if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
+        if (size > g_heap_cur) { dm_gpu_commit(g_heap + g_heap_cur, size - g_heap_cur); rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE); }
         else if (size < g_heap_cur) rc = mprotect(g_heap + size, g_heap_cur - size, PROT_NONE);
         if (rc) die("SetHeapSize mprotect failed: req=%#zx errno=%d", size, errno);
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
@@ -439,6 +445,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             if ((mhi - hi) / 4096 != (uint64_t)alias_unmapped(hi - (uintptr_t)g_alias, mhi - hi)) mhi -= pg;
         }
         if (changed && mhi > mlo) {
+            if (commit) dm_gpu_commit((void *)mlo, mhi - mlo);
             if (mprotect((void *)mlo, mhi - mlo, commit ? PROT_READ | PROT_WRITE : PROT_NONE))
                 die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
             if (commit) dm_guest_write_prepare((void *)mlo, mhi - mlo);
