@@ -263,9 +263,15 @@ static inline int pthread_override_qos_class_end_np(pthread_override_t o) { (voi
 #ifndef ENOATTR
 #define ENOATTR ENODATA
 #endif
-#define getxattr(p, n, v, s, pos, opt) ((void)(pos), ((opt) & XATTR_NOFOLLOW) ? lgetxattr(p, n, v, s) : getxattr(p, n, v, s))
-#define setxattr(p, n, v, s, pos, opt) ((void)(pos), ((opt) & XATTR_NOFOLLOW) ? lsetxattr(p, n, v, s, 0) : setxattr(p, n, v, s, 0))
-#define removexattr(p, n, opt) (((opt) & XATTR_NOFOLLOW) ? lremovexattr(p, n) : removexattr(p, n))
+// Linux names carry a namespace (user., trusted., security., system.) and refuse others with EOPNOTSUPP; a Darwin name such as hle_fs.c's org.d2rmobile.guest-name goes in user.
+static inline const char *dm_xattr_name(const char *n, char *buf, size_t cap) {
+    if (!strncmp(n, "user.", 5) || !strncmp(n, "trusted.", 8) || !strncmp(n, "security.", 9) || !strncmp(n, "system.", 7)) return n;
+    snprintf(buf, cap, "user.%s", n); return buf;
+}
+#define DM_XN(n) dm_xattr_name(n, (char[256]){0}, 256)
+#define getxattr(p, n, v, s, pos, opt) ((void)(pos), ((opt) & XATTR_NOFOLLOW) ? lgetxattr(p, DM_XN(n), v, s) : getxattr(p, DM_XN(n), v, s))
+#define setxattr(p, n, v, s, pos, opt) ((void)(pos), ((opt) & XATTR_NOFOLLOW) ? lsetxattr(p, DM_XN(n), v, s, 0) : setxattr(p, DM_XN(n), v, s, 0))
+#define removexattr(p, n, opt) (((opt) & XATTR_NOFOLLOW) ? lremovexattr(p, DM_XN(n)) : removexattr(p, DM_XN(n)))
 
 // ---- stdio.h renamex_np: RENAME_SWAP is renameat2's RENAME_EXCHANGE ----
 #include <stdio.h>

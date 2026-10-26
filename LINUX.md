@@ -15,13 +15,30 @@ make -f Makefile.linux linux-tests            # tests of the Linux layer
 
 Modules must be rewritten for the Linux host: set `DM_THREAD_REG=tpidr_el0` when running `dm/tools/patch_nso.py` (the NSP script includes it in its rewrite cache key).
 
+## Run a game headless
+
+Keys in `~/.switch/prod.keys`; one game's NSPs in their own folder (here `~/Games/MarioWonder`), with the work folder `<id>-work` beside them. Inside `nix develop`, from the repository root:
+
+```sh
+W=~/Games/MarioWonder/010015100B514000-work
+dotnet build dm/tools/nx_extract -c Release -o $W/tools/nx_extract
+$W/tools/nx_extract/nx_extract ~/.switch/prod.keys ~/Games/MarioWonder/*.nsp - $W/data/v0      # - = no update NSP
+for m in main sdk; do DM_GAME=010015100B514000 DM_THREAD_REG=tpidr_el0 python3 dm/tools/patch_nso.py $W/data/v0/ExeFS/$m $W/build/patched_v0 $m; done
+# Fonts: the Mac tools read macOS fonts; DejaVu Sans stands in (English text; CJK needs another font)
+D=$(nix build --no-link --print-out-paths nixpkgs#dejavu_fonts)/share/fonts/truetype
+python3 dm/tools/make_ext_font.py $W/font/nintendo_ext.ttf $D/DejaVuSans-Bold.ttf && cp $D/DejaVuSans.ttf $W/font/standard.ttf
+mkdir -p $W/run/save $W/run/temp
+DM_ROMFS=$W/data/v0/RomFS DM_SAVE=$W/run/save DM_TEMP=$W/run/temp DM_FONT_DIR=$W/font DM_LANG=en-US \
+  DM_NVN_SHMAP=dm/games/010015100B514000/shader_map.tsv dm/host/dmhost $W/build/patched_v0
+```
+
 ## How the platform differences are handled
 
 | Darwin | Linux | Where |
 |---|---|---|
 | Thread slots at `tpidrro_el0 + 8*key` (the pthread TSD) | EL0 cannot set `tpidrro_el0`; the rewriter emits `mrs tpidr_el0` and the key page holds each key's offset from glibc's thread pointer, found at startup | `nso_asm.py`, `loader.c` `tp_slot_offsets` |
 | `x18` clobbered by the kernel | not clobbered; the rewrite still applies, unchanged | — |
-| Mach, libkern, dispatch, CommonCrypto, QoS, `malloc_zone`, `clonefile`, `renamex_np`, xattr options | equivalents or clean failures, force-included | `linux/darwin_compat.{h,c}`, header stand-ins in `linux/` |
+| Mach, libkern, dispatch, CommonCrypto, QoS, `malloc_zone`, `clonefile`, `renamex_np`, xattr options | equivalents or clean failures, force-included; xattr names without a Linux namespace go in `user.` | `linux/darwin_compat.{h,c}`, header stand-ins in `linux/` |
 | `uc->uc_mcontext->__ss` in signal handlers | `sigaction` installs a trampoline that hands handlers a Darwin-shaped context and writes registers back | `darwin_compat.c` `sig_trampoline` |
 | `getsectiondata` registration tables | the same `section("__DATA,…")` attributes, bracketed by a linker script | `linux/sections.ld` |
 | Mach-O assembly (`_sym`, `@PAGE`) | translated to ELF at build time; one `#ifdef` for the big-stack stub macro | `linux/darwin_asm.sed`, `hle.h` |
@@ -32,7 +49,7 @@ Modules must be rewritten for the Linux host: set `DM_THREAD_REG=tpidr_el0` when
 - [x] Thread-slot scheme verified on the real kernel and glibc across threads (`t_tpslot`)
 - [x] Darwin-shaped signal context verified: registers, SIMD, ESR/fault address, write-back of `pc` and registers (`t_sigctx`)
 - [x] Rewriter tests pass with both `DM_THREAD_REG` settings
-- [ ] **Milestone 1: a game boots headless to its frame loop** (extract and rewrite with `DM_THREAD_REG=tpidr_el0`, run `dmhost`, read the log)
+- [x] **Milestone 1: a game boots headless to its frame loop.** Super Mario Bros. Wonder 1.0.0 reaches `nnMain`, runs 3,300 frames in 60 s at 60 fps (p50 16.66 ms) and commits its saves; the only `[RED]` is upstream's conditional render. Steps: [Run a game headless](#run-a-game-headless)
 - [ ] Milestone 2: Vulkan backend behind the `mtl_*` interface of `gfx/nvn/nvn_obj.h` (now `linux/headless.c`), presenting through SDL3. The shader chain already produces SPIR-V before SPIRV-Cross
 - [ ] Milestone 3: SDL3 front end: window, keyboard and controllers (`front.h`, `dm_input.h`), audio behind the AudioUnit subset `hle_audio.c` uses
 - [ ] Packing script: a `--platform linux` that skips Xcode and the IPA
