@@ -11,22 +11,16 @@
 #include "vk_dev.h"
 #include "vk_fmt.h"
 #include "vk_window.h"
+#include "vk_draw.h"
+int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_dirty.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include <stdatomic.h>
 
 #define CB_RING 8
-typedef struct vtex {
-    uint64_t serial; struct vtex *next;
-    VkImage img; VkDeviceMemory mem; VkFormat fmt; VkImageAspectFlags aspect;
-    uint32_t w, h, d, layers, levels, samples; int target, fresh;   // fresh: still VK_IMAGE_LAYOUT_UNDEFINED
-    VkImageUsageFlags usage;
-    int gpu_owned;            // written by the GPU (a render target, cleared, a copy destination): its content is the GPU's, never reloaded from guest memory
-    int uploaded; uint64_t stamp;   // loaded from guest memory, at this dirty-tracking stamp (nvn_dirty.c)
-    uint64_t release_after;   // released: destroyed once the timeline passes this (0 = live)
-} vtex;
-static pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
+#include "vk_replay.h"
+pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
 static vtex *g_tab[4096]; static vtex *g_dead;
 static VkSemaphore g_tl; static _Atomic uint64_t g_fence;
 static VkCommandPool g_pool; static VkCommandBuffer g_cb[CB_RING]; static uint64_t g_cb_val[CB_RING]; static int g_cb_i = -1, g_open;
@@ -69,7 +63,7 @@ static void reap(void) {   // images released once the GPU is past their last us
     uint64_t done = done_value();
     for (vtex **p = &g_dead; *p;) {
         vtex *t = *p;
-        if (t->release_after <= done) { *p = t->next; vkDestroyImage(g_vkd.dev, t->img, NULL); vkFreeMemory(g_vkd.dev, t->mem, NULL); free(t); g_live--; }
+        if (t->release_after <= done) { *p = t->next; for (vkview *v = t->views, *nv; v; v = nv) { nv = v->next; vkDestroyImageView(g_vkd.dev, v->view, NULL); free(v); } vkDestroyImage(g_vkd.dev, t->img, NULL); vkFreeMemory(g_vkd.dev, t->mem, NULL); free(t); g_live--; }
         else p = &t->next;
     }
 }
@@ -289,6 +283,7 @@ void mtl_sub_begin(void) {
     vkBeginCommandBuffer(g_cb[g_cb_i], &bi); g_open = 1;
     g_up_open = 0;
     full_barrier(g_cb[g_cb_i]);   // after everything before it on the queue: the upload command buffer, earlier submissions, presents
+    vkx_sub_begin(g_cb_i, g_cb[g_cb_i]);
 }
 uint64_t mtl_sub_commit(void) {
     if (!g_on) return atomic_fetch_add(&g_fence, 1) + 1;
@@ -382,7 +377,20 @@ void mtl_exec(const uint8_t *handle) {
         }
         case OP_CLEAR_COLOR: op_clear_color(c, a); break;
         case OP_CLEAR_DS: op_clear_ds(c, a); break;
-        case OP_BIND_TEX: case OP_BIND_TEX1: op_bind_tex(h.op, a); break;
+        case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: {   // textures are made ready to sample now; the handles go to the draw state
+            p_bind_handles t1; const p_bind_handles *b = bind_rec(h.op, a, &t1);
+            if (b->n < 0 || b->n > 32) break;
+            uint64_t hh[32]; memcpy(hh, b->h, 8 * (size_t)b->n);
+            if (b->defer && b->src) memcpy(hh, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);   // BindTexturesDeferred: the handles as they are at execution
+            vkx_bind_handles(h.op == OP_BIND_SAMP ? 1 : h.op == OP_BIND_IMG ? 2 : 0, b, hh);
+            if (h.op == OP_BIND_TEX || h.op == OP_BIND_TEX1) op_bind_tex(h.op, a);
+            break;
+        }
+        case OP_BIND_PROGRAM: vkx_bind_program(((const p_bind_program *)a)->prog); break;
+        case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tb; vkx_bind_buf(0, bind_buf_rec(h.op, a, &tb)); break; }
+        case OP_BIND_SSBO: vkx_bind_buf(1, a); break;
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: vkx_set_pool(h.op == OP_SET_TEX_POOL, nvn_dpool_base(((const p_set_pool *)a)->pool, h.op == OP_SET_TEX_POOL)); break;
+        case OP_DRAW: case OP_DRAW_IDX: vkx_prepare_draw(c); break;   // the shaders and their resources; the draw itself is step 3.4c
         default: break;   // counted only, for now
         }
         if (h.size < 8) { LOG("[RED] vulkan replay: record of op %u with size %u: the stream is broken", h.op, h.size); return; }
@@ -505,3 +513,12 @@ static void shot_check(const tex_t *t) {
     pthread_mutex_unlock(&g_shot_mu);
     if (now && g_on > 0) shoot(t, atomic_load(&g_fence), path);
 }
+
+// ---- for vk_draw.c ----
+vtex *vkr_tex_sampled(const tex_t *o, VkCommandBuffer unused) { (void)unused; return tex_sampled(o); }
+int vkr_treg(int id, tex_t *t, view_t *v, int *has_v) { treg_t r; if (!treg_get(id, &r)) return 0; *t = r.t; *v = r.v; *has_v = r.has_v; return 1; }
+int vkr_sreg(int id, samp_par *p) { pthread_mutex_lock(&g_rmu); int ok = id > 0 && id < g_nsreg && g_sreg_ok[id]; if (ok) *p = g_sreg[id]; pthread_mutex_unlock(&g_rmu); return ok; }
+uint32_t vkr_pick_mem(uint32_t bits, VkMemoryPropertyFlags want) { return pick_mem(bits, want); }
+uint64_t vkr_fence_next(void) { return atomic_load(&g_fence) + 1; }
+int vkr_slot(void) { return g_cb_i; }
+VkCommandBuffer vkr_cmd(void) { return g_cb[g_cb_i]; }

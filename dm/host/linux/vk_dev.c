@@ -38,9 +38,11 @@ int vkd_init(int with_window) {
     if (!g_vkd.pd) { LOG("[RED] vulkan: no device with a graphics, compute and sparse binding queue"); return 0; }
     vkGetPhysicalDeviceMemoryProperties(g_vkd.pd, &g_vkd.mem);
     g_vkd.placed = has_ext(g_vkd.pd, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has_ext(g_vkd.pd, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+    g_vkd.shader_object = has_ext(g_vkd.pd, VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
 
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
-    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = g_vkd.placed ? &mp : NULL};
+    VkPhysicalDeviceShaderObjectFeaturesEXT so = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, .pNext = g_vkd.placed ? &mp : NULL};
+    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = g_vkd.shader_object ? (void *)&so : g_vkd.placed ? (void *)&mp : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
     vkGetPhysicalDeviceFeatures2(g_vkd.pd, &have);
@@ -50,11 +52,14 @@ int vkd_init(int with_window) {
         return 0;
     }
     if (g_vkd.placed && !mp.memoryMapPlaced) g_vkd.placed = 0;
+    if (g_vkd.shader_object && !so.shaderObject) g_vkd.shader_object = 0;
     have.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE;   // bounds checks on every access: Metal had none, and NVN has none
     // Enable what the device has: the backend checks the features it uses, and the shaders' needs differ by game
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT mp_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT, .memoryMapPlaced = VK_TRUE};
-    f13.pNext = g_vkd.placed ? &mp_on : NULL;
-    const char *dext[4]; uint32_t nd = 0;
+    VkPhysicalDeviceShaderObjectFeaturesEXT so_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, .pNext = g_vkd.placed ? &mp_on : NULL, .shaderObject = VK_TRUE};
+    f13.pNext = g_vkd.shader_object ? (void *)&so_on : g_vkd.placed ? (void *)&mp_on : NULL;
+    const char *dext[6]; uint32_t nd = 0;
+    if (g_vkd.shader_object) dext[nd++] = VK_EXT_SHADER_OBJECT_EXTENSION_NAME;
     if (with_window) dext[nd++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     if (g_vkd.placed) { dext[nd++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME; dext[nd++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME; }
     float prio = 1;
@@ -63,6 +68,8 @@ int vkd_init(int with_window) {
     VKD_OK(vkCreateDevice(g_vkd.pd, &di, NULL, &g_vkd.dev));
     vkGetDeviceQueue(g_vkd.dev, g_vkd.qf, 0, &g_vkd.q);
     if (g_vkd.placed) g_vkd.map2 = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(g_vkd.dev, "vkMapMemory2KHR");
+    if (g_vkd.shader_object) { g_vkd.create_shaders = (PFN_vkCreateShadersEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkCreateShadersEXT");
+        g_vkd.destroy_shader = (PFN_vkDestroyShaderEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkDestroyShaderEXT"); g_vkd.bind_shaders = (PFN_vkCmdBindShadersEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkCmdBindShadersEXT"); }
     g_vkd.window = with_window;
     LOG("vulkan: %s (driver %u.%u.%u, API %u.%u), queue family %u%s%s", g_vkd.props.deviceName, VK_VERSION_MAJOR(g_vkd.props.driverVersion), VK_VERSION_MINOR(g_vkd.props.driverVersion),
         VK_VERSION_PATCH(g_vkd.props.driverVersion), VK_API_VERSION_MAJOR(g_vkd.props.apiVersion), VK_API_VERSION_MINOR(g_vkd.props.apiVersion), g_vkd.qf,
