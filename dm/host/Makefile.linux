@@ -3,7 +3,7 @@
 # tables, and the Mach-O assembly translated to ELF (gen/linux/asm). Modules must be rewritten for this host: DM_THREAD_REG=tpidr_el0 (dm/tools/nso_asm.py).
 # Headless for now: the Objective-C front end and the Metal graphics are left out, and linux/headless.c stands in for what the C sources call in them.
 ifeq ($(strip $(GAME)),)
-ifneq ($(filter-out clean t_tpslot t_sigctx linux-tests t_spv_compile,$(or $(MAKECMDGOALS),dmhost)),)
+ifneq ($(filter-out clean t_tpslot t_sigctx linux-tests t_spv_compile t_placed,$(or $(MAKECMDGOALS),dmhost)),)
 $(error GAME is not set: make -f Makefile.linux GAME=<base game title ID>)
 endif
 endif
@@ -88,3 +88,12 @@ $(O)/t_spv_compile: linux/tests/t_spv_compile.c linux/spv_reflect.c linux/spv_re
 	$(CC) -O2 -g -Wall -Ilinux -o $@ linux/tests/t_spv_compile.c linux/spv_reflect.c $(shell pkg-config --libs vulkan) -lpthread
 t_spv_compile: $(O)/t_spv_compile
 	$< $(SPV)
+
+# The Vulkan backend's memory design on the device: chunks of guest memory backed in place, one sparse buffer per region (linux/tests/t_placed.c)
+$(O)/t_placed.spv.inc: linux/tests/t_placed.comp
+	@mkdir -p $(O)
+	glslangValidator -V --target-env vulkan1.3 -x -o $@ $< >/dev/null
+$(O)/t_placed: linux/tests/t_placed.c $(O)/t_placed.spv.inc
+	$(CC) -O1 -g -Wall -I$(O) -o $@ $< $(shell pkg-config --libs vulkan)
+t_placed: $(O)/t_placed
+	$<

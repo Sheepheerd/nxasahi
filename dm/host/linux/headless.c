@@ -56,7 +56,15 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img;
     static int warned; if (!warned++) LOG("[RED] [headless] texture read-back: no GPU, the destination keeps its bytes");
 }
-void mtl_pool_add(const void *mem, uint64_t size) { (void)mem; (void)size; }
+// Memory pools: counted by the alignment of their storage and size, which decides whether a Vulkan backend can map device memory over them in place (VK_EXT_map_memory_placed: 16 KiB)
+static _Atomic uint64_t g_pools, g_pool_bytes, g_pool_a16, g_pool_a16_bytes;
+void mtl_pool_add(const void *mem, uint64_t size) {
+    uint64_t n = atomic_fetch_add(&g_pools, 1) + 1; atomic_fetch_add(&g_pool_bytes, size);
+    int a16 = !(((uintptr_t)mem | size) & 0x3FFF); if (a16) { atomic_fetch_add(&g_pool_a16, 1); atomic_fetch_add(&g_pool_a16_bytes, size); }
+    if (getenv("DM_POOL_LOG")) LOG("[headless] pool %llu at %p, %#llx bytes (storage %s16 KiB aligned, size %s)", (unsigned long long)n, mem, (unsigned long long)size, ((uintptr_t)mem & 0x3FFF) ? "not " : "", (size & 0x3FFF) ? "not a 16 KiB multiple" : "a 16 KiB multiple");
+    if (n == 1 || !(n & (n - 1))) LOG("[headless] memory pools: %llu (%llu MiB); with 16 KiB aligned storage and size %llu (%llu MiB)", (unsigned long long)n, (unsigned long long)(atomic_load(&g_pool_bytes) >> 20),
+                                     (unsigned long long)atomic_load(&g_pool_a16), (unsigned long long)(atomic_load(&g_pool_a16_bytes) >> 20));
+}
 void mtl_pool_del(const void *mem) { (void)mem; }
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) { (void)addr; (void)len; *buf = NULL; *off = 0; return 0; }
