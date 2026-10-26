@@ -32,6 +32,8 @@ DM_ROMFS=$W/data/v0/RomFS DM_SAVE=$W/run/save DM_TEMP=$W/run/temp DM_FONT_DIR=$W
   DM_NVN_SHMAP=dm/games/010015100B514000/shader_map.tsv dm/host/dmhost $W/build/patched_v0
 ```
 
+Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/asahi_icd.aarch64.json` keeps the loader to the Asahi driver).
+
 ## How the platform differences are handled
 
 | Darwin | Linux | Where |
@@ -50,7 +52,11 @@ DM_ROMFS=$W/data/v0/RomFS DM_SAVE=$W/run/save DM_TEMP=$W/run/temp DM_FONT_DIR=$W
 - [x] Darwin-shaped signal context verified: registers, SIMD, ESR/fault address, write-back of `pc` and registers (`t_sigctx`)
 - [x] Rewriter tests pass with both `DM_THREAD_REG` settings
 - [x] **Milestone 1: a game boots headless to its frame loop.** Super Mario Bros. Wonder 1.0.0 reaches `nnMain`, runs 3,300 frames in 60 s at 60 fps (p50 16.66 ms) and commits its saves; the only `[RED]` is upstream's conditional render. Steps: [Run a game headless](#run-a-game-headless)
-- [ ] Milestone 2: Vulkan backend behind the `mtl_*` interface of `gfx/nvn/nvn_obj.h` (now `linux/headless.c`), presenting through SDL3. The shader chain already produces SPIR-V before SPIRV-Cross
+- [ ] Milestone 2: Vulkan backend behind the `mtl_*` interface of `gfx/nvn/nvn_obj.h` (now `linux/headless.c`)
+  - [x] Step 1: SDL3 window and Vulkan presentation (`linux/front_sdl.c`, `linux/vk_window.c`, `DM_WINDOW=1`): Wayland window, swapchain made again on resize, a present thread with FIFO; Mario Wonder presents at 60 fps on Honeykrisp (Apple M1). The picture is a placeholder (a bar that moves one step per game frame) until the draws are translated
+  - [ ] Step 2: shaders as SPIR-V (the chain's output before SPIRV-Cross) loaded as Vulkan pipelines
+  - [ ] Step 3: draws, textures, samplers and memory pools on Vulkan
+  - [ ] Step 4: performance, the pipeline cache, memory aliasing
 - [ ] Milestone 3: SDL3 front end: window, keyboard and controllers (`front.h`, `dm_input.h`), audio behind the AudioUnit subset `hle_audio.c` uses
 - [ ] Packing script: a `--platform linux` that skips Xcode and the IPA
 

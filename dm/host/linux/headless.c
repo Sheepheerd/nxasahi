@@ -1,12 +1,13 @@
 // Linux build, first milestone: the host without a window or a GPU. Stands in for what the C sources call in the Objective-C parts the Linux build leaves out:
-//   - the Metal backend of the NVN layer (nvn_mtl.m, the mtl_* calls of nvn_obj.h): command buffers are dropped, every fence completes at once, presents are
-//     counted and return; textures read back as left (no GPU wrote them). This is the seam a Vulkan backend replaces
-//   - the front end (front_mac.m): no window; front_run runs the game on this thread, as the Mac host without DM_WINDOW
+//   - the Metal backend of the NVN layer (nvn_mtl.m, the mtl_* calls of nvn_obj.h): command buffers are dropped, every fence completes at once, presents go
+//     to the window when there is one (vk_window.c) and are counted otherwise; textures read back as left (no GPU wrote them). This is the seam a Vulkan backend replaces
+//   - the front end's software keyboard (front_mac.m; the window is front_sdl.c)
 //   - the graphics dumps of the DM_CTL control file (dm_gfx_*), and libSystem's private thread_selfcounts
 // The game's CPU side runs as on the Mac: it boots, loads, and submits frames that nobody draws
 #include "dm.h"
 #include "front.h"
 #include "../gfx/nvn/nvn_obj.h"
+#include "vk_window.h"
 #include <stdatomic.h>
 
 // ---- NVN on nothing ----
@@ -23,16 +24,17 @@ int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeo
 void mtl_finish(void) {}
 void mtl_drain(void) {}
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
-    (void)t; (void)period_s; (void)crop;
+    (void)t; (void)crop;
+    if (vkw_active()) return vkw_present(period_s);   // a window (front_sdl.c, DM_WINDOW=1): the present thread shows it
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
     if (n == 1 || !(n & (n - 1))) LOG("[headless] present %llu (no window: frames are not drawn)", (unsigned long long)n);
     return n;
 }
-void mtl_present_wait(uint64_t ticket) { (void)ticket; }
+void mtl_present_wait(uint64_t ticket) { if (vkw_active()) vkw_present_wait(ticket); }
 double mtl_presented_time(uint64_t n) { (void)n; return -1; }
 uint32_t mtl_present_qos(void) { return 0; }
-int mtl_display_hz(void) { return 0; }
-int mtl_has_window(void) { return 0; }
+int mtl_display_hz(void) { return vkw_display_hz(); }
+int mtl_has_window(void) { return vkw_active(); }
 int mtl_fps_target(void) { const char *e = getenv("DM_FPS"); int v = e ? atoi(e) : 0; return v == 30 || v == 60 ? v : nvn_game_fps() == 30 ? 30 : 60; }
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 0; }
@@ -91,9 +93,7 @@ void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 
-// ---- front end: none ----
-void front_run(void (*guest)(void)) { guest(); }
-int front_screen_max_fps(void) { return 0; }
+// ---- front end: front_sdl.c; the software keyboard has no window of its own yet ----
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap;
     return -1;   // front.h: no window, nothing shown (hle_swkbd.c then answers from DM_KBD or the initial text)
