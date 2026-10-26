@@ -6,6 +6,10 @@
 #include "dm.h"
 #include "vk_window.h"
 #include "vk_dev.h"
+#include "../gfx/nvn/nvn_obj.h"
+// vk_replay.c: the image of a presented texture, made ready in c if new; and the replay's timeline
+int vkr_present_image(const tex_t *o, VkCommandBuffer c, VkImage *img, uint32_t *w, uint32_t *h, VkFormat *fmt);
+VkSemaphore vkr_timeline(void);
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
@@ -27,6 +31,8 @@ static VkCommandPool g_pool; static VkCommandBuffer g_cmd[VKW_FRAMES]; static Vk
 static _Atomic int g_active, g_resize, g_suspended;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_want, g_handed;   // newest ticket asked for / newest handed to the GPU (under g_mu)
+typedef struct { tex_t tex; int has; uint64_t wait; int crop[4]; } src_t;   // what the newest present shows (under g_mu)
+static src_t g_src;
 
 static void swapchain_drop(void) {
     for (uint32_t i = 0; i < g_nimg; i++) { vkDestroyImageView(g_dev, g_view[i], NULL); vkDestroySemaphore(g_dev, g_present_done[i], NULL); }
@@ -65,10 +71,29 @@ static void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageL
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(c, s0, s1, 0, 0, NULL, 0, NULL, 1, &b);
 }
-// The placeholder picture: a dark field and a bar across a 16:9 band that moves one step per game frame
-static void record(VkCommandBuffer c, uint32_t i, uint64_t ticket) {
+// The picture: the game's presented texture, its crop scaled to fit the window with black bars (the game's aspect kept); without one, the placeholder
+// (a dark field and a bar that moves one step per game frame)
+static int record(VkCommandBuffer c, uint32_t i, uint64_t ticket, const src_t *s) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(c, &bi);
+    VkImage src; uint32_t sw, sh; VkFormat sf;
+    if (s->has && vkr_present_image(&s->tex, c, &src, &sw, &sh, &sf)) {
+        barrier(c, g_img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange whole = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(c, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);
+        barrier(c, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        int32_t cx = s->crop[0], cy = s->crop[1], cw = s->crop[2], ch = s->crop[3];
+        if (cw <= 0 || ch <= 0 || cx < 0 || cy < 0 || (uint32_t)(cx + cw) > sw || (uint32_t)(cy + ch) > sh) { cx = 0; cy = 0; cw = (int32_t)sw; ch = (int32_t)sh; }
+        double sc = (double)g_ext.width / cw < (double)g_ext.height / ch ? (double)g_ext.width / cw : (double)g_ext.height / ch;
+        int32_t dw = (int32_t)(cw * sc), dh = (int32_t)(ch * sc), dx = ((int32_t)g_ext.width - dw) / 2, dy = ((int32_t)g_ext.height - dh) / 2;
+        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{cx, cy, 0}, {cx + cw, cy + ch, 1}},
+                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+        vkCmdBlitImage(c, src, VK_IMAGE_LAYOUT_GENERAL, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        barrier(c, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+        vkEndCommandBuffer(c);
+        return 1;
+    }
     barrier(c, g_img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     VkRenderingAttachmentInfo att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_view[i], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -83,18 +108,22 @@ static void record(VkCommandBuffer c, uint32_t i, uint64_t ticket) {
     barrier(c, g_img[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
     vkEndCommandBuffer(c);
+    return 0;
 }
 // One present: 1 = shown, 0 = skipped (minimized, or the swapchain is being made again)
-static int present_one(uint64_t ticket, unsigned slot) {
+static int present_one(uint64_t ticket, unsigned slot, const src_t *s) {
     if (atomic_exchange(&g_resize, 0) || !g_nimg) { { pthread_mutex_lock(&g_vkd_qlock); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_vkd_qlock); } if (!swapchain_make()) return 0; }
     vkWaitForFences(g_dev, 1, &g_done[slot], VK_TRUE, UINT64_MAX);
     uint32_t i; VkResult r = vkAcquireNextImageKHR(g_dev, g_sc, UINT64_MAX, g_acquired[slot], VK_NULL_HANDLE, &i);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { atomic_store(&g_resize, 1); return 0; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[RED] vulkan: acquire failed (%d)", (int)r); return 0; }
     vkResetFences(g_dev, 1, &g_done[slot]);
-    vkResetCommandBuffer(g_cmd[slot], 0); record(g_cmd[slot], i, ticket);
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_acquired[slot], .pWaitDstStageMask = &ws,
+    vkResetCommandBuffer(g_cmd[slot], 0); int game = record(g_cmd[slot], i, ticket, s);
+    // waits: the swapchain image, and for the game's picture the replay's timeline (the submissions before the present: their writes are visible to the copy)
+    VkSemaphore wsem[2] = {g_acquired[slot], vkr_timeline()}; uint64_t wval[2] = {0, s->wait};
+    VkPipelineStageFlags ws[2] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT};
+    VkTimelineSemaphoreSubmitInfo ts = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 2, .pWaitSemaphoreValues = wval};
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = game ? &ts : NULL, .waitSemaphoreCount = game ? 2 : 1, .pWaitSemaphores = wsem, .pWaitDstStageMask = ws,
         .commandBufferCount = 1, .pCommandBuffers = &g_cmd[slot], .signalSemaphoreCount = 1, .pSignalSemaphores = &g_present_done[i]};
     pthread_mutex_lock(&g_vkd_qlock); r = vkQueueSubmit(g_q, 1, &si, g_done[slot]); pthread_mutex_unlock(&g_vkd_qlock);
     if (r != VK_SUCCESS) { LOG("[RED] vulkan: submit failed (%d)", (int)r); return 0; }
@@ -110,9 +139,9 @@ static void *present_thread(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_mu);
         while (g_want == g_handed) pthread_cond_wait(&g_cv, &g_mu);
-        uint64_t t = g_want;   // the newest: presents in between are replaced
+        uint64_t t = g_want; src_t s = g_src;   // the newest: presents in between are replaced
         pthread_mutex_unlock(&g_mu);
-        if (!atomic_load(&g_suspended) && present_one(t, slot)) { slot = (slot + 1) % VKW_FRAMES; if (!shown++) LOG("vulkan: first picture shown (game present %llu)", (unsigned long long)t); }
+        if (!atomic_load(&g_suspended) && present_one(t, slot, &s)) { slot = (slot + 1) % VKW_FRAMES; if (!shown++) LOG("vulkan: first picture shown (game present %llu%s)", (unsigned long long)t, s.has ? ", the game's texture" : ", the placeholder"); }
         pthread_mutex_lock(&g_mu); g_handed = t; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
     }
     return NULL;
@@ -139,9 +168,11 @@ int vkw_init(SDL_Window *w) {
     return 1;
 }
 int vkw_active(void) { return atomic_load(&g_active); }
-uint64_t vkw_present(double period_s) {
+uint64_t vkw_present(const void *t0, uint64_t wait, const int crop[4], double period_s) {
     (void)period_s;   // FIFO shows each picture for at least one refresh; the game's own pacing (hle_nvn.c) keeps the rate
-    pthread_mutex_lock(&g_mu); uint64_t t = ++g_want; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu);
+    g_src.has = t0 != NULL; if (t0) g_src.tex = *(const tex_t *)t0; g_src.wait = wait; for (int k = 0; k < 4; k++) g_src.crop[k] = crop ? crop[k] : 0;
+    uint64_t t = ++g_want; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
     return t;
 }
 void vkw_present_wait(uint64_t ticket) {

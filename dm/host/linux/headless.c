@@ -1,6 +1,5 @@
 // Linux build, first milestone: the host without a window or a GPU. Stands in for what the C sources call in the Objective-C parts the Linux build leaves out:
-//   - the Metal backend of the NVN layer (nvn_mtl.m, the mtl_* calls of nvn_obj.h): command buffers are dropped, every fence completes at once, presents go
-//     to the window when there is one (vk_window.c) and are counted otherwise; textures read back as left (no GPU wrote them). This is the seam a Vulkan backend replaces
+//   - the rest of the Metal backend of the NVN layer (nvn_mtl.m, the mtl_* calls of nvn_obj.h): the replay, fences and presents are vk_replay.c; textures read back as left (no GPU wrote them). This is the seam a Vulkan backend replaces
 //   - the front end's software keyboard (front_mac.m; the window is front_sdl.c)
 //   - the graphics dumps of the DM_CTL control file (dm_gfx_*), and libSystem's private thread_selfcounts
 // The game's CPU side runs as on the Mac: it boots, loads, and submits frames that nobody draws
@@ -12,24 +11,8 @@
 
 // ---- NVN on nothing ----
 int nvn_game_fps(void);   // hle_nvn.c: the rate the game paces itself at
-static _Atomic uint64_t g_fence, g_presents, g_frame_no;
-void mtl_exec(const uint8_t *handle) { (void)handle; }
-void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
-void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
-void mtl_sub_begin(void) {}
-uint64_t mtl_sub_commit(void) { return atomic_fetch_add(&g_fence, 1) + 1; }
-uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
-int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
-int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
-void mtl_finish(void) {}
-void mtl_drain(void) {}
-uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
-    (void)t; (void)crop;
-    if (vkw_active()) return vkw_present(period_s);   // a window (front_sdl.c, DM_WINDOW=1): the present thread shows it
-    uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
-    if (n == 1 || !(n & (n - 1))) LOG("[headless] present %llu (no window: frames are not drawn)", (unsigned long long)n);
-    return n;
-}
+// Submissions, fences, textures and presents: vk_replay.c
+static _Atomic uint64_t g_frame_no;
 void mtl_present_wait(uint64_t ticket) { if (vkw_active()) vkw_present_wait(ticket); }
 double mtl_presented_time(uint64_t n) { (void)n; return -1; }
 uint32_t mtl_present_qos(void) { return 0; }
@@ -46,8 +29,6 @@ void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_set_depth_zero(int on) { (void)on; }
 void mtl_set_origin_lower_left(int on) { (void)on; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
-void mtl_tex_init(const tex_t *t) { (void)t; }
-void mtl_tex_release(tex_t *t) { (void)t; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
 void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
@@ -95,7 +76,6 @@ void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 
 // ---- DM_CTL graphics dumps ----
-void dm_gfx_shot_at(long k, const char *path) { (void)k; LOG("[RED] [headless] screenshot %s: no picture", path); }
 void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
