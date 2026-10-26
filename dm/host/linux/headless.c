@@ -30,8 +30,6 @@ void mtl_set_depth_zero(int on) { (void)on; }
 void mtl_set_origin_lower_left(int on) { (void)on; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
-void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
 void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img;
