@@ -1,0 +1,83 @@
+# Linux host (Asahi on Apple silicon): make -f Makefile.linux GAME=<base game title ID>, inside the dev shell (nix develop at the repository root).
+# The shared host sources build unchanged against linux/: Darwin header stand-ins and darwin_compat.c (force-included), linux/sections.ld for the registration
+# tables, and the Mach-O assembly translated to ELF (gen/linux/asm). Modules must be rewritten for this host: DM_THREAD_REG=tpidr_el0 (dm/tools/nso_asm.py).
+# Headless for now: the Objective-C front end and the Metal graphics are left out, and linux/headless.c stands in for what the C sources call in them.
+ifeq ($(strip $(GAME)),)
+ifneq ($(filter-out clean t_tpslot t_sigctx linux-tests,$(or $(MAKECMDGOALS),dmhost)),)
+$(error GAME is not set: make -f Makefile.linux GAME=<base game title ID>)
+endif
+endif
+ifneq ($(strip $(GAME)),)
+GAME_DIR := $(if $(and $(wildcard ../games/$(GAME)/game.tsv),$(if $(DM_GAMES_FIRST),,1)),../games/$(GAME),$(shell python3 ../games/game.py link $(GAME) gen/$(GAME)/profile >&2 && echo gen/$(GAME)/profile))
+endif
+GAME_H = gen/$(GAME)/game_profile.h
+O = gen/linux
+CC = clang
+CFLAGS = -O1 -g -Wall -Wno-unused-function -std=gnu11 -fblocks -D_GNU_SOURCE -Ilinux -include darwin_compat.h \
+         -I. -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I../third_party/libvpx -I../third_party/stb_vorbis
+LDFLAGS = -fuse-ld=lld -rdynamic -Wl,-T,linux/sections.ld
+LIBS = -lBlocksRuntime -lm -lpthread -ldl
+
+# hle_movie_avc.c is VideoToolbox: linux/movie_avc_none.c implements its interface. hle_bigstack.c has Mach-O inline assembly: built from its translation
+HOST_C = main.c loader.c hle.c crash.c probe.c thread.c $(filter-out hle_movie_avc.c hle_bigstack.c,$(sort $(wildcard hle_*.c)))
+GFX_C = $(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/tex/*.c))
+LINUX_C = $(sort $(wildcard linux/*.c))
+ASM = entry.S ../gfx/nvn/nvn_entry.S ../gfx/nvn/nvn_thunks.S
+OBJ = $(patsubst %.c,$(O)/%.o,$(notdir $(HOST_C) $(GFX_C))) $(patsubst linux/%.c,$(O)/linux_%.o,$(LINUX_C)) $(O)/hle_bigstack.o $(patsubst %.S,$(O)/asm_%.o,$(notdir $(ASM)))
+vpath %.c . ../gfx ../gfx/nvn ../gfx/tex
+vpath %.S . ../gfx/nvn
+
+# Mach-O → ELF assembly: linux/darwin_asm.sed
+DARWIN_ASM = sed -E -f linux/darwin_asm.sed
+
+.DEFAULT_GOAL := dmhost
+$(GAME_H): $(GAME_DIR)/game.tsv ../games/game.py FORCE
+	@python3 ../games/game.py header $(GAME) $@
+.PHONY: FORCE clean
+FORCE:
+
+$(O)/%.o: %.c $(GAME_H) $(wildcard *.h linux/*.h ../gfx/nvn/*.h ../gfx/tex/*.h)
+	@mkdir -p $(O)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(O)/linux_%.o: linux/%.c $(wildcard linux/*.h)
+	@mkdir -p $(O)
+	$(CC) $(CFLAGS) -c $< -o $@
+# Only the string literals of the inline assembly are translated, so no C identifier changes
+$(O)/hle_bigstack.c: hle_bigstack.c linux/darwin_asm.sed
+	@mkdir -p $(O)
+	sed -E -e '/^[[:space:]]*"/!b' -f linux/darwin_asm.sed $< > $@
+$(O)/hle_bigstack.o: $(O)/hle_bigstack.c $(GAME_H)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(O)/asm_%.S: %.S linux/darwin_asm.sed
+	@mkdir -p $(O)
+	$(DARWIN_ASM) $< > $@
+$(O)/asm_%.o: $(O)/asm_%.S
+	$(CC) -c $< -o $@
+
+# libvpx (VP8 / VP9 movies), as in Makefile (stb_vorbis is #included by hle_movie.c)
+VPX = ../third_party/libvpx
+VPX_SRC = $(sort $(shell find $(VPX) -name '*.c'))
+VPX_OBJ = $(patsubst $(VPX)/%.c,$(O)/vpx/%.o,$(VPX_SRC))
+$(O)/vpx/%.o: $(VPX)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -g -I$(VPX) -I$(VPX)/config -c $< -o $@
+$(O)/libvpx.a: $(VPX_OBJ)
+	rm -f $@; ar rcs $@ $^
+
+dmhost: $(OBJ) $(O)/libvpx.a linux/sections.ld
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(O)/libvpx.a $(LIBS)
+clean:
+	rm -rf $(O) dmhost
+
+# Tests of the Linux layer itself (linux/tests): the thread-slot scheme and the Darwin-shaped signal context
+.PHONY: t_tpslot t_sigctx linux-tests
+$(O)/t_tpslot: linux/tests/t_tpslot.c
+	@mkdir -p $(O)
+	$(CC) -O1 -g -Wall -o $@ $< -lpthread
+$(O)/t_sigctx: linux/tests/t_sigctx.c $(O)/linux_darwin_compat.o
+	$(CC) -O1 -g -Wall -fblocks -D_GNU_SOURCE -Ilinux -o $@ $< $(O)/linux_darwin_compat.o $(LIBS)
+t_tpslot: $(O)/t_tpslot
+	$<
+t_sigctx: $(O)/t_sigctx
+	$<
+linux-tests: t_tpslot t_sigctx

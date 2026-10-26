@@ -1,0 +1,47 @@
+# nxasahi: nxnative on Linux (Asahi, Apple silicon)
+
+A port of [nxnative](https://github.com/seedds/nxnative) to Linux on Apple silicon. The game code already runs natively on the M-series CPU and 16 KiB pages, so the port replaces the Apple platform layer around it: Darwin APIs, Mach-O details, the Cocoa front end and the Metal graphics backend.
+
+Upstream is the `upstream` remote. The port keeps the shared sources almost unchanged, so merging upstream stays cheap; Linux-only code lives in `dm/host/linux/`, `dm/host/Makefile.linux` and `flake.nix`.
+
+## Build
+
+```sh
+nix develop                                   # clang, lld, Python with lz4/capstone/fonttools, .NET 10, SPIRV-Cross, glslang, SDL3, Vulkan
+cd dm/host
+make -f Makefile.linux GAME=010015100B514000  # the host, for one game profile
+make -f Makefile.linux linux-tests            # tests of the Linux layer
+```
+
+Modules must be rewritten for the Linux host: set `DM_THREAD_REG=tpidr_el0` when running `dm/tools/patch_nso.py` (the NSP script includes it in its rewrite cache key).
+
+## How the platform differences are handled
+
+| Darwin | Linux | Where |
+|---|---|---|
+| Thread slots at `tpidrro_el0 + 8*key` (the pthread TSD) | EL0 cannot set `tpidrro_el0`; the rewriter emits `mrs tpidr_el0` and the key page holds each key's offset from glibc's thread pointer, found at startup | `nso_asm.py`, `loader.c` `tp_slot_offsets` |
+| `x18` clobbered by the kernel | not clobbered; the rewrite still applies, unchanged | — |
+| Mach, libkern, dispatch, CommonCrypto, QoS, `malloc_zone`, `clonefile`, `renamex_np`, xattr options | equivalents or clean failures, force-included | `linux/darwin_compat.{h,c}`, header stand-ins in `linux/` |
+| `uc->uc_mcontext->__ss` in signal handlers | `sigaction` installs a trampoline that hands handlers a Darwin-shaped context and writes registers back | `darwin_compat.c` `sig_trampoline` |
+| `getsectiondata` registration tables | the same `section("__DATA,…")` attributes, bracketed by a linker script | `linux/sections.ld` |
+| Mach-O assembly (`_sym`, `@PAGE`) | translated to ELF at build time; one `#ifdef` for the big-stack stub macro | `linux/darwin_asm.sed`, `hle.h` |
+
+## Status
+
+- [x] Dev shell; all host C sources build unchanged against the compat layer; the host links (headless)
+- [x] Thread-slot scheme verified on the real kernel and glibc across threads (`t_tpslot`)
+- [x] Darwin-shaped signal context verified: registers, SIMD, ESR/fault address, write-back of `pc` and registers (`t_sigctx`)
+- [x] Rewriter tests pass with both `DM_THREAD_REG` settings
+- [ ] **Milestone 1: a game boots headless to its frame loop** (extract and rewrite with `DM_THREAD_REG=tpidr_el0`, run `dmhost`, read the log)
+- [ ] Milestone 2: Vulkan backend behind the `mtl_*` interface of `gfx/nvn/nvn_obj.h` (now `linux/headless.c`), presenting through SDL3. The shader chain already produces SPIR-V before SPIRV-Cross
+- [ ] Milestone 3: SDL3 front end: window, keyboard and controllers (`front.h`, `dm_input.h`), audio behind the AudioUnit subset `hle_audio.c` uses
+- [ ] Packing script: a `--platform linux` that skips Xcode and the IPA
+
+## Known gaps (open)
+
+- **Graphics:** headless only. Fences complete at once and frames are dropped.
+- **Sparse NVN memory pools** use `vm_remap` to alias memory, which Linux can only do for file-backed memory. Mappings stay in the page table only (`hle_nvn.c` `vpool_map` logs it). Fix with memfd-backed pools.
+- **Audio output and AAC movie audio:** the AudioToolbox stand-in fails, so there is no sound (the same as the Mac host without `DM_AUDIO=1`). **H.264 movies:** no decoder (`linux/movie_avc_none.c`). VP9/Vorbis movies use the bundled libvpx/stb_vorbis.
+- **Diagnostics:** the ones that read other threads' state (watchdog backtraces, hitch dumps, Mach CPU/energy counters) report nothing.
+- **Saves:** `clonefile` is a recursive copy (reflinked where the file system supports it), so commits cost time proportional to the save's size.
+- **Signals:** the SIGTERM shutdown source blocks SIGTERM only in threads created after it starts.

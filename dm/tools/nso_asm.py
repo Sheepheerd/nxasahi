@@ -11,7 +11,11 @@ def STUR(t, n, off): return 0xF8000000 | ((off & 0x1FF) << 12) | (n << 5) | t   
 def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   # ldur xt,[xn,#off]
 def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
 def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
-def MRS_TPIDRRO(t): return 0xD53BD060 | t
+# The host's thread-slot base register. Darwin keeps the pthread TSD in tpidrro_el0; Linux zeroes tpidrro_el0 for 64-bit tasks and EL0 cannot set it,
+# so a Linux host (DM_THREAD_REG=tpidr_el0) finds its slots at offsets from glibc's thread pointer instead (loader.c tp_slot_offsets). The guest's own tpidr_el0 is a slot either way
+import os as _os
+_TP = {'tpidrro_el0': 0xD53BD060, 'tpidr_el0': 0xD53BD040}[_os.environ.get('DM_THREAD_REG', 'tpidrro_el0')]
+def MRS_TPIDRRO(t): return _TP | t
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd

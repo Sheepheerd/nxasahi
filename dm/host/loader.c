@@ -31,15 +31,50 @@ static pthread_key_t key_value(unsigned i) {
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
-    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", (unsigned long)g_key18, (unsigned long)g_keytls, (unsigned long)g_keytlr, (unsigned long)g_keygate);
 }
 
-// K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+#ifdef __linux__
+// Linux: EL0 cannot set tpidrro_el0, so the rewritten code (DM_THREAD_REG=tpidr_el0) adds the key page's offsets to glibc's thread pointer. glibc keeps a key below 32 in
+// struct pthread's specific_1stblock, and struct pthread lies right below the thread pointer (pthread_self() is its start), so each key's value word sits at the same
+// distance from tpidr_el0 on every thread. Found once by marking each key and scanning [pthread_self(), tp); the slot offsets are then negative
+#define DM_TP "tpidr_el0"
+static int64_t g_tp_off[KEY_N];
+static void tp_slot_offsets(void) {
+    uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    uint64_t *lo = (uint64_t *)pthread_self(), *hi = (uint64_t *)tp;
+    if (lo >= hi || hi - lo > 0x1000) die("unexpected glibc thread layout: pthread_self %p, tp %#llx", (void *)lo, (unsigned long long)tp);
+    for (unsigned i = 0; i < KEY_N; i++) {
+        pthread_key_t k = key_value(i);
+        void *old = pthread_getspecific(k);
+        uint64_t *hit = NULL;
+        for (int pass = 0; pass < 2; pass++) {   // two different marks: a word that holds the first by chance does not hold the second
+            uint64_t mark = 0x5d6d000000000000ull ^ ((uint64_t)i << 8) ^ (uint64_t)pass;
+            pthread_setspecific(k, (void *)mark);
+            uint64_t *found = NULL; int n = 0;
+            for (uint64_t *p = lo; p < hi; p++) if (*p == mark) { found = p; n++; }
+            if (n != 1 || (pass && found != hit)) die("thread slot of key %u not found below the thread pointer (%d matches)", i, n);
+            hit = found;
+        }
+        pthread_setspecific(k, old);
+        g_tp_off[i] = (int64_t)((uint64_t)hit - tp);
+    }
+    LOG("thread slot offsets from tpidr_el0: K18 %lld KTLS %lld KTLR %lld KGATE %lld", (long long)g_tp_off[KEY_K18], (long long)g_tp_off[KEY_KTLS], (long long)g_tp_off[KEY_KTLR], (long long)g_tp_off[KEY_KGATE]);
+}
+static uint64_t slot_off(unsigned i) { return (uint64_t)g_tp_off[i]; }
+#else
+// Darwin: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+#define DM_TP "tpidrro_el0"
+static void tp_slot_offsets(void) {}
+static uint64_t slot_off(unsigned i) { return (uint64_t)key_value(i) * 8; }
+#endif
+
+// K slot check: the key page's offset from the thread-slot base register reaches the value pthread_setspecific wrote
 static void tsd_check(void) {
     pthread_setspecific(g_key18, (void *)0x1234);
-    uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+    uint64_t base; __asm__ volatile("mrs %0, " DM_TP : "=r"(base));
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
-    if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
+    if (*(uint64_t *)((base & ~7ull) + off) != 0x1234) die("TSD layout mismatch");
     pthread_setspecific(g_key18, 0);
 }
 
@@ -242,7 +277,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = slot_off(i);
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -573,7 +608,7 @@ void load_modules(const char *dir, const char **names, int n) {
         strlcpy(m->name, names[i], sizeof m->name);
         read_layout(m, dir);
     }
-    create_keys();
+    create_keys(); tp_slot_offsets();
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];
         t = now_ns(); map_image(m, dir); tm += now_ns() - t;   // On return the code area is already read-only+execute; from here on the loader only writes data
