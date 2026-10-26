@@ -176,3 +176,78 @@ fail:
     free(ptr_sc); free(bufblock); free(nonwr); free(ptr_t); free(arr); free(root); free(isbuf); free(written);
     return NULL;
 }
+
+// ---- spvr_gl_depth ----
+enum { OpTypeVoid2 = 19, OpFunction = 54, OpFunctionEnd = 56, OpReturn = 253, OpLoad = 61, OpCompositeExtract = 81, OpCompositeInsert = 82, OpFAdd = 129, OpFMul = 133,
+       OpMemberDecorate2 = 72, DecBuiltIn = 11, BuiltInPosition = 0, SCOutput = 3 };
+uint32_t *spvr_gl_depth(const uint32_t *code, size_t words, size_t *out_words) {
+    if (words < 5 || code[0] != 0x07230203) return NULL;
+    uint32_t bound = code[3], entry = 0, t_float = 0, t_v4 = 0, t_int = 0, t_ptr_v4 = 0, c0 = 0, chalf = 0;
+    uint32_t pos_var = 0, pos_struct = 0, pos_member = UINT32_MAX, block_var = 0;
+    size_t first_fn = 0;
+    // what is there: the entry point, float / vec4 / int types, an Output vec4 pointer, constants 0 and 0.5, where Position is
+    for (size_t i = 5; i < words;) {
+        const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16; if (!n || i + n > words) return NULL;
+        if (op == OpEntryPoint && !entry) entry = w[2];
+        else if (op == OpTypeFloat && w[2] == 32 && !t_float) t_float = w[1];
+        else if (op == OpTypeInt && w[2] == 32 && !t_int) t_int = w[1];
+        else if (op == OpDecorate && w[2] == DecBuiltIn && w[3] == BuiltInPosition) pos_var = w[1];
+        else if (op == OpMemberDecorate2 && w[3] == DecBuiltIn && w[4] == BuiltInPosition) { pos_struct = w[1]; pos_member = w[2]; }
+        else if (op == OpFunction && !first_fn) first_fn = i;
+        i += n;
+    }
+    for (size_t i = 5; i < words;) {   // second pass: what depends on the first
+        const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16;
+        if (op == OpTypeVector && w[2] == t_float && w[3] == 4 && !t_v4) t_v4 = w[1];
+        else if (op == OpConstant && w[1] == t_int && w[3] == 0 && !c0) c0 = w[2];
+        else if (op == OpConstant && w[1] == t_float && w[3] == 0x3f000000u && !chalf) chalf = w[2];
+        i += n;
+    }
+    for (size_t i = 5; i < words;) {
+        const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16;
+        if (op == OpTypePointer && w[2] == SCOutput && w[3] == t_v4 && t_v4 && !t_ptr_v4) t_ptr_v4 = w[1];
+        i += n;
+    }
+    if (pos_struct && !pos_var) {   // the Output variable of the block that holds Position
+        uint32_t ptr_to_struct = 0;
+        for (size_t i = 5; i < words;) { const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16;
+            if (op == OpTypePointer && w[2] == SCOutput && w[3] == pos_struct) ptr_to_struct = w[1]; i += n; }
+        for (size_t i = 5; i < words && ptr_to_struct;) { const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16;
+            if (op == OpVariable && w[1] == ptr_to_struct && w[3] == SCOutput) block_var = w[2]; i += n; }
+    }
+    if ((!pos_var && !block_var) || !t_float || !t_v4 || !entry || !first_fn) return NULL;
+    // the declarations it needs and lacks, inserted before the first function (after every type and constant)
+    uint32_t decl[16]; size_t nd = 0;
+    if (!t_int && block_var) { t_int = bound++; decl[nd++] = (4u << 16) | OpTypeInt; decl[nd++] = t_int; decl[nd++] = 32; decl[nd++] = 1; }
+    if (!c0 && block_var) { c0 = bound++; decl[nd++] = (4u << 16) | OpConstant; decl[nd++] = t_int; decl[nd++] = c0; decl[nd++] = 0; }
+    if (!chalf) { chalf = bound++; decl[nd++] = (4u << 16) | OpConstant; decl[nd++] = t_float; decl[nd++] = chalf; decl[nd++] = 0x3f000000u; }
+    if (!t_ptr_v4) { t_ptr_v4 = bound++; decl[nd++] = (4u << 16) | OpTypePointer; decl[nd++] = t_ptr_v4; decl[nd++] = SCOutput; decl[nd++] = t_v4; }
+    uint32_t *o = malloc((words + nd + 64 * 32) * sizeof *o); if (!o) return NULL;
+    size_t k = 0, cap = words + nd + 64 * 32; int in_entry = 0, nret = 0;
+    for (size_t i = 0; i < words;) {
+        if (i == first_fn) { memcpy(o + k, decl, nd * sizeof *o); k += nd; }
+        const uint32_t *w = code + i; uint32_t op = i < 5 ? 0 : w[0] & 0xFFFF, n = i < 5 ? 5 : w[0] >> 16;
+        if (op == OpFunction) in_entry = w[2] == entry;
+        if (op == OpFunctionEnd) in_entry = 0;
+        if (op == OpReturn && in_entry) {
+            if (k + 40 > cap) { cap *= 2; uint32_t *no = realloc(o, cap * sizeof *o); if (!no) { free(o); return NULL; } o = no; }
+            uint32_t p = bound++, v = bound++, z = bound++, ww = bound++, s = bound++, hh = bound++, v2 = bound++;
+            if (block_var) { o[k++] = (5u << 16) | OpAccessChain; o[k++] = t_ptr_v4; o[k++] = p; o[k++] = block_var; o[k++] = c0;   // c0: Position is member 0 (pos_member)
+                if (pos_member != 0) { free(o); return NULL; } }
+            else p = pos_var;
+            o[k++] = (4u << 16) | OpLoad; o[k++] = t_v4; o[k++] = v; o[k++] = p;
+            o[k++] = (5u << 16) | OpCompositeExtract; o[k++] = t_float; o[k++] = z; o[k++] = v; o[k++] = 2;
+            o[k++] = (5u << 16) | OpCompositeExtract; o[k++] = t_float; o[k++] = ww; o[k++] = v; o[k++] = 3;
+            o[k++] = (5u << 16) | OpFAdd; o[k++] = t_float; o[k++] = s; o[k++] = z; o[k++] = ww;
+            o[k++] = (5u << 16) | OpFMul; o[k++] = t_float; o[k++] = hh; o[k++] = s; o[k++] = chalf;
+            o[k++] = (6u << 16) | OpCompositeInsert; o[k++] = t_v4; o[k++] = v2; o[k++] = hh; o[k++] = v; o[k++] = 2;
+            o[k++] = (3u << 16) | OpStore; o[k++] = p; o[k++] = v2;
+            nret++;
+        }
+        if (k + n > cap) { cap = cap * 2 + n; uint32_t *no = realloc(o, cap * sizeof *o); if (!no) { free(o); return NULL; } o = no; }
+        memcpy(o + k, w, n * sizeof *o); k += n; i += n;
+    }
+    if (!nret) { free(o); return NULL; }
+    o[3] = bound;
+    *out_words = k; return o;
+}

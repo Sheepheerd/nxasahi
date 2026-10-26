@@ -26,11 +26,15 @@ typedef struct { uint16_t b; char desc; char kind[12]; int reg, off; char skind[
 typedef struct vks {
     char key[17]; struct vks *next; int stage, ok;
     VkShaderEXT sh; VkShaderStageFlagBits vstage;
+    VkShaderEXT sh_gl; uint32_t *spv; size_t nspv;   // the GL-depth variant (spvr_gl_depth), made the first time it is needed from the fitted SPIR-V kept here
     int nb; vkbind bd[NBIND_MAX];
     VkBuffer c1; VkDeviceMemory c1m; uint32_t c1_len;
 } vks;
 static vks *g_sh[1024]; static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
 static VkDescriptorSetLayout g_dsl; static VkPipelineLayout g_pl_gfx, g_pl_cs;
+static int g_trace;   // the replay's pass log is on (DM_VK_PASSLOG): each draw is logged with its shaders and textures
+void vkx_trace(int on) { g_trace = on; }
+static int g_depth_zero;   // NVN depth mode: 1 near = 0 (as Vulkan), 0 near = -w (GL, NVN's default): the last stage before rasterization then takes its GL-depth variant
 static int g_init = -1; static char g_spv[1024]; static uint32_t g_per_set[5];   // descriptors of a set by type: uniform, storage, combined, storage image, texel buffer
 static uint64_t g_st_load, g_st_fail, g_st_nokey, g_st_draws, g_st_sets, g_miss[16];
 enum { M_UBO, M_TEX, M_TEXREG, M_SAMP, M_SBUF, M_IMG, M_TBUF, M_UNALIGNED, M_NOSHADER, M_OTHER };
@@ -145,6 +149,7 @@ static vks *shader_get(const prog_t *p, int st) {
                      st == 3 ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : 0,
         .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = fw * 4, .pCode = fit, .pName = "main", .setLayoutCount = st == 5 ? 1 : 5, .pSetLayouts = sets};
     VkResult r = fit ? g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &s->sh) : VK_ERROR_INITIALIZATION_FAILED;
+    if (st == 0 || st == 2 || st == 4) { s->spv = fit; s->nspv = fw; fit = NULL; }   // kept for the GL-depth variant
     free(fit); free(code); free(vkb); free(job);
     s->ok = r == VK_SUCCESS;
     if (s->ok) g_st_load++; else { g_st_fail++; LOG("[RED] vulkan draws: shader %s (stage %d) not made (%d)", key, st, (int)r); }
@@ -215,15 +220,28 @@ static VkSampler sampler_get(const samp_par *p) {
     e->next = g_samps[h & 255]; g_samps[h & 255] = e; g_nsamp++;
     return e->s;
 }
+// The components a sampled texture reads: the format's own (formats without alpha read a as 1 and so on, vk_fmt.c), then the texture's swizzle from its builder
+// (TextureBuilderSetSwizzle: 3 bits per component, 0 zero 1 one 2 R 3 G 4 B 5 A), then the view's (TextureView SetSwizzle), each picking from what the one before gives
+static VkComponentSwizzle swz_pick(int sel, const VkComponentSwizzle base[4]) {
+    switch (sel) { case 0: return VK_COMPONENT_SWIZZLE_ZERO; case 1: return VK_COMPONENT_SWIZZLE_ONE; case 2: case 3: case 4: case 5: return base[sel - 2]; default: return VK_COMPONENT_SWIZZLE_IDENTITY; }
+}
+static VkComponentMapping tex_swizzle(const tex_t *o, const view_t *v, int has_v) {
+    VkComponentMapping m; vkf_from_nvn(o->d.format, NULL, &m);
+    VkComponentSwizzle c[4] = {m.r == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_R : m.r, m.g == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_G : m.g,
+                               m.b == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_B : m.b, m.a == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_A : m.a};
+    if (o->set_swz) { VkComponentSwizzle n[4]; for (int i = 0; i < 4; i++) n[i] = swz_pick((o->swz >> (3 * i)) & 7, c); memcpy(c, n, sizeof c); }
+    if (has_v && v->set_swizzle) { VkComponentSwizzle n[4]; for (int i = 0; i < 4; i++) n[i] = swz_pick(v->swz[i], c); memcpy(c, n, sizeof c); }
+    return (VkComponentMapping){c[0], c[1], c[2], c[3]};
+}
 // A view of an image as the shader declares it (dim / arrayed from its binding), cached on the image (under g_tmu)
-static VkImageView view_get(vtex *t, const vkbind *b, const tex_t *o) {
+static VkImageView view_get(vtex *t, const vkbind *b, const tex_t *o, const view_t *ov, int has_v) {
     VkImageViewType vt = b->dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : b->dim == 4 ? (b->arr ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE)
                        : b->arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     if ((vt == VK_IMAGE_VIEW_TYPE_3D) != (t->d > 1)) return VK_NULL_HANDLE;   // the image is not of this kind
     if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && t->layers % 6) return VK_NULL_HANDLE;
-    uint32_t key = (uint32_t)vt;
+    VkComponentMapping sw = tex_swizzle(o, ov, has_v);
+    uint32_t key = (uint32_t)vt | (uint32_t)sw.r << 4 | (uint32_t)sw.g << 8 | (uint32_t)sw.b << 12 | (uint32_t)sw.a << 16;   // the view type and the components (below 0x80000000: attachment views)
     for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
-    VkComponentMapping sw; vkf_from_nvn(o->d.format, NULL, &sw);
     VkImageAspectFlags asp = t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : t->aspect;   // a depth-stencil image samples its depth
     uint32_t layers = vt == VK_IMAGE_VIEW_TYPE_2D || vt == VK_IMAGE_VIEW_TYPE_3D ? 1 : vt == VK_IMAGE_VIEW_TYPE_CUBE ? 6 : vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY ? t->layers - t->layers % 6 : t->layers;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = vt, .format = t->fmt, .components = sw,
@@ -308,7 +326,9 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             tex_t o; view_t v; int hv;
             if (!tid) g_miss[M_TEX]++;
             else if (!vkr_treg(tid, &o, &v, &hv)) g_miss[M_TEXREG]++;
-            else { vtex *t = vkr_tex_sampled(&o, VK_NULL_HANDLE); VkImageView iv = t ? view_get(t, b, &o) : VK_NULL_HANDLE; if (iv) ii[nw].imageView = iv; else g_miss[M_TEX]++; }
+            else { vtex *t = vkr_tex_sampled(&o, VK_NULL_HANDLE); VkImageView iv = t ? view_get(t, b, &o, &v, hv) : VK_NULL_HANDLE; if (iv) ii[nw].imageView = iv; else g_miss[M_TEX]++; }
+            if (g_trace) LOG("[pass]     stage %d %s binding %u slot %d: texture ID %d serial %llu %ux%u fmt %#x target %d, sampler ID %d", st, b->kind, b->b, b->reg, tid,
+                             tid && vkr_treg(tid, &o, &v, &hv) ? (unsigned long long)o.serial : 0ull, tid ? o.d.width : 0, tid ? o.d.height : 0, tid ? o.d.format : 0, tid ? o.d.target : -1, sid);
             samp_par sp; if (sid && vkr_sreg(sid, &sp)) ii[nw].sampler = sampler_get(&sp); else g_miss[M_SAMP]++;
         } else if (b->desc == 'i') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w->pImageInfo = &ii[nw];
@@ -321,6 +341,19 @@ static VkDescriptorSet stage_set(int st, vks *s) {
     if (nw) vkUpdateDescriptorSets(g_vkd.dev, (uint32_t)nw, wr, 0, NULL);
     g_st_sets++;
     return set;
+}
+// The GL-depth variant of a pre-rasterization shader, made the first time (under no lock: the submit thread alone makes them)
+static VkShaderEXT gl_variant(vks *s) {
+    if (s->sh_gl) return s->sh_gl;
+    size_t nw; uint32_t *g = s->spv ? spvr_gl_depth(s->spv, s->nspv, &nw) : NULL;
+    if (!g) { static int w; if (!w++) LOG("[RED] vulkan draws: shader %s writes no gl_Position this pass can find: drawn with GL depth uncorrected", s->key); return s->sh; }
+    VkDescriptorSetLayout sets[5] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl};
+    VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = s->vstage,
+        .nextStage = s->stage == 0 ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : VK_SHADER_STAGE_FRAGMENT_BIT,
+        .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = nw * 4, .pCode = g, .pName = "main", .setLayoutCount = 5, .pSetLayouts = sets};
+    VkResult r = g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &s->sh_gl); free(g);
+    if (r) { LOG("[RED] vulkan draws: GL-depth variant of %s not made (%d)", s->key, (int)r); s->sh_gl = VK_NULL_HANDLE; return s->sh; }
+    return s->sh_gl;
 }
 // A draw: the program's shaders and their descriptor sets (bound in c). 0 when the draw cannot be made (no program, a shader missing)
 int vkx_prepare_draw(VkCommandBuffer c) {
@@ -339,6 +372,7 @@ int vkx_prepare_draw(VkCommandBuffer c) {
     for (int st = 0; st < 5; st++) if (sets[st]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_gfx, (uint32_t)st, 1, &sets[st], 0, NULL);
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
     VkShaderEXT objs[5]; for (int st = 0; st < 5; st++) objs[st] = sh[st] ? sh[st]->sh : VK_NULL_HANDLE;
+    if (!g_depth_zero) { int last = sh[2] ? 2 : sh[4] ? 4 : 0; objs[last] = gl_variant(sh[last]); }   // GL clip depth: the stage that feeds the rasterizer maps it to Vulkan's
     g_vkd.bind_shaders(c, 5, stages, objs);
     if (getenv("DM_VK_DRAWLOG") && !(g_st_draws & (g_st_draws - 1))) {
         char m[400]; int q = 0; for (int i = 0; i < 10; i++) if (g_miss[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", MISS[i], (unsigned long long)g_miss[i]);
@@ -358,3 +392,216 @@ void vkx_bind_handles(int what, const p_bind_handles *b, const uint64_t *h) {   
     for (int k = 0; k < b->n && b->first + k < lim; k++) dst[b->first + k] = h[k];
 }
 void vkx_set_pool(int tex, int base) { if (tex) S.tex_base = base; else S.samp_base = base; }
+
+// ---- step 3.4c: the draws ----
+// The fixed-function state, as the walker records it (NVN state objects are copied by value into the records: nvn_obj.h's bit fields), set as dynamic state before each draw:
+// with shader objects every piece of graphics state is dynamic, so there are no pipelines to make or cache
+static struct {
+    blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
+    float vp[16][6]; int nvp; float dn, df; int has_dr; int sc[4], has_sc;
+    int st_vmask[2], st_wmask[2], st_ref[2];
+    float pof, pou, poc; float bc[4]; int clamp, restart;
+    va_st attr[16]; vs_st stream[16]; NVNbufferRange vbuf[16];
+    int origin_ll, depth_zero;
+} D = {.chmask = {0xffffffff}, .poly = {.cull = 0, .front = 1, .mode = 2}, .st_vmask = {0xff, 0xff}, .st_wmask = {0xff, 0xff}};
+static PFN_vkCmdSetVertexInputEXT p_vin; static PFN_vkCmdSetPolygonModeEXT p_poly; static PFN_vkCmdSetRasterizationSamplesEXT p_rs; static PFN_vkCmdSetSampleMaskEXT p_sm;
+static PFN_vkCmdSetAlphaToCoverageEnableEXT p_a2c; static PFN_vkCmdSetColorBlendEnableEXT p_cbe; static PFN_vkCmdSetColorBlendEquationEXT p_cbq; static PFN_vkCmdSetColorWriteMaskEXT p_cwm;
+static PFN_vkCmdSetLogicOpEnableEXT p_loe; static PFN_vkCmdSetDepthClampEnableEXT p_dce; static PFN_vkCmdSetAlphaToOneEnableEXT p_a21;
+static VkPhysicalDeviceFeatures g_feat; static uint64_t g_st_drawn, g_st_skip[8];
+enum { SK_QUADS, SK_FORMAT, SK_VBUF, SK_IBUF, SK_INDIRECT, SK_PREP, SK_U8 };
+static const char *const SKIP[] = {"quads", "vertex format", "vertex buffer", "index buffer", "indirect buffer", "shaders", "8-bit indices"};
+static void dyn_init(void) {
+    if (p_vin) return;
+    #define P(v, n) v = (void *)vkGetDeviceProcAddr(g_vkd.dev, n)
+    P(p_vin, "vkCmdSetVertexInputEXT"); P(p_poly, "vkCmdSetPolygonModeEXT"); P(p_rs, "vkCmdSetRasterizationSamplesEXT"); P(p_sm, "vkCmdSetSampleMaskEXT");
+    P(p_a2c, "vkCmdSetAlphaToCoverageEnableEXT"); P(p_cbe, "vkCmdSetColorBlendEnableEXT"); P(p_cbq, "vkCmdSetColorBlendEquationEXT"); P(p_cwm, "vkCmdSetColorWriteMaskEXT");
+    P(p_loe, "vkCmdSetLogicOpEnableEXT"); P(p_dce, "vkCmdSetDepthClampEnableEXT"); P(p_a21, "vkCmdSetAlphaToOneEnableEXT");
+    #undef P
+    vkGetPhysicalDeviceFeatures(g_vkd.pd, &g_feat);
+}
+void vkx_bind_state(const p_bind_state *s) {
+    switch (s->kind) {
+    case 0: { blend_st b; memcpy(&b, s->bytes, sizeof b); if (b.target < 8) D.blend[b.target] = b; break; }
+    case 1: memcpy(&D.color, s->bytes, sizeof D.color); break;
+    case 2: memcpy(&D.chmask, s->bytes, sizeof D.chmask); break;
+    case 3: memcpy(&D.ms, s->bytes, sizeof D.ms); break;
+    case 4: memcpy(&D.poly, s->bytes, sizeof D.poly); break;
+    case 5: memcpy(&D.ds, s->bytes, sizeof D.ds); break;
+    }
+}
+void vkx_viewports(const p_viewports *v) { for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(D.vp[v->first + i], v->v[i], sizeof D.vp[0]); if (v->first + v->n > D.nvp) D.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; }
+void vkx_scissor(const p_scissor *s) { D.sc[0] = s->x; D.sc[1] = s->y; D.sc[2] = s->w; D.sc[3] = s->h; D.has_sc = 1; }
+void vkx_depth_range(const p_depth_range *r) { D.dn = r->n; D.df = r->f; D.has_dr = 1; }
+void vkx_stencil(const p_stencil *s) {
+    for (int f = 0; f < 2; f++) if (s->face & (f ? 2 : 1)) { if (s->which == 0) D.st_vmask[f] = s->value_mask; else if (s->which == 1) D.st_wmask[f] = s->mask; else D.st_ref[f] = s->ref; }
+}
+void vkx_poly_offset(const p_poly_offset *p) { D.pof = p->factor; D.pou = p->units; D.poc = p->clamp; }
+void vkx_blend_color(const p_blend_color *b) { memcpy(D.bc, b->rgba, sizeof D.bc); }
+void vkx_depth_clamp(int on) { D.clamp = on; }
+void vkx_prim_restart(int on) { D.restart = on; }
+void vkx_vattr(const p_bind_vattr *a) { for (int i = 0; i < a->n && a->first + i < 16; i++) memcpy(&D.attr[a->first + i], &a->st[i], sizeof(va_st)); }
+void vkx_vstream(const p_bind_vstream *s) { for (int i = 0; i < s->n && s->first + i < 16; i++) D.stream[s->first + i] = s->st[i]; }
+void vkx_vbuf(const p_bind_vbuf *b) { for (int i = 0; i < b->n && b->first + i < 16; i++) D.vbuf[b->first + i] = b->r[i]; }
+void mtl_set_origin_lower_left(int on) { D.origin_ll = on; }
+void mtl_set_depth_zero(int on) { D.depth_zero = on; g_depth_zero = on; }
+
+static VkBlendFactor bfac(int f) {
+    switch (f) {
+    case 0x1: return VK_BLEND_FACTOR_ZERO; case 0x2: return VK_BLEND_FACTOR_ONE; case 0x3: return VK_BLEND_FACTOR_SRC_COLOR; case 0x4: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 0x5: return VK_BLEND_FACTOR_SRC_ALPHA; case 0x6: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; case 0x7: return VK_BLEND_FACTOR_DST_ALPHA; case 0x8: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 0x9: return VK_BLEND_FACTOR_DST_COLOR; case 0xA: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR; case 0xB: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    case 0x10: return VK_BLEND_FACTOR_SRC1_COLOR; case 0x11: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR; case 0x12: return VK_BLEND_FACTOR_SRC1_ALPHA; case 0x13: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    case 0x61: return VK_BLEND_FACTOR_CONSTANT_COLOR; case 0x62: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR; case 0x63: return VK_BLEND_FACTOR_CONSTANT_ALPHA; case 0x64: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+static VkBlendOp bop(int e) { return e == 2 ? VK_BLEND_OP_SUBTRACT : e == 3 ? VK_BLEND_OP_REVERSE_SUBTRACT : e == 4 ? VK_BLEND_OP_MIN : e == 5 ? VK_BLEND_OP_MAX : VK_BLEND_OP_ADD; }
+static VkCompareOp cmpop(int f) { return f >= 1 && f <= 8 ? (VkCompareOp)(f - 1) : VK_COMPARE_OP_ALWAYS; }   // NVN NEVER 1 … ALWAYS 8 = Vulkan 0 … 7
+static VkStencilOp sop(int o) { static const VkStencilOp m[9] = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_ZERO, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+    VK_STENCIL_OP_DECREMENT_AND_CLAMP, VK_STENCIL_OP_INVERT, VK_STENCIL_OP_INCREMENT_AND_WRAP, VK_STENCIL_OP_DECREMENT_AND_WRAP}; return o >= 0 && o <= 8 ? m[o] : VK_STENCIL_OP_KEEP; }
+// A vertex attribute's format: the texture table's where it has one, else the 3-component and the integer-read-as-float (scaled) layouts Metal had no texture format for
+static VkFormat vfmt(int f) {
+    switch (f) {
+    case 0x19: return VK_FORMAT_R8G8B8_UNORM; case 0x1A: return VK_FORMAT_R8G8B8_SNORM; case 0x1B: return VK_FORMAT_R8G8B8_UINT; case 0x1C: return VK_FORMAT_R8G8B8_SINT;
+    case 0x1D: return VK_FORMAT_R16G16B16_SFLOAT; case 0x1E: return VK_FORMAT_R16G16B16_UNORM; case 0x1F: return VK_FORMAT_R16G16B16_SNORM; case 0x20: return VK_FORMAT_R16G16B16_UINT;
+    case 0x21: return VK_FORMAT_R16G16B16_SINT; case 0x22: return VK_FORMAT_R32G32B32_SFLOAT; case 0x23: return VK_FORMAT_R32G32B32_UINT; case 0x24: return VK_FORMAT_R32G32B32_SINT;
+    case 0x51: return VK_FORMAT_R8_USCALED; case 0x52: return VK_FORMAT_R8_SSCALED; case 0x53: return VK_FORMAT_R16_USCALED; case 0x54: return VK_FORMAT_R16_SSCALED;
+    case 0x57: return VK_FORMAT_R8G8_USCALED; case 0x58: return VK_FORMAT_R8G8_SSCALED; case 0x59: return VK_FORMAT_R16G16_USCALED; case 0x5A: return VK_FORMAT_R16G16_SSCALED;
+    case 0x5D: return VK_FORMAT_R8G8B8_USCALED; case 0x5E: return VK_FORMAT_R8G8B8_SSCALED; case 0x5F: return VK_FORMAT_R16G16B16_USCALED; case 0x60: return VK_FORMAT_R16G16B16_SSCALED;
+    case 0x63: return VK_FORMAT_R8G8B8A8_USCALED; case 0x64: return VK_FORMAT_R8G8B8A8_SSCALED; case 0x65: return VK_FORMAT_R16G16B16A16_USCALED; case 0x66: return VK_FORMAT_R16G16B16A16_SSCALED;
+    case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32; case 0x6A: return VK_FORMAT_A2B10G10R10_SINT_PACK32; case 0x6B: return VK_FORMAT_A2B10G10R10_USCALED_PACK32; case 0x6C: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
+    default: return vkf_from_nvn(f, NULL, NULL);
+    }
+}
+static VkPrimitiveTopology topo(int p, int *ok) {
+    *ok = 1;
+    switch (p) {
+    case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST; case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST; case 2: case 3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;   // a line loop drawn open (open)
+    case 4: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; case 5: case 8: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;   // a quad strip has the triangle strip's vertex order
+    case 6: case 9: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;   // a convex polygon as a fan
+    case 0xA: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; case 0xB: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+    case 0xC: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; case 0xD: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY; case 0xE: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    default: *ok = 0; return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // quads: open
+    }
+}
+// Everything a draw needs set, then the draw (inside the render pass vk_replay.c began). ncolor / rt_h: the render pass's colour attachments and height
+static void set_state(VkCommandBuffer c, int ncolor, uint32_t rt_w, uint32_t rt_h, VkPrimitiveTopology tp, int samples) {
+    VkViewport vp[16]; int nvp = D.nvp ? D.nvp : 1;
+    for (int i = 0; i < nvp; i++) {
+        float x = D.nvp ? D.vp[i][0] : 0, y = D.nvp ? D.vp[i][1] : 0, w = D.nvp ? D.vp[i][2] : (float)rt_w, h = D.nvp ? D.vp[i][3] : (float)rt_h;
+        float n = D.has_dr ? D.dn : D.nvp ? D.vp[i][4] : 0, f = D.has_dr ? D.df : D.nvp ? D.vp[i][5] : 1;
+        if (w <= 0) w = 1;
+        // NVN upper-left origin (D3D, Metal): NDC +1 is the target's first row, Vulkan puts -1 there: a negative height flips it. Lower-left (GL) already agrees with Vulkan
+        vp[i] = D.origin_ll ? (VkViewport){x, y, w, h, n, f} : (VkViewport){x, y + h, w, -h, n, f};
+    }
+    VkRect2D sc[16];
+    for (int i = 0; i < nvp; i++) {
+        if (D.has_sc && D.sc[2] > 0 && D.sc[3] > 0) {
+            int sy = D.origin_ll ? (int)rt_h - D.sc[1] - D.sc[3] : D.sc[1];
+            sc[i] = (VkRect2D){{D.sc[0] < 0 ? 0 : D.sc[0], sy < 0 ? 0 : sy}, {(uint32_t)D.sc[2], (uint32_t)D.sc[3]}};
+        } else sc[i] = (VkRect2D){{0, 0}, {rt_w, rt_h}};
+    }
+    vkCmdSetViewportWithCount(c, (uint32_t)nvp, vp); vkCmdSetScissorWithCount(c, (uint32_t)nvp, sc);
+    vkCmdSetRasterizerDiscardEnable(c, VK_FALSE);
+    p_rs(c, (VkSampleCountFlagBits)(samples > 1 ? samples : 1));
+    VkSampleMask sm = 0xffffffff; p_sm(c, (VkSampleCountFlagBits)(samples > 1 ? samples : 1), &sm);
+    p_a2c(c, D.ms.a2c ? VK_TRUE : VK_FALSE); if (g_feat.alphaToOne) p_a21(c, VK_FALSE);
+    p_poly(c, D.poly.mode == 0 ? VK_POLYGON_MODE_POINT : D.poly.mode == 1 && g_feat.fillModeNonSolid ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL);
+    vkCmdSetLineWidth(c, 1.0f);
+    static int nocull = -1; if (nocull < 0) nocull = getenv("DM_VK_NOCULL") != NULL;   // diagnostic: no face culling
+    vkCmdSetCullMode(c, nocull ? VK_CULL_MODE_NONE : D.poly.cull == 1 ? VK_CULL_MODE_FRONT_BIT : D.poly.cull == 2 ? VK_CULL_MODE_BACK_BIT : D.poly.cull == 3 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE);
+    // Facing: with the upper-left origin the flipped viewport puts NVN's picture on the same memory rows Vulkan does, so the winding agrees as given; with GL's
+    // lower-left origin NVN judges winding in y-up window coordinates while Vulkan's framebuffer runs y down: it turns over (the title screen's final quad, culled
+    // as a back face, came out black when the upper-left case was the one turned)
+    int ccw = D.poly.front == 1; if (D.origin_ll) ccw = !ccw;
+    vkCmdSetFrontFace(c, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+    vkCmdSetDepthTestEnable(c, D.ds.dt); vkCmdSetDepthWriteEnable(c, D.ds.dw); vkCmdSetDepthCompareOp(c, cmpop((int)D.ds.df));
+    vkCmdSetDepthBoundsTestEnable(c, VK_FALSE); vkCmdSetDepthBounds(c, 0, 1);
+    vkCmdSetStencilTestEnable(c, D.ds.st);
+    vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, sop((int)D.ds.fail_f), sop((int)D.ds.zpass_f), sop((int)D.ds.zfail_f), cmpop((int)D.ds.sf_f));
+    vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, sop((int)D.ds.fail_b), sop((int)D.ds.zpass_b), sop((int)D.ds.zfail_b), cmpop((int)D.ds.sf_b));
+    for (int f = 0; f < 2; f++) { VkStencilFaceFlags fl = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+        vkCmdSetStencilCompareMask(c, fl, (uint32_t)D.st_vmask[f]); vkCmdSetStencilWriteMask(c, fl, (uint32_t)D.st_wmask[f]); vkCmdSetStencilReference(c, fl, (uint32_t)D.st_ref[f]); }
+    int bias = D.poly.offset_en != 0; vkCmdSetDepthBiasEnable(c, bias); vkCmdSetDepthBias(c, D.pou, g_feat.depthBiasClamp ? D.poc : 0, D.pof);
+    vkCmdSetPrimitiveTopology(c, tp); vkCmdSetPrimitiveRestartEnable(c, D.restart ? VK_TRUE : VK_FALSE);
+    if (g_feat.depthClamp) p_dce(c, D.clamp ? VK_TRUE : VK_FALSE);
+    if (g_feat.logicOp) p_loe(c, VK_FALSE);   // open: NVN logic ops
+    vkCmdSetBlendConstants(c, D.bc);
+    if (ncolor) {
+        VkBool32 en[8]; VkColorBlendEquationEXT eq[8]; VkColorComponentFlags wm[8];
+        for (int i = 0; i < ncolor; i++) {
+            const blend_st *b = &D.blend[i];
+            en[i] = (D.color.blend_en >> i) & 1;
+            eq[i] = (VkColorBlendEquationEXT){bfac((int)b->src_rgb), bfac((int)b->dst_rgb), bop((int)b->eq_rgb), bfac((int)b->src_a), bfac((int)b->dst_a), bop((int)b->eq_a)};
+            if (!b->src_rgb) eq[i] = (VkColorBlendEquationEXT){VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};   // never set: NVN's default
+            wm[i] = (D.chmask.mask >> (4 * i)) & 0xF;   // r 1, g 2, b 4, a 8 as Vulkan's bits
+        }
+        p_cbe(c, 0, (uint32_t)ncolor, en); p_cbq(c, 0, (uint32_t)ncolor, eq); p_cwm(c, 0, (uint32_t)ncolor, wm);
+    }
+}
+// Vertex input: the streams and attributes as bound (all of them: the shader takes what it reads), and the streams' buffers. 0 when a buffer is not in GPU-visible memory
+static int set_vertex(VkCommandBuffer c) {
+    VkVertexInputBindingDescription2EXT bd[16]; VkVertexInputAttributeDescription2EXT ad[16]; uint32_t nb = 0, na = 0; uint16_t used = 0;
+    for (int i = 0; i < 16; i++) {
+        const va_st *a = &D.attr[i]; if (!a->fmt) continue;
+        VkFormat f = vfmt((int)a->fmt); if (!f) { g_st_skip[SK_FORMAT]++; continue; }
+        ad[na++] = (VkVertexInputAttributeDescription2EXT){.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = (uint32_t)i, .binding = a->stream, .format = f, .offset = a->offset};
+        used |= (uint16_t)(1u << a->stream);
+    }
+    VkBuffer bufs[16]; VkDeviceSize offs[16], sizes[16], strides[16];
+    for (int s = 0; s < 16; s++) {
+        if (!(used >> s & 1)) continue;
+        bd[nb++] = (VkVertexInputBindingDescription2EXT){.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = (uint32_t)s, .stride = D.stream[s].stride,
+            .inputRate = D.stream[s].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1};
+    }
+    p_vin(c, nb, bd, na, ad);
+    for (int s = 0; s < 16; s++) {
+        if (!(used >> s & 1)) continue;
+        VkDeviceAddress g; VkBuffer b; VkDeviceSize o;
+        if (!D.vbuf[s].address || !vkm_lookup((const void *)(uintptr_t)D.vbuf[s].address, D.vbuf[s].size ? D.vbuf[s].size : 1, &b, &o, &g)) { g_st_skip[SK_VBUF]++; return 0; }
+        // bound one at a time (the streams used need not be contiguous)
+        bufs[0] = b; offs[0] = o; sizes[0] = D.vbuf[s].size ? D.vbuf[s].size : VK_WHOLE_SIZE; strides[0] = D.stream[s].stride;
+        vkCmdBindVertexBuffers2(c, (uint32_t)s, 1, bufs, offs, sizes, strides);
+    }
+    return 1;
+}
+static int lookup_buf(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) { VkDeviceAddress g; return addr && vkm_lookup((const void *)(uintptr_t)addr, len ? len : 1, b, o, &g); }
+// A draw record (OP_DRAW / OP_DRAW_IDX), inside the render pass; ncolor, rt_w, rt_h, samples: the pass's colour attachments, size and sample count
+void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int ncolor, uint32_t rt_w, uint32_t rt_h, int samples) {
+    if (!draw_init()) return;
+    dyn_init();
+    p_draw td; p_draw_idx ti; int ok;
+    const p_draw *d = op == OP_DRAW ? draw_rec(a, size, &td) : NULL;
+    const p_draw_idx *x = op == OP_DRAW_IDX ? draw_idx_rec(a, size, &ti) : NULL;
+    VkPrimitiveTopology tp = topo(d ? d->prim : x->prim, &ok);
+    if (!ok) { g_st_skip[SK_QUADS]++; return; }
+    if ((d ? d->mdi_cnt : x->mdi_cnt)) { g_st_skip[SK_INDIRECT]++; return; }   // open: indirect-count multi-draws
+    if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog && prog_key(S.prog, (unsigned)st, k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
+        LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
+            d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.poly.cull);
+        LOG("[pass]     viewports %d: %.1f %.1f %.1f %.1f depth %.2f..%.2f%s; scissor %s %d %d %d %d; front %s; origin %s; depth mode %s; attrs %#x", D.nvp, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3],
+            D.has_dr ? D.dn : D.vp[0][4], D.has_dr ? D.df : D.vp[0][5], D.has_dr ? " (depth range)" : "", D.has_sc ? "on" : "off", D.sc[0], D.sc[1], D.sc[2], D.sc[3], D.poly.front ? "ccw" : "cw",
+            D.origin_ll ? "lower left" : "upper left", D.depth_zero ? "zero" : "gl", ({ unsigned m = 0; for (int i = 0; i < 16; i++) if (D.attr[i].fmt) m |= 1u << i; m; }));
+        for (int i = 0; i < 16; i++) if (D.attr[i].fmt) LOG("[pass]     attr %d: NVN format %#x (vk %d) offset %u stream %u; stream stride %u divisor %u, buffer %#llx size %llu", i, (unsigned)D.attr[i].fmt, (int)vfmt((int)D.attr[i].fmt),
+            (unsigned)D.attr[i].offset, (unsigned)D.attr[i].stream, D.stream[D.attr[i].stream].stride, D.stream[D.attr[i].stream].divisor, (unsigned long long)D.vbuf[D.attr[i].stream].address, (unsigned long long)D.vbuf[D.attr[i].stream].size); }
+    if (!vkx_prepare_draw(c)) { g_st_skip[SK_PREP]++; return; }
+    set_state(c, ncolor, rt_w, rt_h, tp, samples);
+    if (!set_vertex(c)) return;
+    if (d) {
+        if (d->ind) { VkBuffer b; VkDeviceSize o; if (!lookup_buf(d->ind, 16, &b, &o)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndirect(c, b, o, 1, 16); }
+        else vkCmdDraw(c, (uint32_t)d->count, (uint32_t)(d->instances ? d->instances : 1), (uint32_t)d->first, (uint32_t)d->base_instance);
+    } else {
+        static const VkIndexType it[3] = {VK_INDEX_TYPE_UINT8_KHR, VK_INDEX_TYPE_UINT16, VK_INDEX_TYPE_UINT32};
+        if (x->itype == 0 && !g_vkd.index_u8) { g_st_skip[SK_U8]++; return; }   // open: 8-bit indices on a device without them
+        VkBuffer b; VkDeviceSize o;
+        if (!lookup_buf(x->ibuf, 1, &b, &o)) { g_st_skip[SK_IBUF]++; return; }
+        vkCmdBindIndexBuffer(c, b, o, it[x->itype > 2 ? 1 : x->itype]);
+        if (x->ind) { VkBuffer ib; VkDeviceSize io; if (!lookup_buf(x->ind, 20, &ib, &io)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndexedIndirect(c, ib, io, 1, 20); }
+        else vkCmdDrawIndexed(c, (uint32_t)x->count, (uint32_t)(x->instances ? x->instances : 1), 0, x->base_vertex, (uint32_t)x->base_instance);
+    }
+    g_st_drawn++;
+    if (getenv("DM_VK_DRAWLOG") && !(g_st_drawn & (g_st_drawn - 1))) {
+        char m[300]; int q = 0; for (int i = 0; i < 7; i++) if (g_st_skip[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", SKIP[i], (unsigned long long)g_st_skip[i]);
+        LOG("vulkan draws: %llu drawn; skipped:%s", (unsigned long long)g_st_drawn, q ? m : " none");
+    }
+}

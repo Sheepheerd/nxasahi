@@ -12,6 +12,7 @@
 #include "vk_fmt.h"
 #include "vk_window.h"
 #include "vk_draw.h"
+#include "vk_mem.h"
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_dirty.h"
@@ -58,6 +59,9 @@ static int wait_value(uint64_t v, uint64_t timeout_ns) {
 }
 
 // ---- textures ----
+static void tex_ready(VkCommandBuffer c, vtex *t);
+static VkCommandBuffer up_cb(void);
+static void rp_end(VkCommandBuffer c);
 static vtex *tex_find(uint64_t serial) { for (vtex *t = g_tab[serial % 4096]; t; t = t->next) if (t->serial == serial) return t; return NULL; }
 static void reap(void) {   // images released once the GPU is past their last use (under g_tmu)
     uint64_t done = done_value();
@@ -109,6 +113,7 @@ static vtex *tex_get(const tex_t *o) {
     t->serial = o->serial; t->fmt = f; t->aspect = asp; t->w = ci.extent.width; t->h = h; t->d = depth; t->layers = layers; t->levels = ci.mipLevels; t->samples = samples;
     t->target = tg; t->usage = use; t->fresh = 1;
     t->next = g_tab[o->serial % 4096]; g_tab[o->serial % 4096] = t; g_live++;
+    if (g_open) tex_ready(up_cb(), t);   // into GENERAL before the submission runs: never inside a render pass
     static uint64_t n; n++; if (!(n & (n - 1))) LOG("vulkan replay: %llu images made, %llu live (latest %ux%ux%u format %d, NVN %#x, target %d, %u layers, %u levels)", (unsigned long long)n,
                                                    (unsigned long long)g_live, t->w, t->h, depth, (int)f, d->format, tg, layers, t->levels);
     return t;
@@ -287,6 +292,7 @@ void mtl_sub_begin(void) {
 }
 uint64_t mtl_sub_commit(void) {
     if (!g_on) return atomic_fetch_add(&g_fence, 1) + 1;
+    rp_end(g_cb[g_cb_i]);
     VkCommandBuffer c = g_cb[g_cb_i]; vkEndCommandBuffer(c); g_open = 0;
     VkCommandBuffer cbs[2]; uint32_t ncb = 0;   // the uploads first, then the submission (which starts with a full barrier)
     if (g_up_open) { vkEndCommandBuffer(g_up[g_cb_i]); g_up_open = 0; cbs[ncb++] = g_up[g_cb_i]; }
@@ -327,7 +333,63 @@ static VkImageSubresourceRange view_range(const vtex *t, const view_t *v, int ha
     if (r.baseArrayLayer + r.layerCount > t->layers) r.layerCount = t->layers - r.baseArrayLayer;
     return r;
 }
+
+// ---- render passes over the bound render targets (step 3.4c) ----
+// Dynamic rendering begins at the first draw after the targets were set, and ends before anything that cannot be inside it (a clear, a target change, a barrier, the
+// submission's end), each end followed by a full barrier so the next pass or a sampling sees what was drawn
+static int g_rp_on, g_rp_ncolor, g_rp_samples; static uint32_t g_rp_w, g_rp_h; static uint64_t g_passes; static uint64_t g_ub_updates; static int g_passlog;
+static VkImageView att_view(vtex *t, uint32_t level, uint32_t layer, VkImageAspectFlags asp) {   // under g_tmu
+    uint32_t key = 0x80000000u | (level & 0xff) | (layer & 0xffff) << 8;
+    for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = t->d > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = t->fmt,
+        .subresourceRange = {asp, level, 1, t->d > 1 ? 0 : layer, 1}};
+    if (t->d > 1) { LOG("[RED] vulkan replay: a 3D render target is not rendered yet"); return VK_NULL_HANDLE; }
+    vkview *v = calloc(1, sizeof *v); v->key = key;
+    if (vkCreateImageView(g_vkd.dev, &vi, NULL, &v->view)) { free(v); return VK_NULL_HANDLE; }
+    v->next = t->views; t->views = v; return v->view;
+}
+static void rp_end(VkCommandBuffer c) { if (!g_rp_on) return; vkCmdEndRendering(c); g_rp_on = 0; full_barrier(c); }
+static int rp_begin(VkCommandBuffer c) {
+    if (g_rp_on) return 1;
+    VkRenderingAttachmentInfo ca[8], da, sa; int nc = 0, have = 0, samples = 1; uint32_t w = UINT32_MAX, h = UINT32_MAX;
+    memset(ca, 0, sizeof ca); memset(&da, 0, sizeof da); memset(&sa, 0, sizeof sa);
+    pthread_mutex_lock(&g_tmu);
+    for (int i = 0; i < g_rt_n; i++) {
+        ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        nc = i + 1;
+        vtex *t = g_rt[i] ? tex_get(g_rt[i]) : NULL;
+        if (!t || !(t->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) continue;
+        VkImageSubresourceRange r = view_range(t, &g_rt_view[i], g_rt_has_view[i], VK_IMAGE_ASPECT_COLOR_BIT);
+        ca[i].imageView = att_view(t, r.baseMipLevel, r.baseArrayLayer, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!ca[i].imageView) continue;
+        t->gpu_owned = 1; have = 1; samples = (int)t->samples;
+        uint32_t lw = t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, lh = t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1;
+        if (lw < w) w = lw; if (lh < h) h = lh;
+    }
+    int has_d = 0, has_s = 0;
+    vtex *dt = g_rt_depth ? tex_get(g_rt_depth) : NULL;
+    if (dt && (dt->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        VkImageSubresourceRange r = view_range(dt, &g_rt_dview, g_rt_has_dview, dt->aspect);
+        VkImageView v = att_view(dt, r.baseMipLevel, r.baseArrayLayer, dt->aspect);
+        if (v) {
+            has_d = (dt->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0; has_s = (dt->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+            da = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            sa = da; dt->gpu_owned = 1; have = 1; if (!nc) samples = (int)dt->samples;
+            uint32_t lw = dt->w >> r.baseMipLevel ? dt->w >> r.baseMipLevel : 1, lh = dt->h >> r.baseMipLevel ? dt->h >> r.baseMipLevel : 1;
+            if (lw < w) w = lw; if (lh < h) h = lh;
+        }
+    }
+    pthread_mutex_unlock(&g_tmu);
+    if (!have) return 0;
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1, .colorAttachmentCount = (uint32_t)nc, .pColorAttachments = ca,
+        .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
+    vkCmdBeginRendering(c, &ri);
+    g_rp_on = 1; g_rp_ncolor = nc; g_rp_w = w; g_rp_h = h; g_rp_samples = samples; g_passes++;
+    if (g_passlog) LOG("[pass] %llu: %ux%u, %d colour (first serial %llu), depth %s", (unsigned long long)g_passes, w, h, nc, g_rt[0] ? (unsigned long long)g_rt[0]->serial : 0ull, has_d || has_s ? "yes" : "no");
+    return 1;
+}
 static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
+    rp_end(c);
     if (p->index < 0 || p->index >= g_rt_n || !g_rt[p->index]) return;
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt[p->index]);
@@ -341,6 +403,7 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
     pthread_mutex_unlock(&g_tmu);
 }
 static void op_clear_ds(VkCommandBuffer c, const p_clear_ds *p) {
+    rp_end(c);
     if (!g_rt_depth) return;
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt_depth);
@@ -370,6 +433,7 @@ void mtl_exec(const uint8_t *handle) {
         case OP_JUMP: memcpy(&p, a, 8); continue;
         case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (nret == 16) { LOG("[RED] vulkan replay: command buffer calls nested deeper than 16"); return; } ret[nret++] = p + h.size; p = t; continue; }
         case OP_SET_RT: {
+            rp_end(c);
             const p_set_rt *s = a; g_rt_n = s->n < 0 ? 0 : s->n > 8 ? 8 : s->n;
             for (int i = 0; i < 8; i++) { g_rt[i] = i < g_rt_n ? s->color[i] : NULL; g_rt_view[i] = s->cview[i]; g_rt_has_view[i] = s->has_cview[i]; }
             g_rt_depth = s->depth; g_rt_dview = s->dview; g_rt_has_dview = s->has_dview;
@@ -390,7 +454,36 @@ void mtl_exec(const uint8_t *handle) {
         case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tb; vkx_bind_buf(0, bind_buf_rec(h.op, a, &tb)); break; }
         case OP_BIND_SSBO: vkx_bind_buf(1, a); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: vkx_set_pool(h.op == OP_SET_TEX_POOL, nvn_dpool_base(((const p_set_pool *)a)->pool, h.op == OP_SET_TEX_POOL)); break;
-        case OP_DRAW: case OP_DRAW_IDX: vkx_prepare_draw(c); break;   // the shaders and their resources; the draw itself is step 3.4c
+        case OP_DRAW: case OP_DRAW_IDX: if (rp_begin(c)) vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples); break;
+        case OP_BARRIER: rp_end(c); full_barrier(c); break;
+        case OP_UPDATE_UB: {   // {dst, n, data}: the bytes written into the buffer at this point of the GPU's work (UpdateUniformBuffer)
+            uint64_t dst, n; memcpy(&dst, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
+            VkBuffer b; VkDeviceSize off; VkDeviceAddress g;
+            if (n && n <= 65536 && !(n & 3) && !(dst & 3) && vkm_lookup((const void *)(uintptr_t)dst, n, &b, &off, &g)) {
+                rp_end(c); vkCmdUpdateBuffer(c, b, off, n, (const uint8_t *)a + 16); full_barrier(c); g_ub_updates++;
+            } else { static int w; if (!w++) LOG("[RED] vulkan replay: uniform update of %llu bytes at %#llx not made (not 4-aligned or not in GPU-visible memory)", (unsigned long long)n, (unsigned long long)dst); }
+            break;
+        }
+        case OP_COPY_B2B: {   // {src, dst, n}: CopyBufferToBuffer
+            uint64_t src, dst, n; memcpy(&src, a, 8); memcpy(&dst, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
+            VkBuffer sb, db; VkDeviceSize so, dof; VkDeviceAddress g;
+            if (n && vkm_lookup((const void *)(uintptr_t)src, n, &sb, &so, &g) && vkm_lookup((const void *)(uintptr_t)dst, n, &db, &dof, &g)) {
+                rp_end(c); VkBufferCopy bc = {so, dof, n}; vkCmdCopyBuffer(c, sb, db, 1, &bc); full_barrier(c);
+            } else { static int w; if (!w++) LOG("[RED] vulkan replay: buffer copy of %llu bytes %#llx -> %#llx not made (not in GPU-visible memory)", (unsigned long long)n, (unsigned long long)src, (unsigned long long)dst); }
+            break;
+        }
+        case OP_BIND_STATE: vkx_bind_state(a); break;
+        case OP_VIEWPORTS: vkx_viewports(a); break;
+        case OP_SCISSOR: vkx_scissor(a); break;
+        case OP_DEPTH_RANGE: vkx_depth_range(a); break;
+        case OP_STENCIL: vkx_stencil(a); break;
+        case OP_POLY_OFFSET: vkx_poly_offset(a); break;
+        case OP_BLEND_COLOR: vkx_blend_color(a); break;
+        case OP_DEPTH_CLAMP: vkx_depth_clamp(((const p_depth_clamp *)a)->on); break;
+        case OP_PRIM_RESTART: vkx_prim_restart((int)((const p_prim_restart *)a)->on); break;
+        case OP_BIND_VATTR: vkx_vattr(a); break;
+        case OP_BIND_VSTREAM: vkx_vstream(a); break;
+        case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tv; vkx_vbuf(vbuf_rec(h.op, a, &tv)); break; }
         default: break;   // counted only, for now
         }
         if (h.size < 8) { LOG("[RED] vulkan replay: record of op %u with size %u: the stream is broken", h.op, h.size); return; }
@@ -509,9 +602,22 @@ static void shot_check(const tex_t *t) {
     if (!env) { env = 1; const char *e = getenv("DM_SHOT"); char *c; long k; if (e && (k = strtol(e, &c, 10)) > 0 && *c == ':') dm_gfx_shot_at(k, c + 1); }
     pthread_mutex_lock(&g_shot_mu);
     g_presents++;
+    { static long pk = -1; if (pk < 0) { const char *e = getenv("DM_VK_PASSLOG"); pk = e ? atol(e) : 0; } g_passlog = pk > 0 && (long)g_presents + 1 == pk; vkx_trace(g_passlog); if (g_passlog) LOG("[pass] present %llu begins", (unsigned long long)g_presents + 1); }
     int now = g_shot_k && (long)g_presents >= g_shot_k; char path[1024]; if (now) { snprintf(path, sizeof path, "%s", g_shot_path); g_shot_k = 0; }
     pthread_mutex_unlock(&g_shot_mu);
     if (now && g_on > 0) shoot(t, atomic_load(&g_fence), path);
+    // DM_VK_RTDUMP=<present>:<dir>: at that present, every colour image the GPU rendered (render targets), as <dir>/rt_<serial>_<w>x<h>.png
+    static long rtk = -1; static char rtdir[900];
+    if (rtk < 0) { const char *e = getenv("DM_VK_RTDUMP"); char *c; rtk = 0; if (e && (rtk = strtol(e, &c, 10)) > 0 && *c == ':') snprintf(rtdir, sizeof rtdir, "%s", c + 1); else rtk = 0; }
+    if (rtk > 0 && (long)g_presents == rtk && g_on > 0) {
+        vtex *all[256]; int na = 0;
+        pthread_mutex_lock(&g_tmu); for (int i = 0; i < 4096 && na < 256; i++) for (vtex *t = g_tab[i]; t && na < 256; t = t->next) if (t->gpu_owned && (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) all[na++] = t; pthread_mutex_unlock(&g_tmu);
+        for (int i = 0; i < na; i++) { char p[1100]; snprintf(p, sizeof p, "%s/rt_%06llu_%ux%u_f%d.png", rtdir, (unsigned long long)all[i]->serial, all[i]->w, all[i]->h, (int)all[i]->fmt); shoot_vt(all[i], atomic_load(&g_fence), p); }
+    }
+    // DM_SHOT_EVERY=<n>:<dir>: every n-th presented frame as <dir>/present<number>.png (at most 40)
+    static long every = -1; static char edir[900]; static int shots;
+    if (every < 0) { const char *e = getenv("DM_SHOT_EVERY"); char *c; every = 0; if (e && (every = strtol(e, &c, 10)) > 0 && *c == ':') snprintf(edir, sizeof edir, "%s", c + 1); else every = 0; }
+    if (every > 0 && g_on > 0 && shots < 40 && g_presents % (uint64_t)every == 0) { char p[1000]; snprintf(p, sizeof p, "%s/present%05llu.png", edir, (unsigned long long)g_presents); shots++; shoot(t, atomic_load(&g_fence), p); }
 }
 
 // ---- for vk_draw.c ----

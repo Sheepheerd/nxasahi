@@ -26,8 +26,6 @@ int mtl_snap_on(void) { return 0; }
 uint64_t mtl_snap_acquire_wait(void) { return 0; }
 void mtl_set_frame(uint64_t f) { atomic_store(&g_frame_no, f); }
 void mtl_set_tex_pool_n(int n) { (void)n; }
-void mtl_set_depth_zero(int on) { (void)on; }
-void mtl_set_origin_lower_left(int on) { (void)on; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
 void mtl_prog_release(prog_t *p) { (void)p; }

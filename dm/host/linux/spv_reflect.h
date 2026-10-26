@@ -22,3 +22,7 @@ typedef struct { int float64, interlock, vertex_stores; } spvr_device;
 #define SPVR_FIT_NONWRITABLE 4 // vertex-stage storage buffers that nothing writes decorated NonWritable
 #define SPVR_FIT_STORES 8      // a vertex-stage storage buffer is written, which the device cannot do (not changed: the caller must not use the shader as is)
 uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, size_t *out_words, unsigned *changes);
+
+// GL's clip depth (NVN_DEPTH_MODE_NEAR_IS_MINUS_W, NVN's default) in a module for Vulkan's: before each return of the entry point, gl_Position.z = (z + w) / 2, so -w..w
+// becomes 0..w. For the last stage before rasterization (vertex, or geometry / tessellation evaluation). Returns a malloc'd copy, or NULL when the module writes no Position
+uint32_t *spvr_gl_depth(const uint32_t *code, size_t words, size_t *out_words);
