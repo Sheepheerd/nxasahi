@@ -3,7 +3,7 @@
 # tables, and the Mach-O assembly translated to ELF (gen/linux/asm). Modules must be rewritten for this host: DM_THREAD_REG=tpidr_el0 (dm/tools/nso_asm.py).
 # Headless for now: the Objective-C front end and the Metal graphics are left out, and linux/headless.c stands in for what the C sources call in them.
 ifeq ($(strip $(GAME)),)
-ifneq ($(filter-out clean t_tpslot t_sigctx linux-tests,$(or $(MAKECMDGOALS),dmhost)),)
+ifneq ($(filter-out clean t_tpslot t_sigctx linux-tests t_spv_compile,$(or $(MAKECMDGOALS),dmhost)),)
 $(error GAME is not set: make -f Makefile.linux GAME=<base game title ID>)
 endif
 endif
@@ -81,3 +81,10 @@ t_tpslot: $(O)/t_tpslot
 t_sigctx: $(O)/t_sigctx
 	$<
 linux-tests: t_tpslot t_sigctx
+
+# Compile every translated shader on the GPU (dm/gfx/tools/dmsh_spv.py output): make -f Makefile.linux t_spv_compile SPV=<dir>/spv-<chain version>
+$(O)/t_spv_compile: linux/tests/t_spv_compile.c linux/spv_reflect.c linux/spv_reflect.h
+	@mkdir -p $(O)
+	$(CC) -O2 -g -Wall -Ilinux -o $@ linux/tests/t_spv_compile.c linux/spv_reflect.c $(shell pkg-config --libs vulkan) -lpthread
+t_spv_compile: $(O)/t_spv_compile
+	$< $(SPV)

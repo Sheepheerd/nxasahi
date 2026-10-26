@@ -54,7 +54,8 @@ Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/
 - [x] **Milestone 1: a game boots headless to its frame loop.** Super Mario Bros. Wonder 1.0.0 reaches `nnMain`, runs 3,300 frames in 60 s at 60 fps (p50 16.66 ms) and commits its saves; the only `[RED]` is upstream's conditional render. Steps: [Run a game headless](#run-a-game-headless)
 - [ ] Milestone 2: Vulkan backend behind the `mtl_*` interface of `gfx/nvn/nvn_obj.h` (now `linux/headless.c`)
   - [x] Step 1: SDL3 window and Vulkan presentation (`linux/front_sdl.c`, `linux/vk_window.c`, `DM_WINDOW=1`): Wayland window, swapchain made again on resize, a present thread with FIFO; Mario Wonder presents at 60 fps on Honeykrisp (Apple M1). The picture is a placeholder (a bar that moves one step per game frame) until the draws are translated
-  - [ ] Step 2: shaders as SPIR-V (the chain's output before SPIRV-Cross) loaded as Vulkan pipelines
+  - [x] Step 2a: the game's shaders as SPIR-V on Linux (`dm/gfx/tools/dmsh_spv.py`: the unmodified Metal chain with the pinned translator through dotnet, stopped before SPIRV-Cross, so the chain version is unchanged). Mario Wonder 1.0.0: 12,811 of 12,811 translated, all pass `spirv-val`, and all compile on Honeykrisp one stage at a time (`VK_EXT_shader_object`, `make -f Makefile.linux t_spv_compile SPV=…`), clean under the validation layer but for the two gaps below. At load, `linux/spv_reflect.c` reflects each module (descriptor layouts, push constants) and fits it to the device (`spvr_fit`)
+  - [ ] Step 2b: the shaders as pipelines in the host (with step 3)
   - [ ] Step 3: draws, textures, samplers and memory pools on Vulkan
   - [ ] Step 4: performance, the pipeline cache, memory aliasing
 - [ ] Milestone 3: SDL3 front end: window, keyboard and controllers (`front.h`, `dm_input.h`), audio behind the AudioUnit subset `hle_audio.c` uses
@@ -62,6 +63,8 @@ Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/
 
 ## Known gaps (open)
 
+- **Shaders on the M1:** 11 of Mario Wonder's vertex shaders write a storage buffer, which Honeykrisp does not allow from the vertex stage (`vertexPipelineStoresAndAtomics`; Metal does). Every vertex shader declares 8 clip distances and 1 cull distance (the translator's `gl_PerVertex`), one over the M1's combined limit of 8; the cull distance is never written and the driver compiles them, but the validation layer reports it.
+- **Shader tables per version:** the profile's shader tables cover 1.0.0 and 1.2.1 together. With only one version's NSP, make a derived profile with that version's tables (the split's output) and point the tools at it with `DM_GAMES_DIR` and `DM_GAMES_FIRST=1`.
 - **Graphics:** headless only. Fences complete at once and frames are dropped.
 - **Sparse NVN memory pools** use `vm_remap` to alias memory, which Linux can only do for file-backed memory. Mappings stay in the page table only (`hle_nvn.c` `vpool_map` logs it). Fix with memfd-backed pools.
 - **Audio output and AAC movie audio:** the AudioToolbox stand-in fails, so there is no sound (the same as the Mac host without `DM_AUDIO=1`). **H.264 movies:** no decoder (`linux/movie_avc_none.c`). VP9/Vorbis movies use the bundled libvpx/stb_vorbis.
