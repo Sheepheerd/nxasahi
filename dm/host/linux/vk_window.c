@@ -6,6 +6,7 @@
 #include "dm.h"
 #include "vk_window.h"
 #include "vk_dev.h"
+int vkx_origin_ll(void);   // vk_draw.c
 #include "../gfx/nvn/nvn_obj.h"
 // vk_replay.c: the image of a presented texture, made ready in c if new; and the replay's timeline
 int vkr_present_image(const tex_t *o, VkCommandBuffer c, VkImage *img, uint32_t *w, uint32_t *h, VkFormat *fmt);
@@ -89,6 +90,7 @@ static int record(VkCommandBuffer c, uint32_t i, uint64_t ticket, const src_t *s
         int32_t dw = (int32_t)(cw * sc), dh = (int32_t)(ch * sc), dx = ((int32_t)g_ext.width - dw) / 2, dy = ((int32_t)g_ext.height - dh) / 2;
         VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{cx, cy, 0}, {cx + cw, cy + ch, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+        if (vkx_origin_ll()) { bl.dstOffsets[0].y = dy + dh; bl.dstOffsets[1].y = dy; }   // lower-left origin: the game's image is bottom-up (Pokémon: Let's Go), shown flipped
         vkCmdBlitImage(c, src, VK_IMAGE_LAYOUT_GENERAL, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
         barrier(c, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
         vkEndCommandBuffer(c);

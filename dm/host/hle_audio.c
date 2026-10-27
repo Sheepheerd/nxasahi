@@ -424,6 +424,11 @@ HLE_FORCE("_ZN2nn5audio17SetAudioOutVolumeEPNS0_8AudioOutEf", "output volume; a 
 HLE_FORCE("_ZN2nn5audio17GetAudioOutVolumeEPKNS0_8AudioOutE", "output volume", float, h_au_GetVol, const void *g) {
     uint32_t b = atomic_load_explicit(&ao(g)->vol, memory_order_relaxed); float v; memcpy(&v, &b, 4); return v;
 }
+// The console's automatic output-volume tuning, a setting of the audio device service (audren:u's IAudioDevice), which the SDK opens by itself for it: the host serves no such
+// session (Pokémon FireRed, SDK 20.5, sets it at boot: abort 0xe15 in CreateAudioRendererManagerByHipc). The host has no such tuning; the setting is kept for the getter
+static _Atomic int g_au_autotune;
+HLE_FORCE("_ZN2nn5audio40SetDeviceOutputVolumeAutoTuneModeEnabledEb", "automatic output-volume tuning: kept, no effect on the host", void, h_au_SetAutoTune, bool on) { g_au_autotune = on; }
+HLE_FORCE("_ZN2nn5audio39IsDeviceOutputVolumeAutoTuneModeEnabledEv", "automatic output-volume tuning: as last set", bool, h_au_IsAutoTune, void) { return g_au_autotune; }
 
 HLE_FORCE("_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm", "buffer description; written into the first 24 bytes of the guest struct", void, h_au_SetBuf, gbuf *b, void *p, uint64_t cap, uint64_t size) {
     b->ptr = p; b->cap = cap; b->size = size;

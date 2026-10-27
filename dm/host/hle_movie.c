@@ -125,11 +125,13 @@ static int ev_ok(const void *p) {
 // (SendOutputBufferEventAvailableToClient and the others, subsdk0+0x1feb0 in DRAGON QUEST XI S). That game's movie player registers its struct before it fills it (main+0x39edab0, right after
 // the Decoder constructor: leftover values such as 0xe00000010, sometimes 0 or a stray pointer), so the entry is read at signal time; when it is not an event (any longer), the event it held
 // at registration is used, if any
+static int md_trace_all(void);
 static void md_event(mdec_t *d, int i) {   // 0 input 1 output 2 format 3 error
     void *p = NULL; vm_size_t got = 0;
     if (d->evc && (vm_read_overwrite(mach_task_self(), (vm_address_t)&d->evc[i], sizeof p, (vm_address_t)&p, &got) != KERN_SUCCESS || got != sizeof p)) p = NULL;
     void *live = p;
     if (!p || !ev_ok(p)) p = d->ev[i];
+    if (md_trace_all()) LOG("[movie] decoder %p event %d: entry %p (%s), registered %p → %s", (void *)d, i, live, live && ev_ok(live) ? "readable" : "not readable", d->ev[i], p ? "signalled" : "not signalled");
     if (p) G.signal(p);
     else if (live) { static _Atomic int red; if (red++ < 8) LOG("[RED] movie: decoder %p event %d not delivered: the client's entry %p is not an event", (void *)d, i, live); }
 }

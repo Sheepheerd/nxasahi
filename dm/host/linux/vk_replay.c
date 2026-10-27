@@ -631,7 +631,7 @@ void mtl_exec(const uint8_t *handle) {
             if (h.op == OP_BIND_TEX || h.op == OP_BIND_TEX1) op_bind_tex(h.op, a);
             break;
         }
-        case OP_BIND_PROGRAM: vkx_bind_program(((const p_bind_program *)a)->prog); break;
+        case OP_BIND_PROGRAM: vkx_bind_program(((const p_bind_program *)a)->prog, ((const p_bind_program *)a)->stages); break;
         case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tb; vkx_bind_buf(0, bind_buf_rec(h.op, a, &tb)); break; }
         case OP_BIND_SSBO: vkx_bind_buf(1, a); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: vkx_set_pool(h.op == OP_SET_TEX_POOL, nvn_dpool_base(((const p_set_pool *)a)->pool, h.op == OP_SET_TEX_POOL)); break;
@@ -728,7 +728,7 @@ static uint32_t pick_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < g_vkd.mem.memoryTypeCount; i++) if ((bits >> i & 1) && (g_vkd.mem.memoryTypes[i].propertyFlags & want) == want) return i;
     return UINT32_MAX;
 }
-static void shoot_vt_layer(vtex *t, uint32_t layer, uint64_t fence, const char *path) {
+static void shoot_vt_flip(vtex *t, uint32_t layer, int flip, uint64_t fence, const char *path) {
     if (!t || !(t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) { LOG("[RED] screenshot %s: no colour image", path); return; }
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, t->fmt, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) { LOG("[RED] screenshot %s: format %d cannot be blitted to RGBA8 here", path, (int)t->fmt); return; }
@@ -752,6 +752,7 @@ static void shoot_vt_layer(vtex *t, uint32_t layer, uint64_t fence, const char *
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer < t->layers ? layer : 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
                       .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    if (flip) { bl.dstOffsets[0].y = (int32_t)h; bl.dstOffsets[1].y = 0; }   // a presented image of a lower-left-origin game is bottom-up
     vkCmdBlitImage(c, t->img, VK_IMAGE_LAYOUT_GENERAL, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
@@ -772,8 +773,9 @@ static void shoot_vt_layer(vtex *t, uint32_t layer, uint64_t fence, const char *
     vkUnmapMemory(d, bm); vkDestroyFence(d, fe, NULL); vkFreeCommandBuffers(d, g_pool, 1, &c);
     vkDestroyBuffer(d, buf, NULL); vkFreeMemory(d, bm, NULL); vkDestroyImage(d, im, NULL); vkFreeMemory(d, imm, NULL);
 }
+static void shoot_vt_layer(vtex *t, uint32_t layer, uint64_t fence, const char *path) { shoot_vt_flip(t, layer, 0, fence, path); }
 static void shoot_vt(vtex *t, uint64_t fence, const char *path) { shoot_vt_layer(t, 0, fence, path); }
-static void shoot(const tex_t *o, uint64_t fence, const char *path) { pthread_mutex_lock(&g_tmu); vtex *t = tex_get(o); pthread_mutex_unlock(&g_tmu); shoot_vt(t, fence, path); }
+static void shoot(const tex_t *o, uint64_t fence, const char *path) { pthread_mutex_lock(&g_tmu); vtex *t = tex_get(o); pthread_mutex_unlock(&g_tmu); shoot_vt_flip(t, 0, vkx_origin_ll(), fence, path); }   // as presented
 // DM_VK_TEXDUMP: the textures loaded during this submission, once it is done
 static void dump_uploads(uint64_t fence) {
     static int n;

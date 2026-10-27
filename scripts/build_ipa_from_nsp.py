@@ -14,7 +14,7 @@
 #   in ~/Library/Application Support/nxnative/<title ID>/, the log in ~/Library/Logs/nxnative/<title ID>.log. Signed ad-hoc, or with MAC_SIGN / --mac-sign; no hardened runtime, no notarization.
 # PLATFORM = 'linux' / --platform linux (nxasahi: Linux on Apple silicon, Asahi): the same steps up to the shader split, then the SPIR-V shaders of the Vulkan backend (dmsh_spv.py),
 #   the Linux host for the profile (dm/host/Makefile.linux) and the shared-font stand-ins (DejaVu: NXASAHI_FONT_DIR); writes <id>_build/linux_game.json (what the game runs from: the front end
-#   frontend/nxasahi.py reads it) and prints the command that runs the game. NVN games whose shaders are all in their files only (no run-time capture, which boots the Mac host)
+#   frontend/nxasahi.py reads it) and prints the command that runs the game. NVN games only: their files' shaders, and those a game compiles with its own GLSLC (captured by booting it headless in the Linux host); not Unreal or Oodle packs, which the Mac host decodes
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
@@ -1066,15 +1066,17 @@ def capture_glslc(repo, dirs, pkg_ver, patched, work, env, logs, g):
         say(f'reusing the captured run-time shaders: {", ".join(str(d / "glslc_capture") for d in dirs.values())}')
         PROG.end('reused'); return
     if todo != [pkg_ver]: raise BuildError(f'the run-time shader capture runs the packed version {pkg_ver}\'s code; {", ".join(v for v in todo if v != pkg_ver)} needs a capture of its own')
-    PROG.set(step='building the Mac host')
-    host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+    linux = linux_arm64()   # the Linux host boots it the same way (headless: no window without DM_WINDOW; no SPIR-V yet, so nothing is drawn)
+    PROG.set(step=f'building the {"Linux" if linux else "Mac"} host')
+    host = build_linux_host(repo, work, env, logs, g) if linux else build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
     d = dirs[pkg_ver]; cap, rd, log = d / 'glslc_capture.partial', work / 'tmp/glslc_run', logs / 'glslc_capture.log'
     rmtree(cap); rmtree(rd)
     for s in ('save', 'temp'): (rd / s).mkdir(parents=True)
     # everything the run writes stays in <id>_build (DM_ROOT is already there): a fresh save and temporary storage, no shader libraries yet, the profile's shader map (the host looks beside itself by default)
     henv = dict(env, DM_ROMFS=str(d / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_NVN_SHMAP=str(g.table('shader_map.tsv')), DM_GLSLC_CAPTURE=str(cap))
+    if linux: henv = linux_boot_env(henv)
     PROG.set(step='booting the game', done=0, total=len(want) if want else None, unit='shaders')
-    say(f'booting the game in the Mac host to capture the shaders it compiles at run time → {d / "glslc_capture"}')
+    say(f'booting the game in the {"Linux" if linux else "Mac"} host to capture the shaders it compiles at run time → {d / "glslc_capture"}')
     t0 = time.time()
     def done():   # every file the profile names is there (Three Houses: within its first frames)
         got = glslc_done(cap); PROG.set(done=len(got & want if want else got))
@@ -1309,35 +1311,43 @@ def heap_checked(g):   # the heap check's stamp in the profile ("# heap check: .
 def heap_check(repo, d, patched, work, env, logs, g):
     """The heap check of a provisional profile whose game has virtual address memory (an NPDM system resource) and sets a heap (dm/games/profile_guess.py heap_check_needed):
     its heap request decides the alias / heap split of the guest block, and only a run shows it (Wonder asks for 1.44 GB, Tears of the Kingdom for 2.09 GB, which Engage's split
-    has no room for). The game boots in the Mac host (headless and silent, no shader libraries) until its first heap request is answered or fails, or until it has run
+    has no room for). The game boots in the Mac host, or on Linux the Linux host (headless and silent, no shader libraries) until its first heap request is answered or fails, or until it has run
     HEAP_CHECK_NNMAIN_SECS in nnMain without one (Engage sets none): a few seconds. The keys go into the profile (profile_guess.py heap_signals), which is stamped"""
     PROG.stage('heap check')
-    host, rd, log = work / 'tools/dmhost', work / 'tmp/heap_run', logs / 'heap_check.log'
-    PROG.set(step='building the Mac host'); build_mac_host(repo, host, env, logs, g)
-    rmtree(rd)
-    for x in ('save', 'temp', 'msl'): (rd / x).mkdir(parents=True)
-    # a fresh save and temporary storage, no shader libraries (only the heap request matters), the profile's shader map
-    henv = dict(env, DM_ROMFS=str(d / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_NVN_SHMAP=str(g.table('shader_map.tsv')))
-    PROG.set(step='booting the game')
-    t0, seen = time.time(), {}
-    def done():   # the first heap request answered (or refused for good), or nnMain running for a while without one
-        try: text = log.read_text(errors='replace')
-        except OSError: return False
-        if 'SetHeapSize OOM' in text or '[mem] heap ' in text: return True
-        if '>>> nnMain' in text: seen.setdefault('nnmain', time.time())
-        return time.time() - seen.get('nnmain', time.time()) > HEAP_CHECK_NNMAIN_SECS
-    rc = boot_mac(host, patched, henv, rd, log, HEAP_CHECK_SECS, done)
-    text = log.read_text(errors='replace'); rmtree(rd)
-    sig = {k: v for k, v in pg.heap_signals(text, g).items() if g.get(k, '') != v[0]}
-    for k, (v, why) in sig.items(): say(f'heap check: {k} {v}: {why}')
+    rd, log, linux = work / 'tmp/heap_run', logs / 'heap_check.log', linux_arm64()
+    PROG.set(step=f'building the {"Linux" if linux else "Mac"} host')
+    t0, got = time.time(), {}
+    # a run that changes the heap region boots again with it: the request then meets the pool check, which can fail on its own (Pokémon FireRed asks for a 3.14 GB heap,
+    # then for more than the pool beside its 102 MB of modules), so one run per change, at most three
+    for _ in range(3):
+        host = build_linux_host(repo, work, env, logs, g) if linux else build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+        rmtree(rd)
+        for x in ('save', 'temp', 'msl'): (rd / x).mkdir(parents=True)
+        # a fresh save and temporary storage, no shader libraries (only the heap request matters), the profile's shader map
+        henv = dict(env, DM_ROMFS=str(d / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_NVN_SHMAP=str(g.table('shader_map.tsv')))
+        if linux: henv = linux_boot_env(henv)
+        PROG.set(step='booting the game')
+        seen = {}
+        def done():   # the first heap request answered (or refused for good), or nnMain running for a while without one
+            try: text = log.read_text(errors='replace')
+            except OSError: return False
+            if 'SetHeapSize OOM' in text or '[mem] heap ' in text: return True
+            if '>>> nnMain' in text: seen.setdefault('nnmain', time.time())
+            return time.time() - seen.get('nnmain', time.time()) > HEAP_CHECK_NNMAIN_SECS
+        rc = boot_mac(host, patched, henv, rd, log, HEAP_CHECK_SECS, done)
+        text = log.read_text(errors='replace'); rmtree(rd)
+        sig = {k: v for k, v in pg.heap_signals(text, g).items() if g.get(k, '') != v[0]}
+        for k, (v, why) in sig.items(): say(f'heap check: {k} {v}: {why}')
+        if sig: g = set_keys(g, sig, f'Heap check on {"Linux" if linux else "the Mac"}'); got.update(sig)
+        if not (sig.keys() & {'mem_alias', 'mem_reserve'}): break
+        PROG.set(step='booting the game again with the new heap region')
     m = re.search(r'\[mem\] heap ([0-9.]+ GB)', text)
     how = ('the heap request did not fit' if 'SetHeapSize OOM' in text else f'heap {m.group(1)}' if m else 'no heap set' if '>>> nnMain' in text
            else f'the host stopped before nnMain (exit {rc})' if rc is not None else 'no nnMain within the time limit')
-    if sig: g = set_keys(g, sig, 'Heap check on the Mac')
-    p = g.dir / 'game.tsv'; atomic_text(p, p.read_text(encoding='utf-8') + f'\n# heap check: {time.strftime("%Y-%m-%d")}, {how}' + (f'; set {", ".join(sig)}' if sig else '') + '\n')
-    if not m and '>>> nnMain' not in text and 'SetHeapSize OOM' not in text:   # stopped before any heap request: worth a look before the IPA is tried
+    p = g.dir / 'game.tsv'; atomic_text(p, p.read_text(encoding='utf-8') + f'\n# heap check: {time.strftime("%Y-%m-%d")}, {how}' + (f'; set {", ".join(got)}' if got else '') + '\n')
+    if not m and '>>> nnMain' not in text and 'SetHeapSize OOM' not in text and '[mem] SetHeapSize ' not in text:   # stopped before any heap request: worth a look before the IPA is tried
         PROG.say(f'[RED] heap check: {how}; ---- last lines of {log} ----\n' + ''.join(collections.deque(open(log, errors='replace'), maxlen=20)).rstrip('\n'))
-    PROG.end(f'{how} in {hms(time.time() - t0)}' + (f'; set {", ".join(sig)}' if sig else ''))
+    PROG.end(f'{how} in {hms(time.time() - t0)}' + (f'; set {", ".join(got)}' if got else ''))
     return type(g)(g.dir)
 
 
@@ -1696,14 +1706,27 @@ def linux_shaders(py, repo, sh, env, logs, g, pkg_key=None):
     return out
 
 
-def linux_host(py, repo, work, env, logs, g):
-    """The stage "Linux host": the host for the profile (dm/host/Makefile.linux, its objects per game; copied to <id>_build/tools/dmhost-linux since dm/host/dmhost is the last game's),
-    and the shared fonts' stand-ins in <id>_build/font: DejaVu Sans as the standard font, the button-icon font made over DejaVu Sans Bold. Returns (host, font folder)"""
-    PROG.stage('Linux host', step='building')
+def build_linux_host(repo, work, env, logs, g):   # dm/host/Makefile.linux for the profile, copied to <id>_build/tools/dmhost-linux (dm/host/dmhost is the last game's); make skips what is up to date
     host = repo / 'dm/host'
     run(['make', '-f', 'Makefile.linux', f'GAME={g.id}', f'-j{os.cpu_count() or 8}'], logs / 'linux_host_build.log', env=env, cwd=host)
     out = work / 'tools/dmhost-linux'; out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(host / 'dmhost', out)
+    return out
+
+
+def linux_boot_env(henv):   # a headless, silent Linux run for a capture: no window, no sound; on NixOS the Vulkan loader kept to the Asahi driver, as linux_run does
+    henv = {k: v for k, v in henv.items() if k != 'DM_WINDOW'}
+    henv['DM_AUDIO'] = '0'
+    icd = Path('/run/opengl-driver/share/vulkan/icd.d/asahi_icd.aarch64.json')
+    if icd.is_file(): henv['VK_DRIVER_FILES'] = str(icd)
+    return henv
+
+
+def linux_host(py, repo, work, env, logs, g):
+    """The stage "Linux host": the host for the profile (dm/host/Makefile.linux, its objects per game; copied to <id>_build/tools/dmhost-linux since dm/host/dmhost is the last game's),
+    and the shared fonts' stand-ins in <id>_build/font: DejaVu Sans as the standard font, the button-icon font made over DejaVu Sans Bold. Returns (host, font folder)"""
+    PROG.stage('Linux host', step='building')
+    out = build_linux_host(repo, work, env, logs, g)
     PROG.set(step='fonts')
     font, fd = work / 'font', linux_font_dir()
     ttf, kf = font / 'nintendo_ext.ttf', font / 'nintendo_ext.key'
@@ -1726,6 +1749,7 @@ def linux_run(work, game, patched, host, font, spv, aoc, lang, g, app, name, ver
     for k in ('DM_GAMES_DIR', 'DM_GAMES_FIRST'):   # a derived or provisional profile: the host finds its tables through them
         if os.environ.get(k): renv[k] = os.environ[k]
     if env_file: renv.update(env_file_pairs(env_file))
+    renv['DM_TEXT_INPUT'] = f'{sys.executable} {Path(__file__).resolve().parent.parent / "frontend/text_input.py"}'   # the software keyboard's input box (GTK 4: front_sdl.c front_text_input)
     icd = Path('/run/opengl-driver/share/vulkan/icd.d/asahi_icd.aarch64.json')   # NixOS: keep the Vulkan loader to the Asahi driver
     if icd.is_file(): renv['VK_DRIVER_FILES'] = icd
     m = {'format': 1, 'title_id': f'{app:016X}', 'profile': g.id, 'name': name or g.get('name', g.id), 'version': version or '', 'package': pkg_ver,
@@ -2013,8 +2037,8 @@ def main(args=None):
     glcap = gfx == 'gl' and src['gl_capture'][0]   # GLSL the game puts together at run time (LÖVE), captured in the Mac host (capture_shaders)
     uedec = gfx == 'nvn' and src['ue_decode'][0]   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
     if linux and gfx != 'nvn': raise BuildError(f'{src["graphics"][1]}: the Linux host draws NVN games only so far (the Vulkan and GL layers are the Mac host\'s)')
-    if linux and (glslc or uedec or src['oodle_packs'][0] or src['ue_legacy'][0]):
-        raise BuildError('this game\'s shaders are captured or decoded by booting it in the Mac host (run-time compiles, Unreal or Oodle packs): not done on Linux yet')
+    if linux and (uedec or src['oodle_packs'][0] or src['ue_legacy'][0]):   # a GLSLC capture boots the Linux host (capture_glslc)
+        raise BuildError('this game\'s shaders are decoded by booting it in the Mac host (Unreal or Oodle packs): not done on Linux yet')
     if gfx == 'vulkan': say(f'Vulkan game ({src["graphics"][1]}): vk_shaders.py translates the shaders instead of the NVN shader chain')
     if gfx == 'gl': say(f'OpenGL game ({src["graphics"][1]}): gl_shaders.py translates the shaders instead of the NVN shader chain')
     for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (glcap, 'gl_capture'), (uedec, 'ue_decode'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs'), (gfx == 'nvn' and src['ue_legacy'][0], 'ue_legacy')):
@@ -2047,7 +2071,7 @@ def main(args=None):
         provisional_prep(py, repo, env, logs, g)
         g = refine_after_rewrite(g, game, patched, reg if derived else None)
         if provisional and heapck and pg.heap_check_needed(game / 'ExeFS'):
-            if apple_silicon(): PROG.add(1); g = heap_check(repo, game, patched, work, env, logs, g)
+            if linux or apple_silicon(): PROG.add(1); g = heap_check(repo, game, patched, work, env, logs, g)
             else: say('no heap check: it boots the game in the Mac host, which needs a Mac with Apple silicon; the profile keeps its guessed heap keys')
     if glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/uio.h>
+#include <fcntl.h>
 
 // ---- pthread ----
 void *pthread_get_stackaddr_np(pthread_t t) {
@@ -39,13 +40,25 @@ kern_return_t vm_allocate(mach_port_t task, vm_address_t *addr, vm_size_t size, 
     *addr = (vm_address_t)p; return KERN_SUCCESS;
 }
 kern_return_t vm_deallocate(mach_port_t task, vm_address_t addr, vm_size_t size) { (void)task; return munmap((void *)addr, size) ? KERN_INVALID_ARGUMENT : KERN_SUCCESS; }
+// A read that fails instead of faulting. Through a pipe: write() copies from the address as any user-memory access does, and fails with EFAULT where nothing is mapped.
+// process_vm_readv cannot read the guest heap: it is Vulkan device memory mapped in place (vk_mem.c, VM_PFNMAP), which it refuses, so every check of a guest pointer
+// failed (Pokémon: Let's Go's movie events were never signalled, and its opening movie never started)
 kern_return_t vm_read_overwrite(mach_port_t task, vm_address_t addr, vm_size_t size, vm_address_t data, vm_size_t *out) {
     (void)task;
-    struct iovec l = { (void *)data, size }, r = { (void *)addr, size };
-    ssize_t n = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
-    if (n < 0 || (size_t)n != size) { if (out) *out = n > 0 ? (vm_size_t)n : 0; return KERN_FAILURE; }
-    if (out) *out = size;
-    return KERN_SUCCESS;
+    static __thread int fd[2] = {-1, -1};
+    if (fd[0] < 0 && pipe2(fd, O_CLOEXEC | O_NONBLOCK)) { fd[0] = -1; if (out) *out = 0; return KERN_FAILURE; }
+    vm_size_t done = 0;
+    while (done < size) {
+        size_t n = size - done > 16384 ? 16384 : size - done;   // well inside the pipe's 64 KiB
+        ssize_t w = write(fd[1], (const void *)(addr + done), n);
+        if (w <= 0) break;
+        ssize_t r = read(fd[0], (void *)(data + done), (size_t)w);
+        if (r != w) break;
+        done += (vm_size_t)w;
+        if ((size_t)w != n) break;
+    }
+    if (out) *out = done;
+    return done == size ? KERN_SUCCESS : KERN_FAILURE;
 }
 kern_return_t vm_remap(mach_port_t task, vm_address_t *to, vm_size_t size, vm_address_t mask, int flags, mach_port_t src, vm_address_t from, boolean_t copy, vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inh) {
     (void)task; (void)to; (void)size; (void)mask; (void)flags; (void)src; (void)from; (void)copy; (void)inh;

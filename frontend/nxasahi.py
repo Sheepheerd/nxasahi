@@ -415,6 +415,7 @@ class App(Adw.Application):
         save = SAVES / tid; save.mkdir(parents=True, exist_ok=True)
         env['DM_SAVE'] = str(save)   # saves outside the build: kept when the game is rebuilt or removed
         env['DM_WINDOW'] = '1'
+        env.setdefault('DM_TEXT_INPUT', f'{sys.executable} {REPO / "frontend/text_input.py"}')   # the software keyboard's input box (games built before the manifest carried it)
         env['DM_AUDIO'] = '1' if s['audio'] else '0'
         if s['fullscreen']: env['DM_FULLSCREEN'] = '1'
         if not s['big_cores']: env['DM_CPUS'] = 'all'

@@ -4,6 +4,7 @@
 //   - the graphics dumps of the DM_CTL control file (dm_gfx_*), and libSystem's private thread_selfcounts
 // The game's CPU side runs as on the Mac: it boots, loads, and submits frames that nobody draws
 #include "dm.h"
+#include "vk_mem.h"
 #include "front.h"
 #include "../gfx/nvn/nvn_obj.h"
 #include "vk_window.h"
@@ -45,7 +46,14 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 void mtl_pool_del(const void *mem) { (void)mem; }
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
-int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) { (void)addr; (void)len; *buf = NULL; *off = 0; return 0; }
+// Whether [addr, addr+len) is in GPU-visible guest memory (vk_mem.c): hle_nvn.c computes a program's shader keys at SetShaders only then, while the control
+// section it hashes is still valid. Answering no for everything left them to the first draw, when Pokémon Shining Pearl had already reused the control
+// sections' memory: every vertex shader key was wrong and nothing was drawn
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    VkBuffer b; VkDeviceSize o; VkDeviceAddress g;
+    if (!vkm_lookup((const void *)(uintptr_t)addr, len ? len : 1, &b, &o, &g)) { *buf = NULL; *off = 0; return 0; }
+    *buf = (void *)b; *off = o; return 1;
+}
 int mtl_pso_prebuild_tool(void) { return 0; }
 // Statistics: nothing measured
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = *draws = 0; }
@@ -71,11 +79,7 @@ void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 
-// ---- front end: front_sdl.c; the software keyboard has no window of its own yet ----
-int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
-    (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap;
-    return -1;   // front.h: no window, nothing shown (hle_swkbd.c then answers from DM_KBD or the initial text)
-}
+// ---- front end: front_sdl.c (the software keyboard's input box too: front_text_input) ----
 
 // ---- libSystem's private per-thread counters: not on Linux (the instruction counts read 0) ----
 int thread_selfcounts(int type, void *buf, size_t nbytes) { (void)type; memset(buf, 0, nbytes); return -1; }

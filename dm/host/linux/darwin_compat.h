@@ -102,7 +102,7 @@ static inline mach_port_t pthread_mach_thread_np(pthread_t t) { (void)t; return 
 static inline kern_return_t mach_port_deallocate(mach_port_t task, mach_port_t p) { (void)task; (void)p; return KERN_SUCCESS; }
 kern_return_t vm_allocate(mach_port_t task, vm_address_t *addr, vm_size_t size, int flags);
 kern_return_t vm_deallocate(mach_port_t task, vm_address_t addr, vm_size_t size);
-kern_return_t vm_read_overwrite(mach_port_t task, vm_address_t addr, vm_size_t size, vm_address_t data, vm_size_t *out);   // fails instead of faulting (process_vm_readv)
+kern_return_t vm_read_overwrite(mach_port_t task, vm_address_t addr, vm_size_t size, vm_address_t data, vm_size_t *out);   // fails instead of faulting (through a pipe: works on device memory too)
 kern_return_t vm_remap(mach_port_t task, vm_address_t *to, vm_size_t size, vm_address_t mask, int flags, mach_port_t src, vm_address_t from, boolean_t copy, vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inh);
 
 typedef struct { vm_prot_t protection, max_protection; vm_inherit_t inheritance; boolean_t shared, reserved; uint64_t offset; int behavior; unsigned short user_wired_count; } vm_region_basic_info_data_64_t;

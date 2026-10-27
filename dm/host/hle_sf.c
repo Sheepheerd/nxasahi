@@ -15,7 +15,7 @@
 #define SF_MAX 64
 static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
-static const char *const sf_served[] = {"olsc:u"};
+static const char *const sf_served[] = {"olsc:u", "bt", "btm:u"};   // bt, btm:u: Pokémon: Let's Go connects to them at boot (Poké Ball Plus, a Bluetooth LE controller); zeroed answers read as "nothing paired"
 
 static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;

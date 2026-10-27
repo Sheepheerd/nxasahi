@@ -23,7 +23,7 @@
 
 #define NST 6
 typedef struct { uint64_t addr, size; } bbuf;
-static struct { bbuf ubo[NST][16], ssbo[NST][16]; uint64_t tex[NST][256], samp[NST][128], img[NST][32]; int tex_base, samp_base; const prog_t *prog; } S;
+static struct { bbuf ubo[NST][16], ssbo[NST][16]; uint64_t tex[NST][256], samp[NST][128], img[NST][32]; int tex_base, samp_base; const prog_t *prog[NST]; } S;   // prog: the program bound to each stage (vkx_bind_program)
 
 // ---- shaders ----
 #define NBIND_MAX 96
@@ -250,7 +250,7 @@ static vks *shader_get(const prog_t *p, int idx) {
     s->next = g_sh[hsh]; g_sh[hsh] = s;
     int st = -1; size_t fw = 0; unsigned ch = 0;
     uint32_t *fit = sh_code(key, &st, &fw, s, &ch);
-    if (!fit) { g_st_nokey++; if (g_st_nokey <= 8) LOG("[RED] vulkan draws: no translated shader %s (index %d) in %s", key, idx, g_spv); pthread_mutex_unlock(&g_shmu); return NULL; }
+    if (!fit) { g_st_nokey++; if (g_st_nokey <= 8 || !(g_st_nokey & (g_st_nokey - 1))) LOG("[RED] vulkan draws: no translated shader %s (index %d) in %s (%llu keys without one so far)", key, idx, g_spv, (unsigned long long)g_st_nokey); pthread_mutex_unlock(&g_shmu); return NULL; }
     s->stage = st; s->vstage = vstage_of(st);
     // Stages that can feed the rasterizer are made when a draw asks for a variant (sh_plain / gl_variant): the GL-depth form is the one drawn in a GL-depth game, and
     // making the plain one as well compiled every vertex shader twice
@@ -584,15 +584,18 @@ static VkShaderEXT gl_variant(vks *s) {
 }
 // A draw: the program's shaders and their descriptor sets (bound in c). 0 when the draw cannot be made (no program, a shader missing)
 int vkx_prepare_draw(VkCommandBuffer c) {
-    if (!draw_init() || g_pool_slot < 0 || !S.prog) return 0;
+    if (!draw_init() || g_pool_slot < 0 || !S.prog[0]) return 0;
     g_st_draws++;
     vks *sh[5] = {0};
-    for (int i = 0; i < NST; i++) {   // the program's shaders, each in its stage's place
+    for (int st = 0; st < 5; st++) {   // each stage's shader from the program bound to that stage
+        const prog_t *p = S.prog[st];
+        if (!p) continue;
         uint8_t k8[8];
-        if (!prog_key(S.prog, (unsigned)i, k8)) break;
-        vks *s = shader_get(S.prog, i);
-        if (!s) { g_miss[M_NOSHADER]++; return 0; }
-        if (s->stage < 5) sh[s->stage] = s;
+        for (int i = 0; i < NST && prog_key(p, (unsigned)i, k8); i++) {
+            vks *s = shader_get(p, i);
+            if (!s) { g_miss[M_NOSHADER]++; return 0; }
+            if (s->stage == st) { sh[st] = s; break; }
+        }
     }
     if (!sh[0]) { g_miss[M_NOSHADER]++; return 0; }
     VkDescriptorSet sets[5] = {0};
@@ -612,7 +615,9 @@ int vkx_prepare_draw(VkCommandBuffer c) {
 }
 
 // ---- the bound state, from the walker ----
-void vkx_bind_program(const prog_t *p) { S.prog = p; }
+// NVN's BindProgram(program, stage bits) binds per stage: the stages in the bits take that program's shaders (a null program unbinds them), the others stay (as the Mac replay's
+// bind_stages). Pokémon FireRed binds its vertex and fragment programs apart; replacing one bound program for every stage left its only draw without a vertex shader, and the screen black
+void vkx_bind_program(const prog_t *p, int stages) { for (int st = 0; st < NST; st++) if (stages >> st & 1) S.prog[st] = p; }
 void vkx_bind_buf(int ssbo, const p_bind_buf *b) { if (b->stage >= 0 && b->stage < NST && b->index >= 0 && b->index < 16) (ssbo ? S.ssbo : S.ubo)[b->stage][b->index] = (bbuf){b->addr, b->size}; }
 void vkx_bind_handles(int what, const p_bind_handles *b, const uint64_t *h) {   // what: 0 textures, 1 samplers, 2 images
     if (b->stage < 0 || b->stage >= NST || b->first < 0 || b->n <= 0) return;
@@ -672,6 +677,7 @@ void vkx_vattr(const p_bind_vattr *a) { for (int i = 0; i < a->n && a->first + i
 void vkx_vstream(const p_bind_vstream *s) { for (int i = 0; i < s->n && s->first + i < 16; i++) D.stream[s->first + i] = s->st[i]; }
 void vkx_vbuf(const p_bind_vbuf *b) { for (int i = 0; i < b->n && b->first + i < 16; i++) D.vbuf[b->first + i] = b->r[i]; }
 void mtl_set_origin_lower_left(int on) { D.origin_ll = on; }
+int vkx_origin_ll(void) { return D.origin_ll; }   // lower-left origin (NVN's default, GL): the window image is stored bottom-up, so presenting flips it
 void mtl_set_depth_zero(int on) { D.depth_zero = on; g_depth_zero = on; }
 
 static VkBlendFactor bfac(int f) {
@@ -812,7 +818,7 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
     VkPrimitiveTopology tp = topo(d ? d->prim : x->prim, &ok);
     if (!ok) { g_st_skip[SK_QUADS]++; return; }
     if ((d ? d->mdi_cnt : x->mdi_cnt)) { g_st_skip[SK_INDIRECT]++; return; }   // open: indirect-count multi-draws
-    if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog && prog_key(S.prog, (unsigned)st, k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
+    if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog[st] && prog_key(S.prog[st], (unsigned)(S.prog[st] == S.prog[0] ? st : 0), k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
         LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d func %d, stencil %d func %d ref %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
             d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.ds.df, (int)D.ds.st, (int)D.ds.sf_f, D.st_ref[0], (int)D.poly.cull);
         LOG("[pass]     viewports %d: %.1f %.1f %.1f %.1f depth %.2f..%.2f%s; scissor %s %d %d %d %d; front %s; origin %s; depth mode %s; attrs %#x", D.nvp, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3],
@@ -851,9 +857,9 @@ static uint64_t g_st_dispatched, g_st_dskip;
 void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p) {
     static uint64_t why[4];
     #define DSKIP(k) do { g_st_dskip++; why[k]++; if (!(g_st_dskip & (g_st_dskip - 1))) LOG("[RED] vulkan draws: %llu dispatches skipped (no program %llu, no compute shader %llu, indirect buffer %llu, set %llu)", (unsigned long long)g_st_dskip, (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]); return; } while (0)
-    if (!draw_init() || g_pool_slot < 0 || !S.prog) DSKIP(0);
+    if (!draw_init() || g_pool_slot < 0 || !S.prog[5]) DSKIP(0);
     vks *s = NULL; uint8_t k8[8];
-    for (int i = 0; i < NST && !s && prog_key(S.prog, (unsigned)i, k8); i++) { vks *t = shader_get(S.prog, i); if (t && t->stage == 5) s = t; }
+    for (int i = 0; i < NST && !s && prog_key(S.prog[5], (unsigned)i, k8); i++) { vks *t = shader_get(S.prog[5], i); if (t && t->stage == 5) s = t; }
     if (!s) DSKIP(1);
     if (g_trace) LOG("[pass]   dispatch %s groups %d %d %d%s", s->key, (int)p->x, (int)p->y, (int)p->z, p->ind ? " (indirect)" : "");
     VkBuffer ib = VK_NULL_HANDLE; VkDeviceSize io = 0;
