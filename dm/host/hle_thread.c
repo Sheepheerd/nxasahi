@@ -274,6 +274,16 @@ static void qos_apply(thr_t *t) {   // on the thread itself
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
 void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
+#ifdef __linux__
+// glibc's pthread_exit unwinds the stack it runs on (_Unwind_ForcedUnwind, a few KiB of unwinder state), and a guest thread exits on its own stack, which can be a dozen KiB:
+// Pokémon: Let's Go's save thread ended in SIGSEGV at the unwinder's first store (fault address = sp). thread_exit goes back to the pthread's own stack first, at the frame
+// thread_main left when it entered the guest (it never resumes), through this stub, whose return address the unwinder reads as the end of the stack: glibc then jumps
+// back to its thread start and finishes the exit there (key destructors, the stack's release). The Mac's pthread_exit does not unwind and keeps the guest stack
+static __thread void *g_host_sp;
+__attribute__((noreturn)) void dm_exit_on_host_stack(void *sp);
+__asm__(".text\n.p2align 2\n.globl dm_exit_on_host_stack\n.type dm_exit_on_host_stack, %function\ndm_exit_on_host_stack:\n.cfi_startproc\n.cfi_undefined x30\n"
+        "  mov sp, x0\n  mov x29, xzr\n  mov x0, xzr\n  bl pthread_exit\n  brk #0\n.cfi_endproc\n.size dm_exit_on_host_stack, .-dm_exit_on_host_stack\n");
+#endif
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
@@ -285,6 +295,9 @@ static void *thread_main(void *p) {
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+#ifdef __linux__
+    g_host_sp = __builtin_frame_address(0);
+#endif
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
@@ -304,6 +317,9 @@ static void thread_exit(thr_t *t) {
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
     pthread_mutex_unlock(&G);
+#ifdef __linux__
+    if (g_host_sp) dm_exit_on_host_stack(g_host_sp);
+#endif
     pthread_exit(NULL);
 }
 void dm_thread_returned(void) { die("guest thread entry function returned (Horizon requires ExitThread)"); }

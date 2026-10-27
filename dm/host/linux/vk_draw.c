@@ -56,7 +56,7 @@ static int read_file(const char *path, uint8_t **out, size_t *n) {
 }
 static void buffer_with(const void *data, size_t n, VkBuffer *b, VkDeviceMemory *m) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n ? n : 16, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
     vkCreateBuffer(g_vkd.dev, &bi, NULL, b);
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vkd.dev, *b, &mr);
     VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = vkr_pick_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
@@ -477,7 +477,12 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             w->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w->pBufferInfo = &bi[nw];
             bi[nw] = (VkDescriptorBufferInfo){g_zero, 0, 65536};
             const bbuf *u = (b->k == BK_SBUF) && b->reg >= 0 && b->reg < 16 ? &S.ssbo[st][b->reg] : (b->k == BK_UBO_PTR) && b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
-            if (!(u && buf_desc(u->addr, u->size, 16, 0x7fffffff, &bi[nw]))) g_miss[M_SBUF]++;
+            int ok = u && buf_desc(u->addr, u->size, 16, 0x7fffffff, &bi[nw]); if (!ok) g_miss[M_SBUF]++;
+            if (g_trace) { const float *f = u && u->size >= 24 ? (const float *)(uintptr_t)u->addr : NULL;   // what the buffer holds now (a buffer the GPU writes: as last written)
+                LOG("[pass]     stage %d sbuf binding %u s%d: addr %#llx size %llu%s; first %g %g %g %g %g %g", st, b->b, b->reg, u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull,
+                    ok ? "" : " [NOT BOUND]", f ? f[0] : 0.f, f ? f[1] : 0.f, f ? f[2] : 0.f, f ? f[3] : 0.f, f ? f[4] : 0.f, f ? f[5] : 0.f);
+                const char *dd = getenv("DM_VK_SBUFDUMP");   // DM_VK_SBUFDUMP=<dir> (with DM_VK_PASSLOG): each storage buffer of the traced frame saved as <dir>/<address>.bin, as it is at bind time
+                if (dd && f) { char path[600]; snprintf(path, sizeof path, "%s/%llx.bin", dd, (unsigned long long)u->addr); FILE *o = fopen(path, "wb"); if (o) { fwrite(f, 1, u->size, o); fclose(o); } } }
         } else if (b->desc == 't') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w->pImageInfo = &ii[nw];
             ii[nw] = (VkDescriptorImageInfo){g_dsamp, g_dview[dummy_index(b)], VK_IMAGE_LAYOUT_GENERAL};
@@ -637,7 +642,7 @@ static struct {
     float pof, pou, poc; float bc[4]; int clamp, restart;
     va_st attr[16]; vs_st stream[16]; NVNbufferRange vbuf[16];
     int origin_ll, depth_zero;
-} D = {.chmask = {0xffffffff}, .poly = {.cull = 0, .front = 1, .mode = 2}, .st_vmask = {0xff, 0xff}, .st_wmask = {0xff, 0xff}};
+} D = {.df = 1, .chmask = {0xffffffff}, .poly = {.cull = 0, .front = 1, .mode = 2}, .st_vmask = {0xff, 0xff}, .st_wmask = {0xff, 0xff}};
 static PFN_vkCmdSetVertexInputEXT p_vin; static PFN_vkCmdSetPolygonModeEXT p_poly; static PFN_vkCmdSetRasterizationSamplesEXT p_rs; static PFN_vkCmdSetSampleMaskEXT p_sm;
 static PFN_vkCmdSetAlphaToCoverageEnableEXT p_a2c; static PFN_vkCmdSetColorBlendEnableEXT p_cbe; static PFN_vkCmdSetColorBlendEquationEXT p_cbq; static PFN_vkCmdSetColorWriteMaskEXT p_cwm;
 static PFN_vkCmdSetLogicOpEnableEXT p_loe; static PFN_vkCmdSetDepthClampEnableEXT p_dce; static PFN_vkCmdSetAlphaToOneEnableEXT p_a21;
@@ -716,15 +721,28 @@ static VkPrimitiveTopology topo(int p, int *ok) {
     case 6: case 9: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;   // a convex polygon as a fan
     case 0xA: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; case 0xB: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case 0xC: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; case 0xD: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY; case 0xE: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    default: *ok = 0; return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // quads: open
+    case 7: *ok = 2; return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // quads: two triangles each, through g_quad_ib (vkx_draw)
+    default: *ok = 0; return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
+}
+// Quads, which Vulkan has not: each quad i drawn as the triangles 4i+{0,1,2} and 4i+{0,2,3}, the order the Mac replay uses, from a fixed index buffer of QUAD_MAX quads; the draw's
+// first vertex is the indexed draw's vertex offset. Unity's blits are quads (Pokémon Shining Pearl: half of all draws, its bloom, the scene's composite and the upscale to the window:
+// without them its characters were never on screen and the picture stayed 1280x720 in a corner). Open: indexed quads (the guest's indices would need expanding) and indirect quads
+enum { QUAD_MAX = 65536 };
+static VkBuffer g_quad_ib; static VkDeviceMemory g_quad_m;
+static int quad_ib(void) {
+    if (g_quad_ib) return 1;
+    uint32_t *ix = malloc(sizeof *ix * 6 * QUAD_MAX); if (!ix) return 0;
+    for (uint32_t q = 0; q < QUAD_MAX; q++) { uint32_t *t = ix + 6 * q, v = 4 * q; t[0] = v; t[1] = v + 1; t[2] = v + 2; t[3] = v; t[4] = v + 2; t[5] = v + 3; }
+    buffer_with(ix, sizeof *ix * 6 * QUAD_MAX, &g_quad_ib, &g_quad_m); free(ix);
+    return g_quad_ib != VK_NULL_HANDLE;
 }
 // Everything a draw needs set, then the draw (inside the render pass vk_replay.c began). ncolor / rt_h: the render pass's colour attachments and height
 static void set_state(VkCommandBuffer c, int ncolor, uint32_t rt_w, uint32_t rt_h, VkPrimitiveTopology tp, int samples) {
     VkViewport vp[16]; int nvp = D.nvp ? D.nvp : 1;
     for (int i = 0; i < nvp; i++) {
         float x = D.nvp ? D.vp[i][0] : 0, y = D.nvp ? D.vp[i][1] : 0, w = D.nvp ? D.vp[i][2] : (float)rt_w, h = D.nvp ? D.vp[i][3] : (float)rt_h;
-        float n = D.has_dr ? D.dn : D.nvp ? D.vp[i][4] : 0, f = D.has_dr ? D.df : D.nvp ? D.vp[i][5] : 1;
+        float n = D.dn, f = D.df;   // SetDepthRange(s), NVN's default 0..1 until then: the viewport records' near / far are never filled (0..0 put every fragment at depth 0; Pokémon Shining Pearl's characters were not drawn)
         if (w <= 0) w = 1;
         // NVN upper-left origin (D3D, Metal): NDC +1 is the target's first row, Vulkan puts -1 there: a negative height flips it. Lower-left (GL) already agrees with Vulkan
         vp[i] = D.origin_ll ? (VkViewport){x, y, w, h, n, f} : (VkViewport){x, y + h, w, -h, n, f};
@@ -816,13 +834,13 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
     const p_draw *d = op == OP_DRAW ? draw_rec(a, size, &td) : NULL;
     const p_draw_idx *x = op == OP_DRAW_IDX ? draw_idx_rec(a, size, &ti) : NULL;
     VkPrimitiveTopology tp = topo(d ? d->prim : x->prim, &ok);
-    if (!ok) { g_st_skip[SK_QUADS]++; return; }
+    if (!ok || (ok == 2 && (x || d->ind || d->count > 4 * QUAD_MAX || !quad_ib()))) { g_st_skip[SK_QUADS]++; return; }
     if ((d ? d->mdi_cnt : x->mdi_cnt)) { g_st_skip[SK_INDIRECT]++; return; }   // open: indirect-count multi-draws
     if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog[st] && prog_key(S.prog[st], (unsigned)(S.prog[st] == S.prog[0] ? st : 0), k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
         LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d func %d, stencil %d func %d ref %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
             d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.ds.df, (int)D.ds.st, (int)D.ds.sf_f, D.st_ref[0], (int)D.poly.cull);
         LOG("[pass]     viewports %d: %.1f %.1f %.1f %.1f depth %.2f..%.2f%s; scissor %s %d %d %d %d; front %s; origin %s; depth mode %s; attrs %#x", D.nvp, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3],
-            D.has_dr ? D.dn : D.vp[0][4], D.has_dr ? D.df : D.vp[0][5], D.has_dr ? " (depth range)" : "", D.has_sc ? "on" : "off", D.sc[0], D.sc[1], D.sc[2], D.sc[3], D.poly.front ? "ccw" : "cw",
+            D.dn, D.df, D.has_dr ? " (depth range)" : "", D.has_sc ? "on" : "off", D.sc[0], D.sc[1], D.sc[2], D.sc[3], D.poly.front ? "ccw" : "cw",
             D.origin_ll ? "lower left" : "upper left", D.depth_zero ? "zero" : "gl", ({ unsigned m = 0; for (int i = 0; i < 16; i++) if (D.attr[i].fmt) m |= 1u << i; m; }));
         for (int i = 0; i < 16; i++) if (D.attr[i].fmt) LOG("[pass]     attr %d: NVN format %#x (vk %d) offset %u stream %u; stream stride %u divisor %u, buffer %#llx size %llu", i, (unsigned)D.attr[i].fmt, (int)vfmt((int)D.attr[i].fmt),
             (unsigned)D.attr[i].offset, (unsigned)D.attr[i].stream, D.stream[D.attr[i].stream].stride, D.stream[D.attr[i].stream].divisor, (unsigned long long)D.vbuf[D.attr[i].stream].address, (unsigned long long)D.vbuf[D.attr[i].stream].size); }
@@ -833,7 +851,8 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
     set_state(c, ncolor, rt_w, rt_h, tp, samples);
     if (!set_vertex(c)) return;
     if (d) {
-        if (d->ind) { VkBuffer b; VkDeviceSize o; if (!lookup_buf(d->ind, 16, &b, &o)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndirect(c, b, o, 1, 16); }
+        if (ok == 2) { vkCmdBindIndexBuffer(c, g_quad_ib, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c, (uint32_t)d->count / 4 * 6, (uint32_t)(d->instances ? d->instances : 1), 0, (int32_t)d->first, (uint32_t)d->base_instance); }
+        else if (d->ind) { VkBuffer b; VkDeviceSize o; if (!lookup_buf(d->ind, 16, &b, &o)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndirect(c, b, o, 1, 16); }
         else vkCmdDraw(c, (uint32_t)d->count, (uint32_t)(d->instances ? d->instances : 1), (uint32_t)d->first, (uint32_t)d->base_instance);
     } else {
         static const VkIndexType it[3] = {VK_INDEX_TYPE_UINT8_KHR, VK_INDEX_TYPE_UINT16, VK_INDEX_TYPE_UINT32};

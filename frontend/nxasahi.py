@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # nxasahi: the game library (GTK 4 + libadwaita). Drop NSP / XCI / NSZ files on the window (or Add Game): a base game is imported (scripts/build_ipa_from_nsp.py
 # --platform linux, its JSON progress shown as it builds); an update or DLC joins its game and the game is built again with it. Games are tiles: double-click to play,
-# the menu (or a right-click) for rebuild, properties, the save and log folders, removal.
+# the menu (or a right-click) for rebuild, properties, the save and log folders, removal. Controllers (frontend/controllers.py) sets up and remaps each player's input.
 # Where things are: ~/.local/share/nxasahi/games/<title ID>/ holds links to the game's files and the build (<id>_build/, linux_game.json); saves in
 # ~/.local/share/nxasahi/saves/<title ID>/ (kept when a game is rebuilt or removed); settings in ~/.config/nxasahi/settings.json, a game's own in games/<title ID>/nxasahi.json.
 # Run it through frontend/nxasahi.sh (inside nix develop: Python with PyGObject, the build tools)
@@ -23,6 +23,8 @@ DEFAULTS = {'keys': str(Path.home() / '.switch/prod.keys'), 'language': '', 'ful
 
 sys.path.insert(0, str(REPO / 'dm/tools'))
 import nacp   # noqa: E402  (the game languages, the name and version in control data)
+sys.path.insert(0, str(REPO / 'frontend'))
+import controllers   # noqa: E402  (the controller settings window, the host's input map)
 LANGS = nacp.LANGUAGES
 
 _pipeline = None
@@ -255,18 +257,19 @@ class App(Adw.Application):
         for name, fn, param in (('play', self.play, 's'), ('rebuild', lambda t: self.enqueue(self.games[t]), 's'), ('properties', self.properties, 's'),
                                 ('open-saves', lambda t: self.open_dir(SAVES / t), 's'), ('open-logs', lambda t: self.open_dir(self.games[t].work() / 'logs'), 's'),
                                 ('open-folder', lambda t: self.open_dir(self.games[t].folder), 's'), ('remove', self.remove, 's'), ('stop', self.stop, 's'),
-                                ('add', lambda: self.add_dialog(), None), ('preferences', lambda: self.preferences(), None), ('library', lambda: self.open_dir(GAMES), None),
+                                ('add', lambda: self.add_dialog(), None), ('preferences', lambda: self.preferences(), None), ('controllers', lambda: self.controllers(), None), ('library', lambda: self.open_dir(GAMES), None),
                                 ('desktop', lambda: self.install_desktop(), None), ('about', lambda: self.about(), None)):
             act = Gio.SimpleAction.new(name, GLib.VariantType.new(param) if param else None)
             act.connect('activate', (lambda f: lambda a, p: f(p.get_string()))(fn) if param else (lambda f: lambda a, p: f())(fn))
             self.add_action(act)
-        self.set_accels_for_action('app.add', ['<Control>o']); self.set_accels_for_action('app.preferences', ['<Control>comma'])
+        self.set_accels_for_action('app.add', ['<Control>o']); self.set_accels_for_action('app.preferences', ['<Control>comma']); self.set_accels_for_action('app.controllers', ['<Control>k'])
         self.win = Adw.ApplicationWindow(application=self, default_width=1120, default_height=740, title='nxasahi')
         tv = Adw.ToolbarView()
         hb = Adw.HeaderBar(); self.wtitle = Adw.WindowTitle(title='nxasahi'); hb.set_title_widget(self.wtitle)
         add = Gtk.Button(icon_name='list-add-symbolic', tooltip_text='Add a game (Ctrl+O)', action_name='app.add'); hb.pack_start(add)
-        menu = Gio.Menu(); menu.append('Preferences', 'app.preferences'); menu.append('Open Library Folder', 'app.library'); menu.append('Add to App Launcher', 'app.desktop'); menu.append('About nxasahi', 'app.about')
+        menu = Gio.Menu(); menu.append('Preferences', 'app.preferences'); menu.append('Controllers', 'app.controllers'); menu.append('Open Library Folder', 'app.library'); menu.append('Add to App Launcher', 'app.desktop'); menu.append('About nxasahi', 'app.about')
         hb.pack_end(Gtk.MenuButton(icon_name='open-menu-symbolic', menu_model=menu, primary=True))
+        hb.pack_end(Gtk.Button(icon_name='input-gaming-symbolic', tooltip_text='Controllers (Ctrl+K)', action_name='app.controllers'))
         self.search = Gtk.SearchEntry(placeholder_text='Search games', width_chars=24); self.search.connect('search-changed', lambda *a: self.flow.invalidate_filter()); hb.pack_end(self.search)
         tv.add_top_bar(hb)
         self.toasts = Adw.ToastOverlay()
@@ -420,6 +423,8 @@ class App(Adw.Application):
         if s['fullscreen']: env['DM_FULLSCREEN'] = '1'
         if not s['big_cores']: env['DM_CPUS'] = 'all'
         env['DM_VK_PRECOMPILE'] = str(int(s['precompile']))
+        imap = controllers.map_for_launch()   # the controller bindings (dm/host/linux/front_input.c); none set: the host's built-in map
+        if imap: env['DM_INPUT_MAP'] = str(imap)
         lang = g.conf.get('language') or s['language']
         if lang: env['DM_LANG'] = lang
         env.update(env_pairs(s['extra_env'])); env.update(env_pairs(g.conf.get('extra_env')))
@@ -532,6 +537,9 @@ class App(Adw.Application):
         er.connect('apply', lambda r: (put('extra_env', r.get_text()), self.toast('Saved'))); g4.add(er)
         page.add(g4)
         d.add(page); d.present(self.win)
+
+    # ---- controllers ----
+    def controllers(self): controllers.ControllersDialog(self.toast).present(self.win)
 
     # ---- misc ----
     def open_dir(self, p):

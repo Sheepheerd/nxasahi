@@ -197,6 +197,7 @@ static int player_of(uint32_t id) {   // the reported player on npad id; -1 when
     return id > 0 && id < DM_PLAYERS && reported((int)id) ? (int)id : -1;
 }
 static uint32_t g_styles_supported = 0xffffffffu;   // all of them until SetSupportedNpadStyleSet
+static uint32_t g_hold_type;   // SetNpadJoyHoldType: 0 vertical, 1 horizontal
 // A player's controller reports the first style the game supports of full key, dual Joy-Cons, a right or a left Joy-Con: Pokémon: Let's Go supports neither full key nor dual
 // (its styles are handheld, the single Joy-Cons and the Poké Ball Plus), and a full-key controller never answered its "press a button on the controller you want to use"
 static uint32_t player_style(void) {
@@ -242,8 +243,19 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_pad_latch[p], 0);
         uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
     }
-    s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
     b &= 0xffffull;
+    if (style & (STYLE_JOYLEFT | STYLE_JOYRIGHT) && id != NPAD_HANDHELD) {
+        // A single Joy-Con has one stick (the left one's in lx / ly, the right one's in rx / ry) and its SL / SR on the rail (bits 24 / 25 left, 26 / 27 right), and the
+        // hid service reports them as the Joy-Con lies upright: a game that sets the horizontal hold turns them itself. The player's stick (whichever of the two is deflected
+        // more) is taken as screen directions and turned into the Joy-Con's frame, L / R press SL / SR. Pokémon: Let's Go (single Joy-Cons only, held sideways) read nothing
+        // from the left-stick slot of a right Joy-Con: neither the keyboard nor a controller's stick moved the player
+        int32_t x = pick(a[0], a[2]), y = pick(a[1], a[3]), right = style == STYLE_JOYRIGHT;
+        if (g_hold_type == 1) { int32_t t = x; x = right ? -y : y; y = right ? t : -t; }   // horizontal: right Joy-Con turned clockwise (rail up), left one anticlockwise
+        a[0] = a[1] = a[2] = a[3] = 0; a[right ? 2 : 0] = x; a[right ? 3 : 1] = y;
+        if (b & DM_BTN_L) b |= 1ull << (right ? 26 : 24);
+        if (b & DM_BTN_R) b |= 1ull << (right ? 27 : 25);
+    }
+    s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
     if (s->lx < -STICK_THRESH) b |= 1u << 16;
     if (s->ly > STICK_THRESH) b |= 1u << 17;
     if (s->lx > STICK_THRESH) b |= 1u << 18;
@@ -288,7 +300,6 @@ HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", "dual Joy-Co
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", "left Joy-Con states (not connected on the host)", int, h_hid_StatesJoyLeft, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYLEFT); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", "right Joy-Con states (not connected on the host)", int, h_hid_StatesJoyRight, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYRIGHT); }
 HLE_FORCE("_ZN2nn3hid14DisconnectNpadERKj", "disconnect a controller; ignored by the host", void, h_hid_Disconnect, const uint32_t *id) { (void)id; }
-static uint32_t g_hold_type;
 HLE_FORCE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", "Joy-Con hold orientation; the host only records it", void, h_hid_HoldType, int t) { g_hold_type = (uint32_t)t; }
 HLE_FORCE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", "Joy-Con assignment: dual", int, h_hid_GetJoyAssign, const uint32_t *id) { (void)id; return 0; }
 HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assignment; ignored by the host", void, h_hid_JoySingle, const uint32_t *id) { (void)id; }

@@ -483,7 +483,9 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
     if (p->index < 0 || p->index >= g_rt_n || !g_rt[p->index]) return;
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt[p->index]);
-    if (t && (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && t->samples == 1) {
+    // multisampled targets too (vkCmdClearColorImage / vkCmdClearDepthStencilImage take any sample count): Pokémon Shining Pearl draws its scene into a 4x target whose depth,
+    // never cleared, failed its reversed-Z GEQUAL test everywhere, and its background and characters were not drawn
+    if (t && (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         t->gpu_owned = 1;
         tex_ready(c, t);
         if (g_passlog) LOG("[pass] clear colour %d serial %llu to %g %g %g %g", p->index, (unsigned long long)t->serial, p->rgba[0], p->rgba[1], p->rgba[2], p->rgba[3]);
@@ -498,7 +500,8 @@ static void op_clear_ds(VkCommandBuffer c, const p_clear_ds *p) {
     if (!g_rt_depth) return;
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt_depth);
-    if (t && !(t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && t->samples == 1) {
+    if (g_passlog) LOG("[pass] clear depth %g (mask %d) stencil %d (mask %#x) serial %llu%s", p->depth, p->depth_mask, p->stencil, p->stencil_mask, t ? (unsigned long long)t->serial : 0ull, t ? "" : ": no image");
+    if (t && !(t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {   // multisampled too (op_clear_color)
         VkImageAspectFlags asp = 0;
         if ((t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && p->depth_mask) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
         if ((t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && p->stencil_mask) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -532,7 +535,8 @@ static void op_copy_t2t(VkCommandBuffer c, const p_copy_t2t *p) {
     pthread_mutex_lock(&g_tmu);
     vtex *s = tex_sampled(p->src), *d = tex_get(p->dst);
     if (!s || !d) { pthread_mutex_unlock(&g_tmu); copy_fail("texture to texture: an image is missing"); return; }
-    if (g_passlog) LOG("[pass] copy texture serial %llu %ux%u -> serial %llu %ux%u%s", (unsigned long long)s->serial, s->w, s->h, (unsigned long long)d->serial, d->w, d->h, p->flags & DM_COPY_RESOLVE ? " (resolve)" : "");
+    if (g_passlog) LOG("[pass] copy texture serial %llu %ux%u -> serial %llu %ux%u%s (objects: serial %llu storage %p -> serial %llu storage %p)", (unsigned long long)s->serial, s->w, s->h, (unsigned long long)d->serial, d->w, d->h,
+                       p->flags & DM_COPY_RESOLVE ? " (resolve)" : "", (unsigned long long)p->src->serial, (const void *)p->src->mem, (unsigned long long)p->dst->serial, (const void *)p->dst->mem);
     if (!d->gpu_owned && !d->uploaded) upload(d, p->dst);
     d->gpu_owned = 1;
     VkImageSubresourceLayers ss, ds; VkOffset3D so, dof; VkExtent3D se, de;
