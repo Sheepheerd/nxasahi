@@ -1,6 +1,5 @@
-// Linux build: the AudioToolbox subset hle_audio.c (AudioUnit output) and hle_movie.c (AAC through AudioConverter) use. Every call fails for now, so the host takes
-// its paths for a missing device / decoder: no sound output (as the Mac host without DM_AUDIO=1) and silent AAC movie audio. Open: an SDL3 backend behind the
-// same AudioUnit calls (it is a pull-model render callback, as SDL's audio stream callback), and AAC through FFmpeg
+// Linux build: the AudioToolbox subset hle_audio.c (AudioUnit output) and hle_movie.c (AAC through AudioConverter) use. The output AudioUnit is SDL3 audio
+// (linux/audiounit_sdl.c: the render callback pulled by an SDL audio stream callback); AudioConverter fails, so AAC movie audio is silent (open: AAC through FFmpeg)
 #pragma once
 #include <darwin_compat.h>
 typedef int32_t OSStatus;
@@ -37,17 +36,17 @@ enum {
     kAudioObjectUnknown = 0, kAudioConverterDecompressionMagicCookie = DM_FOURCC('d','m','g','c'),
 };
 #define DM_AT_FAIL ((OSStatus)-1)
-static inline AudioComponent AudioComponentFindNext(AudioComponent after, const AudioComponentDescription *d) { (void)after; (void)d; return NULL; }
-static inline OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *out) { (void)c; *out = NULL; return DM_AT_FAIL; }
-static inline OSStatus AudioComponentInstanceDispose(AudioComponentInstance u) { (void)u; return noErr; }
-static inline OSStatus AudioUnitInitialize(AudioUnit u) { (void)u; return DM_AT_FAIL; }
-static inline OSStatus AudioUnitUninitialize(AudioUnit u) { (void)u; return noErr; }
-static inline OSStatus AudioOutputUnitStart(AudioUnit u) { (void)u; return DM_AT_FAIL; }
-static inline OSStatus AudioOutputUnitStop(AudioUnit u) { (void)u; return noErr; }
-static inline OSStatus AudioUnitGetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope s, AudioUnitElement e, void *data, UInt32 *size) { (void)u; (void)id; (void)s; (void)e; (void)data; (void)size; return DM_AT_FAIL; }
-static inline OSStatus AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope s, AudioUnitElement e, const void *data, UInt32 size) { (void)u; (void)id; (void)s; (void)e; (void)data; (void)size; return DM_AT_FAIL; }
-static inline OSStatus AudioUnitAddPropertyListener(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc p, void *ctx) { (void)u; (void)id; (void)p; (void)ctx; return DM_AT_FAIL; }
-static inline OSStatus AudioUnitRemovePropertyListenerWithUserData(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc p, void *ctx) { (void)u; (void)id; (void)p; (void)ctx; return noErr; }
+AudioComponent AudioComponentFindNext(AudioComponent after, const AudioComponentDescription *d);
+OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *out);
+OSStatus AudioComponentInstanceDispose(AudioComponentInstance u);
+OSStatus AudioUnitInitialize(AudioUnit u);
+OSStatus AudioUnitUninitialize(AudioUnit u);
+OSStatus AudioOutputUnitStart(AudioUnit u);
+OSStatus AudioOutputUnitStop(AudioUnit u);
+OSStatus AudioUnitGetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope s, AudioUnitElement e, void *data, UInt32 *size);
+OSStatus AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope s, AudioUnitElement e, const void *data, UInt32 size);
+OSStatus AudioUnitAddPropertyListener(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc p, void *ctx);
+OSStatus AudioUnitRemovePropertyListenerWithUserData(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc p, void *ctx);
 static inline OSStatus AudioConverterNew(const AudioStreamBasicDescription *in, const AudioStreamBasicDescription *out, AudioConverterRef *c) { (void)in; (void)out; *c = NULL; return DM_AT_FAIL; }
 static inline OSStatus AudioConverterDispose(AudioConverterRef c) { (void)c; return noErr; }
 static inline OSStatus AudioConverterSetProperty(AudioConverterRef c, UInt32 id, UInt32 size, const void *data) { (void)c; (void)id; (void)size; (void)data; return DM_AT_FAIL; }
