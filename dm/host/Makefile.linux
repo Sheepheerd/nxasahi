@@ -11,7 +11,8 @@ ifneq ($(strip $(GAME)),)
 GAME_DIR := $(if $(and $(wildcard ../games/$(GAME)/game.tsv),$(if $(DM_GAMES_FIRST),,1)),../games/$(GAME),$(shell python3 ../games/game.py link $(GAME) gen/$(GAME)/profile >&2 && echo gen/$(GAME)/profile))
 endif
 GAME_H = gen/$(GAME)/game_profile.h
-O = gen/linux
+# Objects per game: they are compiled against its profile header, and a shared folder took one game's objects for another's when its header was the older
+O = gen/linux$(if $(strip $(GAME)),/$(GAME))
 CC = clang
 CFLAGS = -O1 -g -Wall -Wno-unused-function -std=gnu11 -fblocks -D_GNU_SOURCE -Ilinux -include darwin_compat.h \
          -I. -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I../third_party/libvpx -I../third_party/stb_vorbis $(shell pkg-config --cflags sdl3)

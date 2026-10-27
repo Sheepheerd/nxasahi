@@ -4,6 +4,18 @@ A port of [nxnative](https://github.com/seedds/nxnative) to Linux on Apple silic
 
 Upstream is the `upstream` remote. The port keeps the shared sources almost unchanged, so merging upstream stays cheap; Linux-only code lives in `dm/host/linux/`, `dm/host/Makefile.linux` and `flake.nix`.
 
+## Play: the game library
+
+```sh
+frontend/nxasahi.sh          # GTK 4 / libadwaita, in the dev shell
+```
+
+Drag NSP, XCI or NSZ files onto the window (or use **+**): a base game is imported (`scripts/build_ipa_from_nsp.py --platform linux`, its progress shown as it builds, a few minutes the first time), an update or DLC joins its game and the game is built again with it. Double-click a tile to play; its menu (or a right-click) has Rebuild, Properties (language, extra environment), the save and log folders, and Remove. Preferences: the keys file (default `~/.switch/prod.keys`), language, fullscreen, sound, fast cores, shader precompile threads. The menu's **Add to App Launcher** writes a desktop entry.
+
+Where things go: `~/.local/share/nxasahi/games/<title ID>/` (links to the game files, and `<id>_build/` with the extracted files, shaders and host: several GB per game), saves in `~/.local/share/nxasahi/saves/<title ID>/` (kept when a game is rebuilt or removed), settings in `~/.config/nxasahi/`.
+
+The same import from a terminal, for one game's folder of NSPs: `python3 scripts/build_ipa_from_nsp.py <folder> -k ~/.switch/prod.keys --platform linux` (inside `nix develop`); it ends with the command that runs the game and writes `<id>_build/linux_game.json`. NVN games only so far, and not those whose shaders are captured or decoded at run time (the Mac host boots them for that).
+
 ## Build
 
 ```sh
@@ -71,7 +83,8 @@ Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/
 - [ ] Milestone 3: SDL3 front end
   - [x] Window, keyboard and controllers (`linux/front_sdl.c`), mapped as the Mac front end: W A S D left stick, J K U I → A B X Y, F G stick presses, Q E Z C → L R ZL ZR, Return / Tab → + / −, arrows d-pad, Space shake; SDL gamepads one player each, buttons by position. Mario Wonder goes from the title through user select and New Game to character select (3D models render) with scripted input (`DM_KEYS`)
   - [x] Audio: the AudioUnit subset `hle_audio.c` uses, on SDL3 audio (`linux/audiounit_sdl.c`; PipeWire, PulseAudio or ALSA through SDL): the render callback pulled by SDL's stream callback, 5 ms device buffers. On by default (`DM_AUDIO=0` for the silent sink); without a device the silent sink stands in and the watchdog retries. Mario Wonder: no underruns
-- [ ] Packing script: a `--platform linux` that skips Xcode and the IPA
+- [x] Packing script: `--platform linux` (SPIR-V shaders, the Linux host per game, DejaVu stand-ins for the shared fonts, `linux_game.json`)
+- [x] Game library front end (`frontend/nxasahi.py`): drag and drop import with progress, updates and DLC, tiles, properties, preferences
 
 ## Known gaps (open)
 

@@ -12,6 +12,9 @@
 # PLATFORM = 'mac-app' / --platform mac-app: everything 'mac' builds, then a self-contained, double-clickable Mac app of the game (dm/mac/pack_app.py) in the NSP folder, <game name>.app (OUT_IPA / -o
 #   names another path): the launcher dm/mac/launcher.c, the Mac host, the RomFS (APFS clones on the build's volume), the Mac shader libraries, the DLC and the rewritten modules inside it; the save
 #   in ~/Library/Application Support/nxnative/<title ID>/, the log in ~/Library/Logs/nxnative/<title ID>.log. Signed ad-hoc, or with MAC_SIGN / --mac-sign; no hardened runtime, no notarization.
+# PLATFORM = 'linux' / --platform linux (nxasahi: Linux on Apple silicon, Asahi): the same steps up to the shader split, then the SPIR-V shaders of the Vulkan backend (dmsh_spv.py),
+#   the Linux host for the profile (dm/host/Makefile.linux) and the shared-font stand-ins (DejaVu: NXASAHI_FONT_DIR); writes <id>_build/linux_game.json (what the game runs from: the front end
+#   frontend/nxasahi.py reads it) and prints the command that runs the game. NVN games whose shaders are all in their files only (no run-time capture, which boots the Mac host)
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
@@ -511,6 +514,7 @@ def pick_nsps(fam, have, versions):
 
 
 def can_clone(d):   # whether this volume supports APFS clones (nx_extract uses them to save space; without them it writes full copies)
+    if sys.platform != 'darwin': return False   # clonefile is macOS's (Linux: full copies)
     a, b = d / '.clone_test', d / '.clone_test2'
     try:
         a.write_bytes(b'x'); rmtree(b)
@@ -1646,6 +1650,89 @@ def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, 
     return f'cd {q(rd)} && ' + ' '.join(f'{k}={q(v)}' for k, v in renv.items()) + f' {q(host)} {q(patched)}'
 
 
+# ---- PLATFORM 'linux' (nxasahi) ----
+def linux_arm64():
+    return sys.platform.startswith('linux') and os.uname().machine in ('aarch64', 'arm64')
+
+
+def check_prereqs_linux(env, xlate):   # the dev shell (nix develop) has all of them
+    missing = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)] + ([] if _importable('compression.zstd') or _importable('backports.zstd') else ['backports.zstd'])
+    if missing: raise BuildError(f'the current Python ({sys.executable}) is missing modules: {", ".join(missing)} (run inside nix develop)')
+    gone = [t for t in ('dotnet', 'zstd', 'make', 'clang', 'pkg-config') if not shutil.which(t, path=env['PATH'])]
+    if gone: raise BuildError('tools not found: ' + ', '.join(gone) + ' (run inside nix develop)')
+    if not xlate.parent.is_dir(): raise BuildError(f'the shader translator is missing from the repository: {xlate.parent}')
+    if not linux_font_dir(): raise BuildError('no DejaVu fonts for the shared-font stand-ins: NXASAHI_FONT_DIR (set by nix develop) names their folder')
+
+
+def linux_font_dir():
+    for d in (os.environ.get('NXASAHI_FONT_DIR'), '/run/current-system/sw/share/X11/fonts', '/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/TTF', '/usr/share/fonts/dejavu-sans-fonts'):
+        if d and (Path(d) / 'DejaVuSans.ttf').is_file() and (Path(d) / 'DejaVuSans-Bold.ttf').is_file(): return Path(d)
+    return None
+
+
+def linux_shaders(py, repo, sh, env, logs, g, pkg_key=None):
+    """The SPIR-V shaders of the Linux host's Vulkan backend (dm/gfx/tools/dmsh_spv.py: the Metal chain's translation, stopped before SPIRV-Cross) into sh/out/spv-<chain>.
+    Reused when the shader package and the chain's tools and profile are as at the last successful run"""
+    PROG.stage('Linux shaders')
+    chain = chain_of(repo)
+    out = sh / 'out' / f'spv-{chain}'; kf = sh / 'out' / f'spv-{chain}.key'
+    key = None
+    if pkg_key:
+        PROG.set(step='checking the inputs')
+        key = fingerprint(pkg_key, ('files', chain_files(repo) + [repo / 'dm/gfx/tools/dmsh_spv.py']), ('files', profile_files(g)), env=env)
+        note = reused(kf, key)
+        if note is not None and next(out.glob('*.vkb'), None): PROG.end(f'{note}, reused (inputs unchanged)'); return out
+    rmtree(kf)
+    try: PROG.watch(ShaderWatch(g, out, Path(env['WORK'])))
+    except Exception: pass
+    run([py, repo / 'dm/gfx/tools/dmsh_spv.py', sh / 'pkg', sh / 'out'], logs / 'dmsh_spv.log', env=env)
+    PROG.watch(None)
+    n = sum(1 for _ in out.glob('*.vkb')) if out.is_dir() else 0
+    if n == 0: raise BuildError(f'no Linux shaders in {out} (logs/dmsh_spv.log)')
+    if key: kf.write_text(f'{key}\n')
+    PROG.end(f'{n} shaders')
+    return out
+
+
+def linux_host(py, repo, work, env, logs, g):
+    """The stage "Linux host": the host for the profile (dm/host/Makefile.linux, its objects per game; copied to <id>_build/tools/dmhost-linux since dm/host/dmhost is the last game's),
+    and the shared fonts' stand-ins in <id>_build/font: DejaVu Sans as the standard font, the button-icon font made over DejaVu Sans Bold. Returns (host, font folder)"""
+    PROG.stage('Linux host', step='building')
+    host = repo / 'dm/host'
+    run(['make', '-f', 'Makefile.linux', f'GAME={g.id}', f'-j{os.cpu_count() or 8}'], logs / 'linux_host_build.log', env=env, cwd=host)
+    out = work / 'tools/dmhost-linux'; out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(host / 'dmhost', out)
+    PROG.set(step='fonts')
+    font, fd = work / 'font', linux_font_dir()
+    ttf, kf = font / 'nintendo_ext.ttf', font / 'nintendo_ext.key'
+    key = fingerprint(('files', [repo / 'dm/tools/make_ext_font.py', fd / 'DejaVuSans-Bold.ttf']))
+    if not (ttf.is_file() and reused(kf, key) is not None):
+        rmtree(kf); font.mkdir(parents=True, exist_ok=True)
+        run([py, repo / 'dm/tools/make_ext_font.py', ttf, fd / 'DejaVuSans-Bold.ttf'], logs / 'make_ext_font.log', env=env)
+        kf.write_text(f'{key}\n')
+    (font / 'standard.ttf').unlink(missing_ok=True); shutil.copyfile(fd / 'DejaVuSans.ttf', font / 'standard.ttf')   # copyfile: not the Nix store's read-only mode
+    PROG.end(str(out))
+    return out, font
+
+
+def linux_run(work, game, patched, host, font, spv, aoc, lang, g, app, name, version, pkg_ver, icon, env_file=''):
+    """<id>_build/linux_game.json, what the front end runs the game from (title, name, version, icon, host, modules, environment), and the command that runs it in a window with sound"""
+    rd = work / 'run'
+    for d in ('save', 'temp'): (rd / d).mkdir(parents=True, exist_ok=True)
+    renv = {'DM_ROOT': work, 'DM_ROMFS': game / 'RomFS', 'DM_SAVE': rd / 'save', 'DM_TEMP': rd / 'temp', 'DM_FONT_DIR': font, 'DM_VK_SPV': spv, 'DM_NVN_SHMAP': g.table('shader_map.tsv'), 'DM_LANG': lang}
+    if aoc: renv['DM_AOC_DIR'] = aoc
+    for k in ('DM_GAMES_DIR', 'DM_GAMES_FIRST'):   # a derived or provisional profile: the host finds its tables through them
+        if os.environ.get(k): renv[k] = os.environ[k]
+    if env_file: renv.update(env_file_pairs(env_file))
+    icd = Path('/run/opengl-driver/share/vulkan/icd.d/asahi_icd.aarch64.json')   # NixOS: keep the Vulkan loader to the Asahi driver
+    if icd.is_file(): renv['VK_DRIVER_FILES'] = icd
+    m = {'format': 1, 'title_id': f'{app:016X}', 'profile': g.id, 'name': name or g.get('name', g.id), 'version': version or '', 'package': pkg_ver,
+         'icon': str(icon) if icon else '', 'host': str(host), 'modules': str(patched), 'cwd': str(rd), 'env': {k: str(v) for k, v in renv.items()}, 'built': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    (work / 'linux_game.json').write_text(json.dumps(m, indent=1) + '\n')
+    q = lambda v: shlex.quote(str(v))
+    return f'cd {q(rd)} && ' + ' '.join(f'{k}={q(v)}' for k, v in renv.items()) + f' DM_WINDOW=1 {q(host)} {q(patched)}'
+
+
 MTL_ARCH_M = '''#import <Metal/Metal.h>
 int main(void) { @autoreleasepool { id<MTLDevice> d = MTLCreateSystemDefaultDevice(); if (!d) return 1; printf("%s\\n", d.architecture.name.UTF8String); return 0; } }
 '''
@@ -1737,7 +1824,7 @@ def parse_args(argv):
     ap.add_argument('--app-name', help='app name on the home screen (default: the game name in the base NSP)')
     ap.add_argument('--bundle-id', help='the app\'s bundle ID (default: saved Xcode ID when preparing again, else org.nxnative.<base game title ID in lowercase>)')
     ap.add_argument('--prepare-xcode', action='store_true', help='prepare a per-game Xcode project and add it to the shared workspace instead of packing an IPA (requires keeping extracted files)')
-    ap.add_argument('--platform', choices=('ios', 'mac', 'mac-app'), help='ios = the IPA (or the Xcode project); mac = for development: build only what running the game on this Mac needs (the Mac shaders and the Mac host, '
+    ap.add_argument('--platform', choices=('ios', 'mac', 'mac-app', 'linux'), help='ios = the IPA (or the Xcode project); mac = for development: build only what running the game on this Mac needs (the Mac shaders and the Mac host, '
                     'no iOS shaders, Xcode project or IPA), keep the extracted files and print the command that runs the game; mac-app = what mac builds, then a self-contained, double-clickable '
                     'Mac app of the game (default: <game name>.app in the NSP folder, -o names another) (default: the PLATFORM setting, ios)')
     ap.add_argument('--mac-sign', help='--platform mac-app: the codesign identity for the app, e.g. "Developer ID Application: <name> (<team>)" (default: the MAC_SIGN setting, else ad-hoc)')
@@ -1789,12 +1876,14 @@ def main(args=None):
     repo = find_repo(here)
     prepare_xcode = args.prepare_xcode or PREPARE_XCODE
     platform = args.platform or PLATFORM
-    if platform not in ('ios', 'mac', 'mac-app'): raise BuildError(f'PLATFORM / --platform must be ios, mac or mac-app: {platform}')
-    mac = platform in ('mac', 'mac-app')   # the Mac's shaders and host only: no iOS shaders, Xcode project or IPA (mac_run prints the command; mac-app packs a Mac app, mac_app)
+    if platform not in ('ios', 'mac', 'mac-app', 'linux'): raise BuildError(f'PLATFORM / --platform must be ios, mac, mac-app or linux: {platform}')
+    linux = platform == 'linux'   # Linux on Apple silicon: like 'mac' up to the shader split, then the SPIR-V shaders, the Linux host and linux_game.json (linux_run)
+    mac = platform in ('mac', 'mac-app', 'linux')   # the host's shaders and host only: no iOS shaders, Xcode project or IPA (mac_run prints the command; mac-app packs a Mac app, mac_app)
     mac_pack = platform == 'mac-app'
     if args.mac_sign and not mac_pack: raise BuildError('--mac-sign signs the Mac app: it needs --platform mac-app')
     if mac and prepare_xcode: raise BuildError(f'--prepare-xcode makes an iPhone project: it cannot be combined with --platform {platform}')
-    if mac and not apple_silicon(): raise BuildError(f'--platform {platform} runs the game in the Mac host, which runs the game\'s own arm64 code natively: it needs a Mac with Apple silicon, and this Mac has an Intel processor')
+    if linux and not linux_arm64(): raise BuildError('--platform linux runs the game\'s own arm64 code natively: it needs Linux on a 64-bit Arm machine (Asahi on Apple silicon)')
+    if mac and not linux and not apple_silicon(): raise BuildError(f'--platform {platform} runs the game in the Mac host, which runs the game\'s own arm64 code natively: it needs a Mac with Apple silicon, and this Mac has an Intel processor')
     keep = KEEP_EXTRACTED if args.keep_extracted is None else args.keep_extracted
     if mac and not keep: say('keeping the extracted game files all the same: the game runs from them on the Mac' + (' and the app is made of clones of them' if mac_pack else '')); keep = True
     if prepare_xcode and not keep: raise BuildError('--prepare-xcode requires --keep-extracted: Xcode builds from the extracted files')
@@ -1812,6 +1901,7 @@ def main(args=None):
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
     env.setdefault('USER', getpass.getuser())   # xcodegen fails without USER (Couldn't find current username)
     configure_dotnet(env)
+    if linux: os.environ['DM_THREAD_REG'] = env['DM_THREAD_REG'] = 'tpidr_el0'   # the Linux host's thread slots (dm/tools/nso_asm.py); part of the rewrite's cache key
     env.setdefault('J', str(os.cpu_count() or 8))   # shader_split.py's and dmsh_build.py's workers (their default is 8)
     py = sys.executable
     app, fam = scan_nsps(nsp_dir)
@@ -1874,13 +1964,14 @@ def main(args=None):
             if not saved_signing and legacy_config.exists() and f'/gen/{g.id}/' in legacy_config.read_text():
                 saved_signing = xcode_projects.signing_settings(repo / 'dm/ios/DmIOS.xcodeproj')
         except ValueError as e: raise BuildError(str(e)) from e
-    say('Mac app: the Mac shaders and the Mac host, packed into a Mac app; no iOS shaders, Xcode project or IPA' if mac_pack else 'Mac-only build for development: the Mac shaders and the Mac host, no iOS shaders, Xcode project or IPA' if mac else f'Xcode project: {project}' if prepare_xcode else f'output IPA: {out_ipa}')
+    say('Linux build: the SPIR-V shaders, the Linux host and linux_game.json; no iOS shaders, Xcode project or IPA' if linux else 'Mac app: the Mac shaders and the Mac host, packed into a Mac app; no iOS shaders, Xcode project or IPA' if mac_pack else 'Mac-only build for development: the Mac shaders and the Mac host, no iOS shaders, Xcode project or IPA' if mac else f'Xcode project: {project}' if prepare_xcode else f'output IPA: {out_ipa}')
     say(f'work folder (extracted game files in extract/, {"kept for the next build" if keep else "deleted after the IPA is built"}): {work}')
     xlate = repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
     # DM_GAME picks the profile; DM_ROOT / WORK point at <id>_build: the tools' default paths and temporary directories all stay inside it
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     logs = work / 'logs'
-    check_prereqs(env, xlate, mac)
+    if linux: check_prereqs_linux(env, xlate)
+    else: check_prereqs(env, xlate, mac)
     picks = pick_nsps(fam, have, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
@@ -1919,6 +2010,9 @@ def main(args=None):
     vkcap = gfx == 'vulkan' and src['vk_capture'][0]   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_shaders)
     glcap = gfx == 'gl' and src['gl_capture'][0]   # GLSL the game puts together at run time (LÖVE), captured in the Mac host (capture_shaders)
     uedec = gfx == 'nvn' and src['ue_decode'][0]   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
+    if linux and gfx != 'nvn': raise BuildError(f'{src["graphics"][1]}: the Linux host draws NVN games only so far (the Vulkan and GL layers are the Mac host\'s)')
+    if linux and (glslc or uedec or src['oodle_packs'][0] or src['ue_legacy'][0]):
+        raise BuildError('this game\'s shaders are captured or decoded by booting it in the Mac host (run-time compiles, Unreal or Oodle packs): not done on Linux yet')
     if gfx == 'vulkan': say(f'Vulkan game ({src["graphics"][1]}): vk_shaders.py translates the shaders instead of the NVN shader chain')
     if gfx == 'gl': say(f'OpenGL game ({src["graphics"][1]}): gl_shaders.py translates the shaders instead of the NVN shader chain')
     for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (glcap, 'gl_capture'), (uedec, 'ue_decode'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs'), (gfx == 'nvn' and src['ue_legacy'][0], 'ue_legacy')):
@@ -1967,7 +2061,7 @@ def main(args=None):
         oodle = (lambda: {'DM_OODLE_HOST': str(build_mac_host(repo, work / 'tools/dmhost', env, logs, g)), 'DM_OODLE_MODULES': str(patched)}) if src['oodle_packs'][0] or src['ue_legacy'][0] else None
         own = bool(provisional or derived)   # the shader tables come from this build's split (the profile's are checked otherwise)
         pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle)
-        ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
+        ios = linux_shaders(py, repo, sh, env, logs, g, pkey) if linux else build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)   # the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     if mac_pack:   # a Mac app: the Mac host, then the app packed from it and the build's files
         host, font = mac_host(py, repo, work, env, logs, g)
@@ -1978,6 +2072,14 @@ def main(args=None):
         say(f'done: {out_ipa} ({tree_size(out_ipa)[1] / 2**30:.1f} GB); '
             f'open it from Finder. Its save is in ~/Library/Application Support/nxnative/{app:016X}/, its log in ~/Library/Logs/nxnative/{app:016X}.log')
         report_profile_status(g, reg, pkg_ver, derived, provisional, 'Mac app')
+        return
+    if linux:   # a Linux build ends with the Linux host, the game's manifest for the front end and the command that runs it
+        host, font = linux_host(py, repo, work, env, logs, g)
+        cmd = linux_run(work, game, patched, host, font, ios, aoc, lang, g, app, app_name, app_version, pkg_ver, icon, args.env_file or DM_ENV_FILE)
+        rmtree(work / 'tmp')
+        say(f'done: the game runs on Linux with this command (its save in {work / "run/save"}, kept from run to run):')
+        PROG.say(cmd)
+        report_profile_status(g, reg, pkg_ver, derived, provisional, 'Linux build')
         return
     if mac:   # a Mac-only build ends with the Mac host and the command that runs the game
         host, font = mac_host(py, repo, work, env, logs, g)
