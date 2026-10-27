@@ -25,6 +25,7 @@ int mtl_link_stalled(void) { return 0; }
 int mtl_snap_on(void) { return 0; }
 uint64_t mtl_snap_acquire_wait(void) { return 0; }
 void mtl_set_frame(uint64_t f) { atomic_store(&g_frame_no, f); }
+uint64_t vkh_frame(void) { return atomic_load(&g_frame_no); }   // the frame the game is recording (vk_replay.c's GPU timing)
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
@@ -66,8 +67,6 @@ uint64_t mtl_pkg_miss(void) { return 0; }
 uint64_t mtl_upload_ns_take(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return 0; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return -1; }
-int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; *t0 = *t1 = 0; return 0; }
 void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 

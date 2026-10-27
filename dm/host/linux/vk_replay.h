@@ -11,8 +11,10 @@ typedef struct vtex {
     VkImageUsageFlags usage;
     int gpu_owned;            // written by the GPU (a render target, cleared, a copy destination): its content is the GPU's, never reloaded from guest memory
     int uploaded; uint64_t stamp;   // loaded from guest memory, at this dirty-tracking stamp (nvn_dirty.c)
+    uint64_t clean_at; const void *span;   // the dirty clock when last found unwritten since stamp; its tracked range (nvn_dirty_span)
     uint64_t release_after;   // released: destroyed once the timeline passes this (0 = live)
     vkview *views;
+    const uint8_t *kmem, *kend; nvn_texdesc kd; uint32_t khash; int refs;   // the storage it is found by (vk_replay.c's sharing), and the texture objects that refer to it
 } vtex;
 extern pthread_mutex_t g_tmu;   // the texture table
 vtex *vkr_tex_sampled(const tex_t *o, VkCommandBuffer upload_unused);   // under g_tmu: the image, loaded from guest memory first when it must be

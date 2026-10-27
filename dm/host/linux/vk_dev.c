@@ -67,6 +67,11 @@ int vkd_init(int with_window) {
     if (g_vkd.index_u8) dext[nd++] = VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME;
     if (with_window) dext[nd++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     if (g_vkd.placed) { dext[nd++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME; dext[nd++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME; }
+    // DM_VK_ROBUST=1 (diagnostic): buffer reads past a binding's range return 0, as Maxwell's constant buffer reads do (robustness2)
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .robustBufferAccess2 = VK_TRUE};
+    if (getenv("DM_VK_ROBUST") && has_ext(g_vkd.pd, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+        dext[nd++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME; have.features.robustBufferAccess = VK_TRUE; r2.pNext = f13.pNext; f13.pNext = &r2;
+        LOG("vulkan: robust buffer access 2 on (DM_VK_ROBUST)"); }
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vkd.qf, .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &have, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi, .enabledExtensionCount = nd, .ppEnabledExtensionNames = dext};

@@ -318,3 +318,28 @@ int clonefile(const char *src, const char *dst, uint32_t flags) {
     if (!access(dst, F_OK)) { errno = EEXIST; return -1; }   // as clonefile: the destination must not exist
     return clone_tree(src, dst);
 }
+
+// ---- big cores ----
+// On a CPU with cores of different capacity (Apple M1 under Asahi: CPUs 0-3 Icestorm at capacity 493, 4-7 Firestorm at 1024) the scheduler's energy-aware placement kept the
+// game's threads on the small cores, where Mario Wonder's frame took 18 ms against 16.7 ms (its 60 fps) on the large ones. Before main, the process limits itself to the
+// cores of the highest capacity; every thread inherits it. DM_CPUS=all leaves the placement to the scheduler, DM_CPUS=<list> (as taskset -c) picks the cores
+#include <sched.h>
+static int cpu_capacity(int c) {
+    char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+    FILE *f = fopen(p, "r"); int v = -1; if (f) { if (fscanf(f, "%d", &v) != 1) v = -1; fclose(f); } return v;
+}
+__attribute__((constructor)) static void prefer_big_cores(void) {
+    const char *e = getenv("DM_CPUS"); if (e && !strcmp(e, "all")) return;
+    cpu_set_t set; CPU_ZERO(&set); int n = 0;
+    if (e && *e) {   // a list: 4-7 or 4,5,6,7
+        for (const char *p = e; *p;) { char *q; long a = strtol(p, &q, 10), b = a; if (q == p) break; if (*q == '-') { p = q + 1; b = strtol(p, &q, 10); }
+            for (long c = a; c <= b && c < CPU_SETSIZE; c++) if (c >= 0) { CPU_SET((int)c, &set); n++; }
+            p = *q == ',' ? q + 1 : q; if (*q && *q != ',') break; }
+    } else {
+        int cap[CPU_SETSIZE], ncpu = 0, best = -1, worst = 1 << 30;
+        for (int c = 0; c < 256; c++) { cap[c] = cpu_capacity(c); if (cap[c] < 0) break; ncpu = c + 1; if (cap[c] > best) best = cap[c]; if (cap[c] < worst) worst = cap[c]; }
+        if (ncpu < 2 || best <= worst) return;   // all cores alike (or not known): nothing to choose
+        for (int c = 0; c < ncpu; c++) if (cap[c] == best) { CPU_SET(c, &set); n++; }
+    }
+    if (n && !sched_setaffinity(0, sizeof set, &set)) fprintf(stderr, "[dm] CPU: %d core%s of the highest capacity (DM_CPUS=all for every core)\n", n, n == 1 ? "" : "s");
+}

@@ -159,6 +159,7 @@ uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, s
     for (size_t i = 5; i < words;) {
         const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16, drop = 0;
         if (op == OpCapability && drop_f64 && w[1] == CapFloat64) { drop = 1; *changes |= SPVR_FIT_FLOAT64; }
+        if ((op == OpDecorate && n >= 3 && w[2] == 0) || (op == 72 && n >= 4 && w[3] == 0)) { drop = 1; *changes |= SPVR_FIT_RELAXED; }   // RelaxedPrecision (decoration 0) on an id or a member
         if (op == OpCapability && drop_il && (w[1] == CapPixelInterlock || w[1] == CapSampleInterlock || w[1] == CapShadingRateInterlock)) { drop = 1; *changes |= SPVR_FIT_INTERLOCK; }
         if (op == OpExtension && drop_il && !strcmp((const char *)(w + 1), "SPV_EXT_fragment_shader_interlock")) { drop = 1; *changes |= SPVR_FIT_INTERLOCK; }
         if (op == OpExecutionMode && drop_il && w[2] >= 5366 && w[2] <= 5371) { drop = 1; *changes |= SPVR_FIT_INTERLOCK; }   // Pixel / Sample / ShadingRate Interlock Ordered / Unordered
@@ -250,4 +251,49 @@ uint32_t *spvr_gl_depth(const uint32_t *code, size_t words, size_t *out_words) {
     if (!nret) { free(o); return NULL; }
     o[3] = bound;
     *out_words = k; return o;
+}
+
+// ---- spvr_init_outputs ----
+enum { OpTypeFunction2 = 33, OpConstantComposite = 44, OpLabel = 248, OpVariable2 = 59, SCFunction = 7 };
+uint32_t *spvr_init_outputs(const uint32_t *code, size_t words, size_t *out_words) {
+    if (words < 5 || code[0] != 0x07230203) return NULL;
+    uint32_t bound = code[3], entry = 0, model = UINT32_MAX, t_float = 0, t_v4 = 0;
+    size_t first_fn = 0;
+    uint8_t *builtin = calloc(bound, 1); uint32_t *ptr_sc = calloc(bound, sizeof *ptr_sc), *ptr_t = calloc(bound, sizeof *ptr_t), outs[64]; int nout = 0;
+    if (!builtin || !ptr_sc || !ptr_t) goto fail;
+    for (size_t i = 5; i < words;) {
+        const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16; if (!n || i + n > words) goto fail;
+        if (op == OpEntryPoint && !entry) { model = w[1]; entry = w[2]; }
+        else if (op == OpTypeFloat && w[2] == 32 && !t_float) t_float = w[1];
+        else if (op == OpTypeVector && w[2] == t_float && t_float && w[3] == 4 && !t_v4) t_v4 = w[1];
+        else if (op == OpDecorate && w[2] == DecBuiltIn && w[1] < bound) builtin[w[1]] = 1;
+        else if (op == OpTypePointer && w[1] < bound) { ptr_sc[w[1]] = w[2] + 1; ptr_t[w[1]] = w[3]; }
+        else if (op == OpVariable2 && w[1] < bound && w[2] < bound && w[3] == SCOutput && ptr_t[w[1]] == t_v4 && t_v4 && !builtin[w[2]] && nout < 64) outs[nout++] = w[2];
+        else if (op == OpFunction && !first_fn) first_fn = i;
+        i += n;
+    }
+    if ((model != 0 && model != 2) || !nout || !first_fn || !t_v4) goto fail;   // vertex and tessellation evaluation shaders (a geometry shader's outputs are per emitted vertex)
+    uint32_t c0 = bound++, c1 = bound++, cv = bound++;
+    uint32_t decl[] = {(4u << 16) | OpConstant, t_float, c0, 0, (4u << 16) | OpConstant, t_float, c1, 0x3f800000u, (7u << 16) | OpConstantComposite, t_v4, cv, c0, c0, c0, c1};
+    size_t nd = sizeof decl / sizeof *decl;
+    uint32_t *o = malloc((words + nd + 3 * (size_t)nout) * sizeof *o); if (!o) goto fail;
+    size_t k = 0; int in_entry = 0, state = 0;   // state: 1 after the entry's first OpLabel (its OpVariables follow), 2 once the stores are in
+    for (size_t i = 0; i < words;) {
+        if (i == first_fn) { memcpy(o + k, decl, sizeof decl); k += nd; }
+        const uint32_t *w = code + i; uint32_t op = i < 5 ? 0 : w[0] & 0xFFFF, n = i < 5 ? 5 : w[0] >> 16;
+        if (op == OpFunction) in_entry = w[2] == entry;
+        if (in_entry && state == 1 && !(op == OpVariable2 && w[3] == SCFunction)) {
+            for (int j = 0; j < nout; j++) { o[k++] = (3u << 16) | OpStore; o[k++] = outs[j]; o[k++] = cv; }
+            state = 2;
+        }
+        memcpy(o + k, w, n * sizeof *o); k += n;
+        if (in_entry && op == OpLabel && !state) state = 1;
+        i += n;
+    }
+    o[3] = bound;
+    free(builtin); free(ptr_sc); free(ptr_t);
+    *out_words = k; return o;
+fail:
+    free(builtin); free(ptr_sc); free(ptr_t);
+    return NULL;
 }

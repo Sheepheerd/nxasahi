@@ -22,9 +22,12 @@ static struct { bbuf ubo[NST][16], ssbo[NST][16]; uint64_t tex[NST][256], samp[N
 
 // ---- shaders ----
 #define NBIND_MAX 96
-typedef struct { uint16_t b; char desc; char kind[12]; int reg, off; char skind[12]; int sreg, soff; uint8_t dim, arr, ms, dep; uint16_t cnt; } vkbind;
+// a binding's kind and sampler kind (the .vkb's names), as numbers for the per-draw descriptor writes
+enum { BK_OTHER, BK_SUPPORT, BK_C1, BK_CBUF, BK_DRVCB, BK_SBUF, BK_UBO_PTR, BK_TEX, BK_TEX_UBO };
+enum { BS_OTHER, BS_SAMP_TEX, BS_SAMP, BS_SAMP_ID, BS_SAMP_UBO };
+typedef struct { uint16_t b; char desc; char kind[12]; int reg, off; char skind[12]; int sreg, soff; uint8_t dim, arr, ms, dep; uint16_t cnt; uint8_t k, sk; } vkbind;
 typedef struct vks {
-    char key[17]; struct vks *next; int stage, ok;
+    char key[17]; uint64_t k64; struct vks *next; int stage, ok;
     VkShaderEXT sh; VkShaderStageFlagBits vstage;
     VkShaderEXT sh_gl; uint32_t *spv; size_t nspv;   // the GL-depth variant (spvr_gl_depth), made the first time it is needed from the fitted SPIR-V kept here
     int nb; vkbind bd[NBIND_MAX];
@@ -116,26 +119,41 @@ static void parse_vkb(vks *s, const char *txt) {
                 b->b = (uint16_t)atoi(f[0]); b->desc = f[1][0]; snprintf(b->kind, sizeof b->kind, "%s", f[2]); b->reg = *f[3] ? atoi(f[3]) : -1; b->off = *f[4] ? atoi(f[4]) : 0;
                 snprintf(b->skind, sizeof b->skind, "%s", f[5]); b->sreg = *f[6] ? atoi(f[6]) : -1; b->soff = *f[7] ? atoi(f[7]) : 0;
                 b->dim = (uint8_t)atoi(f[8]); b->arr = (uint8_t)atoi(f[9]); b->ms = (uint8_t)atoi(f[10]); b->dep = (uint8_t)atoi(f[11]); b->cnt = (uint16_t)atoi(f[12]);
+                static const char *const kn[] = {"", "support", "c1", "cbuf", "drvcb", "sbuf", "ubo_ptr", "tex", "tex_ubo"}, *const sn[] = {"", "samp_tex", "samp", "samp_id", "samp_ubo"};
+                b->k = BK_OTHER; for (int i = 1; i < 9; i++) if (!strcmp(b->kind, kn[i])) b->k = (uint8_t)i;
+                b->sk = BS_OTHER; for (int i = 1; i < 5; i++) if (!strcmp(b->skind, sn[i])) b->sk = (uint8_t)i;
             }
         }
         if (!e) break; p = e + 1;
     }
 }
-// The shader of a program stage, made the first time (its key from prog_key; NULL when there is none or it cannot be made, logged once per key)
-static vks *shader_get(const prog_t *p, int st) {
-    uint8_t k8[8]; if (!prog_key(p, (unsigned)st, k8)) return NULL;
-    char key[17]; for (int i = 0; i < 8; i++) snprintf(key + 2 * i, 3, "%02x", k8[i]);
+// The i-th shader of a program, made the first time (its key from prog_key, which takes the index in the program's list, not a stage: a compute program is one
+// shader at index 0; the shader's stage is the one its translation names, in its .vkb header). NULL when there is none or it cannot be made, logged once per key
+static int stage_of_name(const char *s) { static const char *const n[NST] = {"vs", "ps", "gs", "hs", "ds", "cs"}; for (int i = 0; i < NST; i++) if (!strncmp(s, n[i], 2)) return i; return -1; }
+static int drawlog(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DRAWLOG") != NULL; return v; }   // DM_VK_DRAWLOG: draw counters at powers of two
+static uint64_t g_st_initout;   // vertex-stage shaders whose outputs were initialized (spvr_init_outputs)
+static vks *shader_get(const prog_t *p, int idx) {
+    uint8_t k8[8]; if (!prog_key(p, (unsigned)idx, k8)) return NULL;
+    int st = -1;
+    uint64_t k64; memcpy(&k64, k8, 8);   // found by the key's bytes; its hex form only for a shader made now
     unsigned hsh = (k8[0] | k8[1] << 8) & 1023;
     pthread_mutex_lock(&g_shmu);
-    for (vks *s = g_sh[hsh]; s; s = s->next) if (!strcmp(s->key, key)) { pthread_mutex_unlock(&g_shmu); return s->ok ? s : NULL; }
-    vks *s = calloc(1, sizeof *s); snprintf(s->key, sizeof s->key, "%s", key); s->stage = st; s->vstage = vstage_of(st);
+    for (vks *s = g_sh[hsh]; s; s = s->next) if (s->k64 == k64) { pthread_mutex_unlock(&g_shmu); return s->ok ? s : NULL; }
+    char key[17]; for (int i = 0; i < 8; i++) snprintf(key + 2 * i, 3, "%02x", k8[i]);
+    vks *s = calloc(1, sizeof *s); snprintf(s->key, sizeof s->key, "%s", key); s->k64 = k64;
     s->next = g_sh[hsh]; g_sh[hsh] = s;
     char path[1200]; uint8_t *code = NULL, *vkb = NULL, *job = NULL; size_t ncode = 0, nvkb = 0, njob = 0;
     snprintf(path, sizeof path, "%s/%s.vk.spv", g_spv, key); int have = read_file(path, &code, &ncode);
     snprintf(path, sizeof path, "%s/%s.vkb", g_spv, key); have = have && read_file(path, &vkb, &nvkb);
     snprintf(path, sizeof path, "%s/%s.job.json", g_spv, key); if (have) read_file(path, &job, &njob);
-    if (!have) { g_st_nokey++; if (g_st_nokey <= 8) LOG("[RED] vulkan draws: no translated shader %s (stage %d) in %s", key, st, g_spv); free(code); free(vkb); pthread_mutex_unlock(&g_shmu); return NULL; }
+    { const char *ov = getenv("DM_VK_SHOVERRIDE"), *m = ov ? strstr(ov, key) : NULL;   // diagnostic: DM_VK_SHOVERRIDE=<key>=<spv file>[,...] replaces that shader's code
+      if (have && m && m[16] == '=') { char f[1024]; size_t n = strcspn(m + 17, ","); if (n >= sizeof f) n = sizeof f - 1; memcpy(f, m + 17, n); f[n] = 0;
+          uint8_t *oc = NULL; size_t on = 0; if (read_file(f, &oc, &on)) { free(code); code = oc; ncode = on; LOG("vulkan draws: shader %s replaced by %s", key, f); } } }
+    if (!have) { g_st_nokey++; if (g_st_nokey <= 8) LOG("[RED] vulkan draws: no translated shader %s (index %d) in %s", key, idx, g_spv); free(code); free(vkb); pthread_mutex_unlock(&g_shmu); return NULL; }
     parse_vkb(s, (const char *)vkb);
+    { const char *h = strchr((const char *)vkb, ' '); h = h ? strchr(h + 1, ' ') : NULL; st = h ? stage_of_name(h + 1) : -1; }   // "# <key> <stage> set <n>"
+    if (st < 0) { LOG("[RED] vulkan draws: shader %s: no stage in its .vkb", key); free(code); free(vkb); free(job); pthread_mutex_unlock(&g_shmu); return NULL; }
+    s->stage = st; s->vstage = vstage_of(st);
     // c1: the shader's own constants, from its translation job
     const char *c1 = job ? strstr((const char *)job, "\"c1\": \"") : NULL;
     uint8_t *c1d = NULL; size_t c1n = 0;
@@ -143,6 +161,7 @@ static vks *shader_get(const prog_t *p, int st) {
     buffer_with(c1d, c1n > 65536 ? 65536 : (c1n ? c1n : 256), &s->c1, &s->c1m); s->c1_len = (uint32_t)c1n; free(c1d);
     spvr_device dev = {0, 0, 0}; size_t fw; unsigned ch;
     uint32_t *fit = spvr_fit((const uint32_t *)code, ncode / 4, &dev, &fw, &ch);
+    if (fit && (st == 0 || st == 4)) { size_t iw; uint32_t *io = spvr_init_outputs(fit, fw, &iw); if (io) { free(fit); fit = io; fw = iw; g_st_initout++; } }   // unwritten output components read 0, as on Maxwell
     VkDescriptorSetLayout sets[5] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl};
     VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = s->vstage,
         .nextStage = st == 0 ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : st == 2 || st == 4 ? VK_SHADER_STAGE_FRAGMENT_BIT :
@@ -255,6 +274,11 @@ static VkImageView view_get(vtex *t, const vkbind *b, const tex_t *o, const view
 // ---- descriptor sets: a pool per ring slot, reset when its submission is reused ----
 #define POOL_SETS 256   // sets per pool; a submission takes as many pools as it needs, all reset when its ring slot is reused
 typedef struct { VkDescriptorPool p[256]; int n, cur; } pool_chain;
+// Sets made in this ring slot, by a hash of everything written into them: a draw whose stage would get the same descriptors takes the set already made (allocating and
+// writing a set per stage per draw was the host's largest cost after the dirty checks). Emptied with the slot's pools
+#define SETC 4096
+typedef struct { uint64_t h; VkDescriptorSet set; } setc_ent;
+static setc_ent g_setc[16][SETC]; static uint64_t g_setc_hit, g_setc_miss;
 static pool_chain g_pools[16]; static int g_pool_slot = -1;
 static VkDescriptorPool pool_new(void) {
     VkDescriptorPoolSize ps[5]; uint32_t np = 0;
@@ -264,13 +288,71 @@ static VkDescriptorPool pool_new(void) {
     VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = POOL_SETS, .poolSizeCount = np, .pPoolSizes = ps};
     VkDescriptorPool p = VK_NULL_HANDLE; if (vkCreateDescriptorPool(g_vkd.dev, &pi, NULL, &p)) LOG("[RED] vulkan draws: no descriptor pool"); return p;
 }
+static void arena_reset(int slot);
 void vkx_sub_begin(int slot, VkCommandBuffer c) {
     if (!draw_init()) return;
     res_init(c);
     pool_chain *pc = &g_pools[slot];   // the slot's last submission is done (vk_replay.c waited for it)
     for (int i = 0; i < pc->n; i++) vkResetDescriptorPool(g_vkd.dev, pc->p[i], 0);
-    pc->cur = 0;
+    pc->cur = 0; memset(g_setc[slot], 0, sizeof g_setc[slot]);
+    arena_reset(slot);
     g_pool_slot = slot;
+}
+// ---- the driver banks c0 / c2 (nvn_mtl.m's layout): filled per draw / dispatch from the bound state, for shaders that read them ----
+// c0: per stage a storage buffer table (16 slots of address 64 + size 32 bits at base + 16 r: vertex 0x110, compute 0x310, geometry 0x410, pixel 0x510); compute also
+// the dispatch size at 0x200 and the uniform buffer table at 0x210 + 16 r; graphics stages the largest point size at 0x610 and the base instance at 0x644.
+// c2: the handle tables: combined texture slots from 0x20 (slots 32-39 are the image slots, 0x120), separate textures from 0x168, samplers from 0x568
+enum { DRV_SIZE = 0xA00, ARENA = 8 << 20 };
+typedef struct { VkBuffer b[64]; VkDeviceMemory m[64]; uint8_t *p[64]; int n, cur; size_t off; } arena_t;
+static arena_t g_arena[16]; static uint32_t g_dispatch[3]; static uint32_t g_binst;
+static int arena_get(size_t n, VkBuffer *b, VkDeviceSize *off, uint8_t **p) {
+    arena_t *a = &g_arena[g_pool_slot];
+    for (;;) {
+        if (a->cur < a->n && a->off + n <= ARENA) { *b = a->b[a->cur]; *off = a->off; *p = a->p[a->cur] + a->off; a->off += (n + 255) & ~(size_t)255; return 1; }
+        if (a->cur < a->n - 1) { a->cur++; a->off = 0; continue; }
+        if (a->n == 64) return 0;
+        buffer_with(NULL, ARENA, &a->b[a->n], &a->m[a->n]);
+        void *mp; vkMapMemory(g_vkd.dev, a->m[a->n], 0, VK_WHOLE_SIZE, 0, &mp); a->p[a->n] = mp;
+        a->cur = a->n++; a->off = 0;
+    }
+}
+static uint64_t g_arena_gen[16];   // +1 when the slot's arena is reset (drv_fill's reuse is for the arena's current contents only)
+static void arena_reset(int slot) { g_arena[slot].cur = 0; g_arena[slot].off = 0; g_arena_gen[slot]++; }
+// The last fill of each stage's bank in this ring slot: a fill with the same bytes reuses it (most draws change none of what the banks hold), which also lets their
+// descriptor sets be reused (stage_set)
+static struct { int slot; uint64_t gen; VkDescriptorBufferInfo at; uint8_t d[DRV_SIZE]; } g_drv_last[NST][3];
+static int drv_fill(int st, int bank, VkDescriptorBufferInfo *out) {
+    VkBuffer b; VkDeviceSize off; uint8_t *ad, d[DRV_SIZE];
+    memset(d, 0, DRV_SIZE);
+    if (bank == 0) {
+        static const int base[NST] = {0x110, 0x510, 0x410, -1, -1, 0x310};
+        if (base[st] >= 0) for (int r = 0; r < 16; r++) { memcpy(d + base[st] + 16 * r, &S.ssbo[st][r].addr, 8); uint32_t n = (uint32_t)S.ssbo[st][r].size; memcpy(d + base[st] + 16 * r + 8, &n, 4); }
+        if (st == 5) { memcpy(d + 0x200, g_dispatch, 12); for (int r = 0; r < 16; r++) { memcpy(d + 0x210 + 16 * r, &S.ubo[st][r].addr, 8); uint32_t n = (uint32_t)S.ubo[st][r].size; memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
+        else { const float maxp = 2047.0f; memcpy(d + 0x610, &maxp, 4); memcpy(d + 0x644, &g_binst, 4); }
+    } else if (bank == 2) {
+        for (int k = 0; k < 41; k++) { uint64_t h = k >= 32 && k < 40 ? S.img[st][k - 32] : S.tex[st][k]; memcpy(d + 0x20 + 8 * k, &h, 8); }
+        for (int k = 0; k < 128; k++) { memcpy(d + 0x168 + 8 * k, &S.tex[st][128 + k], 8); memcpy(d + 0x568 + 8 * k, &S.samp[st][k], 8); }
+    }
+    int bi = bank == 2 ? 2 : bank == 0 ? 0 : 1;
+    if (g_drv_last[st][bi].slot == g_pool_slot && g_drv_last[st][bi].gen == g_arena_gen[g_pool_slot] && !memcmp(g_drv_last[st][bi].d, d, DRV_SIZE)) { *out = g_drv_last[st][bi].at; return 1; }
+    if (!arena_get(DRV_SIZE, &b, &off, &ad)) return 0;
+    memcpy(ad, d, DRV_SIZE);
+    *out = (VkDescriptorBufferInfo){b, off, DRV_SIZE};
+    g_drv_last[st][bi].slot = g_pool_slot; g_drv_last[st][bi].gen = g_arena_gen[g_pool_slot]; g_drv_last[st][bi].at = *out; memcpy(g_drv_last[st][bi].d, d, DRV_SIZE);
+    return 1;
+}
+// A storage image view of the texture an image handle names, as the shader declares it (under g_tmu); the texture's content becomes the GPU's
+static VkImageView image_view(vtex *t, const vkbind *b) {
+    if (!(t->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return VK_NULL_HANDLE;
+    VkImageViewType vt = b->dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : (b->arr || b->dim == 4) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;   // a cube is written as its 6 layers
+    if ((vt == VK_IMAGE_VIEW_TYPE_3D) != (t->d > 1)) return VK_NULL_HANDLE;
+    uint32_t key = 0x40000000u | (uint32_t)vt;
+    for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = vt, .format = t->fmt,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, vt == VK_IMAGE_VIEW_TYPE_2D || vt == VK_IMAGE_VIEW_TYPE_3D ? 1 : t->layers}};
+    vkview *v = calloc(1, sizeof *v); v->key = key;
+    if (vkCreateImageView(g_vkd.dev, &vi, NULL, &v->view)) { free(v); return VK_NULL_HANDLE; }
+    v->next = t->views; t->views = v; return v->view;
 }
 // The 32-bit word at byte off of stage st's uniform slot reg (a bindless handle the game wrote there): 0 when unbound or out of range
 static uint32_t ubo_word(int st, int reg, int off) {
@@ -286,14 +368,9 @@ static int buf_desc(uint64_t addr, uint64_t size, uint64_t align, uint64_t maxr,
     return 1;
 }
 // The descriptor set of one stage's shader for the draw now: 0 when nothing could be allocated
+static uint64_t mix64(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
 static VkDescriptorSet stage_set(int st, vks *s) {
     VkDescriptorSet set = VK_NULL_HANDLE; pool_chain *pc = &g_pools[g_pool_slot];
-    for (;;) {
-        if (pc->cur == pc->n) { if (pc->n == 256 || !(pc->p[pc->n] = pool_new())) { static int w; if (!w++) LOG("[RED] vulkan draws: no more descriptor pools"); return VK_NULL_HANDLE; } pc->n++; }
-        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pc->p[pc->cur], .descriptorSetCount = 1, .pSetLayouts = &g_dsl};
-        if (!vkAllocateDescriptorSets(g_vkd.dev, &ai, &set)) break;
-        pc->cur++;   // this pool is full: the next
-    }
     VkWriteDescriptorSet wr[NBIND_MAX]; VkDescriptorBufferInfo bi[NBIND_MAX]; VkDescriptorImageInfo ii[NBIND_MAX]; int nw = 0;
     pthread_mutex_lock(&g_tmu);
     for (int i = 0; i < s->nb; i++) {
@@ -302,44 +379,72 @@ static VkDescriptorSet stage_set(int st, vks *s) {
         if (b->desc == 'u') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w->pBufferInfo = &bi[nw];
             bi[nw] = (VkDescriptorBufferInfo){g_zero, 0, 65536};
-            if (!strcmp(b->kind, "support")) bi[nw].buffer = g_support;
-            else if (!strcmp(b->kind, "c1")) bi[nw] = (VkDescriptorBufferInfo){s->c1, 0, VK_WHOLE_SIZE};
-            else if (!strcmp(b->kind, "cbuf")) { if (!(b->reg >= 0 && b->reg < 16 && buf_desc(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, 64, 65536, &bi[nw]))) g_miss[M_UBO]++; }
-            else if (strcmp(b->kind, "drvcb")) g_miss[M_OTHER]++;   // drvcb: the driver banks read as zero for now (open: c0's storage buffer table, c2's handles)
+            if ((b->k == BK_SUPPORT)) bi[nw].buffer = g_support;
+            else if ((b->k == BK_C1)) bi[nw] = (VkDescriptorBufferInfo){s->c1, 0, VK_WHOLE_SIZE};
+            else if ((b->k == BK_CBUF)) { int ok = b->reg >= 0 && b->reg < 16 && buf_desc(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, 64, 65536, &bi[nw]); if (!ok) g_miss[M_UBO]++;
+                if (g_trace && b->reg >= 0 && b->reg < 16) { const float *f = (const float *)(uintptr_t)S.ubo[st][b->reg].addr;
+                    LOG("[pass]     stage %d cbuf binding %u c%d: addr %#llx size %llu%s; first %g %g %g %g", st, b->b, b->reg, (unsigned long long)S.ubo[st][b->reg].addr, (unsigned long long)S.ubo[st][b->reg].size,
+                        ok ? "" : " [NOT BOUND]", f ? f[0] : 0.f, f ? f[1] : 0.f, f ? f[2] : 0.f, f ? f[3] : 0.f); } }
+            else if ((b->k == BK_DRVCB)) { if (!drv_fill(st, b->b == 17 ? 2 : b->b == 16 ? 0 : -1, &bi[nw])) g_miss[M_OTHER]++; }   // binding 16 = c0, 17 = c2 (dmsh_spv.py)
+            else g_miss[M_OTHER]++;
         } else if (b->desc == 's') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w->pBufferInfo = &bi[nw];
             bi[nw] = (VkDescriptorBufferInfo){g_zero, 0, 65536};
-            const bbuf *u = !strcmp(b->kind, "sbuf") && b->reg >= 0 && b->reg < 16 ? &S.ssbo[st][b->reg] : !strcmp(b->kind, "ubo_ptr") && b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
+            const bbuf *u = (b->k == BK_SBUF) && b->reg >= 0 && b->reg < 16 ? &S.ssbo[st][b->reg] : (b->k == BK_UBO_PTR) && b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
             if (!(u && buf_desc(u->addr, u->size, 16, 0x7fffffff, &bi[nw]))) g_miss[M_SBUF]++;
         } else if (b->desc == 't') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w->pImageInfo = &ii[nw];
             ii[nw] = (VkDescriptorImageInfo){g_dsamp, g_dview[dummy_index(b)], VK_IMAGE_LAYOUT_GENERAL};
             if (b->cnt > 1) { w->descriptorCount = 1; }   // arrays (tex_c2a): element 0 only for now (open)
             uint64_t h = 0; int tid = 0, sid = 0;
-            if (!strcmp(b->kind, "tex") && b->reg >= 0 && b->reg < 256) { h = S.tex[st][b->reg]; tid = (int)(h & 0xfffff); }
-            else if (!strcmp(b->kind, "tex_ubo")) { uint32_t hw = ubo_word(st, b->reg, b->off); tid = (int)(hw & 0xfffff); if (tid) tid += S.tex_base; h = hw; }
-            if (!strcmp(b->skind, "samp_tex")) sid = (int)((h >> 20) & 0xfff);
-            else if (!strcmp(b->skind, "samp") && b->sreg >= 0 && b->sreg < 128) sid = (int)(S.samp[st][b->sreg] >> 20);
-            else if (!strcmp(b->skind, "samp_id")) sid = b->sreg;
-            else if (!strcmp(b->skind, "samp_ubo")) { uint32_t hw = ubo_word(st, b->sreg, b->soff); sid = (int)(hw >> 20); }
-            if (sid && strcmp(b->skind, "samp_id") && !strcmp(b->kind, "tex_ubo")) sid += S.samp_base;
+            if ((b->k == BK_TEX) && b->reg >= 0 && b->reg < 256) { h = S.tex[st][b->reg]; tid = (int)(h & 0xfffff); }
+            else if ((b->k == BK_TEX_UBO)) { uint32_t hw = ubo_word(st, b->reg, b->off); tid = (int)(hw & 0xfffff); if (tid) tid += S.tex_base; h = hw; }
+            if ((b->sk == BS_SAMP_TEX)) sid = (int)((h >> 20) & 0xfff);
+            else if ((b->sk == BS_SAMP) && b->sreg >= 0 && b->sreg < 128) sid = (int)(S.samp[st][b->sreg] >> 20);
+            else if ((b->sk == BS_SAMP_ID)) sid = b->sreg;
+            else if ((b->sk == BS_SAMP_UBO)) { uint32_t hw = ubo_word(st, b->sreg, b->soff); sid = (int)(hw >> 20); }
+            if (sid && (b->sk != BS_SAMP_ID) && (b->k == BK_TEX_UBO)) sid += S.samp_base;
             tex_t o; view_t v; int hv;
+            vtex *tt = NULL;
             if (!tid) g_miss[M_TEX]++;
             else if (!vkr_treg(tid, &o, &v, &hv)) g_miss[M_TEXREG]++;
-            else { vtex *t = vkr_tex_sampled(&o, VK_NULL_HANDLE); VkImageView iv = t ? view_get(t, b, &o, &v, hv) : VK_NULL_HANDLE; if (iv) ii[nw].imageView = iv; else g_miss[M_TEX]++; }
-            if (g_trace) LOG("[pass]     stage %d %s binding %u slot %d: texture ID %d serial %llu %ux%u fmt %#x target %d, sampler ID %d", st, b->kind, b->b, b->reg, tid,
-                             tid && vkr_treg(tid, &o, &v, &hv) ? (unsigned long long)o.serial : 0ull, tid ? o.d.width : 0, tid ? o.d.height : 0, tid ? o.d.format : 0, tid ? o.d.target : -1, sid);
+            else { vtex *t = tt = vkr_tex_sampled(&o, VK_NULL_HANDLE); VkImageView iv = t ? view_get(t, b, &o, &v, hv) : VK_NULL_HANDLE; if (iv) ii[nw].imageView = iv; else g_miss[M_TEX]++; }
+            if (g_trace) LOG("[pass]     stage %d %s binding %u slot %d: texture ID %d serial %llu %ux%u fmt %#x target %d, sampler ID %d; image of serial %llu, %s, storage %p", st, b->kind, b->b, b->reg, tid,
+                             tid && vkr_treg(tid, &o, &v, &hv) ? (unsigned long long)o.serial : 0ull, tid ? o.d.width : 0, tid ? o.d.height : 0, tid ? o.d.format : 0, tid ? o.d.target : -1, sid,
+                             tt ? (unsigned long long)tt->serial : 0ull, !tt ? "none" : tt->gpu_owned ? "GPU-written" : tt->uploaded ? "loaded" : "never written", tt ? (const void *)tt->kmem : NULL);
             samp_par sp; if (sid && vkr_sreg(sid, &sp)) ii[nw].sampler = sampler_get(&sp); else g_miss[M_SAMP]++;
         } else if (b->desc == 'i') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w->pImageInfo = &ii[nw];
-            ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, g_dview[dummy_index(b)], VK_IMAGE_LAYOUT_GENERAL}; g_miss[M_IMG]++;   // open: storage images
+            ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, g_dview[dummy_index(b)], VK_IMAGE_LAYOUT_GENERAL};
+            int tid = b->reg >= 0 && b->reg < 32 ? (int)(S.img[st][b->reg] & 0xfffff) : 0; tex_t o; view_t v; int hv;
+            if (tid && vkr_treg(tid, &o, &v, &hv)) { vtex *t = vkr_tex_sampled(&o, VK_NULL_HANDLE); VkImageView iv = t ? image_view(t, b) : VK_NULL_HANDLE;
+                if (iv) { ii[nw].imageView = iv; t->gpu_owned = 1; } else g_miss[M_IMG]++;
+                if (g_trace) LOG("[pass]     stage %d image binding %u slot %d: texture ID %d serial %llu %ux%u fmt %#x target %d; image of serial %llu", st, b->b, b->reg, tid, (unsigned long long)o.serial, o.d.width, o.d.height, o.d.format, o.d.target, t ? (unsigned long long)t->serial : 0ull);
+            } else g_miss[M_IMG]++;
         } else if (b->desc == 'b') { g_miss[M_TBUF]++; continue; }   // open: texel buffers (left unwritten: partially bound)
         else { g_miss[M_OTHER]++; continue; }
         nw++;
     }
     pthread_mutex_unlock(&g_tmu);
+    uint64_t h = mix64(0x51ed270b27ull, (uint64_t)(uintptr_t)s);
+    for (int i = 0; i < nw; i++) {
+        h = mix64(h, (uint64_t)wr[i].dstBinding << 32 | (uint32_t)wr[i].descriptorType);
+        if (wr[i].pBufferInfo) { h = mix64(h, (uint64_t)(uintptr_t)wr[i].pBufferInfo->buffer); h = mix64(h, wr[i].pBufferInfo->offset); h = mix64(h, wr[i].pBufferInfo->range); }
+        if (wr[i].pImageInfo) { h = mix64(h, (uint64_t)(uintptr_t)wr[i].pImageInfo->sampler); h = mix64(h, (uint64_t)(uintptr_t)wr[i].pImageInfo->imageView); }
+    }
+    if (!h) h = 1;
+    setc_ent *tab = g_setc[g_pool_slot], *e = NULL;
+    for (int k = 0; k < 8; k++) { setc_ent *x = &tab[(h + (uint64_t)k) % SETC]; if (x->h == h) { g_setc_hit++; return x->set; } if (!x->h) { e = x; break; } }   // e: where a new one goes
+    for (;;) {
+        if (pc->cur == pc->n) { if (pc->n == 256 || !(pc->p[pc->n] = pool_new())) { static int w; if (!w++) LOG("[RED] vulkan draws: no more descriptor pools"); return VK_NULL_HANDLE; } pc->n++; }
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pc->p[pc->cur], .descriptorSetCount = 1, .pSetLayouts = &g_dsl};
+        if (!vkAllocateDescriptorSets(g_vkd.dev, &ai, &set)) break;
+        pc->cur++;   // this pool is full: the next
+    }
+    for (int i = 0; i < nw; i++) wr[i].dstSet = set;
     if (nw) vkUpdateDescriptorSets(g_vkd.dev, (uint32_t)nw, wr, 0, NULL);
-    g_st_sets++;
+    g_st_sets++; g_setc_miss++;
+    if (e) *e = (setc_ent){h, set};
     return set;
 }
 // The GL-depth variant of a pre-rasterization shader, made the first time (under no lock: the submit thread alone makes them)
@@ -359,14 +464,15 @@ static VkShaderEXT gl_variant(vks *s) {
 int vkx_prepare_draw(VkCommandBuffer c) {
     if (!draw_init() || g_pool_slot < 0 || !S.prog) return 0;
     g_st_draws++;
-    vks *sh[5] = {0}; int any = 0;
-    for (int st = 0; st < 5; st++) {
+    vks *sh[5] = {0};
+    for (int i = 0; i < NST; i++) {   // the program's shaders, each in its stage's place
         uint8_t k8[8];
-        if (!prog_key(S.prog, (unsigned)st, k8)) continue;
-        if (!(sh[st] = shader_get(S.prog, st))) { g_miss[M_NOSHADER]++; return 0; }
-        any = 1;
+        if (!prog_key(S.prog, (unsigned)i, k8)) break;
+        vks *s = shader_get(S.prog, i);
+        if (!s) { g_miss[M_NOSHADER]++; return 0; }
+        if (s->stage < 5) sh[s->stage] = s;
     }
-    if (!any || !sh[0]) { g_miss[M_NOSHADER]++; return 0; }
+    if (!sh[0]) { g_miss[M_NOSHADER]++; return 0; }
     VkDescriptorSet sets[5] = {0};
     for (int st = 0; st < 5; st++) if (sh[st]) { sets[st] = stage_set(st, sh[st]); if (!sets[st]) return 0; }
     for (int st = 0; st < 5; st++) if (sets[st]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_gfx, (uint32_t)st, 1, &sets[st], 0, NULL);
@@ -374,7 +480,7 @@ int vkx_prepare_draw(VkCommandBuffer c) {
     VkShaderEXT objs[5]; for (int st = 0; st < 5; st++) objs[st] = sh[st] ? sh[st]->sh : VK_NULL_HANDLE;
     if (!g_depth_zero) { int last = sh[2] ? 2 : sh[4] ? 4 : 0; objs[last] = gl_variant(sh[last]); }   // GL clip depth: the stage that feeds the rasterizer maps it to Vulkan's
     g_vkd.bind_shaders(c, 5, stages, objs);
-    if (getenv("DM_VK_DRAWLOG") && !(g_st_draws & (g_st_draws - 1))) {
+    if (drawlog() && !(g_st_draws & (g_st_draws - 1))) {
         char m[400]; int q = 0; for (int i = 0; i < 10; i++) if (g_miss[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", MISS[i], (unsigned long long)g_miss[i]);
         LOG("vulkan draws: %llu prepared, %llu descriptor sets, %llu shader objects (%llu failed, %llu keys without a translation); missing:%s", (unsigned long long)g_st_draws,
             (unsigned long long)g_st_sets, (unsigned long long)g_st_load, (unsigned long long)g_st_fail, (unsigned long long)g_st_nokey, q ? m : " nothing");
@@ -515,7 +621,8 @@ static void set_state(VkCommandBuffer c, int ncolor, uint32_t rt_w, uint32_t rt_
     // as a back face, came out black when the upper-left case was the one turned)
     int ccw = D.poly.front == 1; if (D.origin_ll) ccw = !ccw;
     vkCmdSetFrontFace(c, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
-    vkCmdSetDepthTestEnable(c, D.ds.dt); vkCmdSetDepthWriteEnable(c, D.ds.dw); vkCmdSetDepthCompareOp(c, cmpop((int)D.ds.df));
+    VkCompareOp dop = cmpop((int)D.ds.df);
+    vkCmdSetDepthTestEnable(c, D.ds.dt); vkCmdSetDepthWriteEnable(c, D.ds.dw); vkCmdSetDepthCompareOp(c, dop);
     vkCmdSetDepthBoundsTestEnable(c, VK_FALSE); vkCmdSetDepthBounds(c, 0, 1);
     vkCmdSetStencilTestEnable(c, D.ds.st);
     vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, sop((int)D.ds.fail_f), sop((int)D.ds.zpass_f), sop((int)D.ds.zfail_f), cmpop((int)D.ds.sf_f));
@@ -545,6 +652,12 @@ static int set_vertex(VkCommandBuffer c) {
     for (int i = 0; i < 16; i++) {
         const va_st *a = &D.attr[i]; if (!a->fmt) continue;
         VkFormat f = vfmt((int)a->fmt); if (!f) { g_st_skip[SK_FORMAT]++; continue; }
+        static int8_t vok[256];   // 1 the device fetches the format, -1 it does not (logged once)
+        if (a->fmt < 256 && !vok[a->fmt]) {
+            VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, f, &fp);
+            vok[a->fmt] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : -1;
+            if (vok[a->fmt] < 0) LOG("[RED] vulkan draws: vertex format NVN %#x (vk %d) is not a vertex format on this device", (unsigned)a->fmt, (int)f);
+        }
         ad[na++] = (VkVertexInputAttributeDescription2EXT){.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = (uint32_t)i, .binding = a->stream, .format = f, .offset = a->offset};
         used |= (uint16_t)(1u << a->stream);
     }
@@ -577,8 +690,8 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
     if (!ok) { g_st_skip[SK_QUADS]++; return; }
     if ((d ? d->mdi_cnt : x->mdi_cnt)) { g_st_skip[SK_INDIRECT]++; return; }   // open: indirect-count multi-draws
     if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog && prog_key(S.prog, (unsigned)st, k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
-        LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
-            d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.poly.cull);
+        LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d func %d, stencil %d func %d ref %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
+            d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.ds.df, (int)D.ds.st, (int)D.ds.sf_f, D.st_ref[0], (int)D.poly.cull);
         LOG("[pass]     viewports %d: %.1f %.1f %.1f %.1f depth %.2f..%.2f%s; scissor %s %d %d %d %d; front %s; origin %s; depth mode %s; attrs %#x", D.nvp, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3],
             D.has_dr ? D.dn : D.vp[0][4], D.has_dr ? D.df : D.vp[0][5], D.has_dr ? " (depth range)" : "", D.has_sc ? "on" : "off", D.sc[0], D.sc[1], D.sc[2], D.sc[3], D.poly.front ? "ccw" : "cw",
             D.origin_ll ? "lower left" : "upper left", D.depth_zero ? "zero" : "gl", ({ unsigned m = 0; for (int i = 0; i < 16; i++) if (D.attr[i].fmt) m |= 1u << i; m; }));
@@ -600,8 +713,31 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
         else vkCmdDrawIndexed(c, (uint32_t)x->count, (uint32_t)(x->instances ? x->instances : 1), 0, x->base_vertex, (uint32_t)x->base_instance);
     }
     g_st_drawn++;
-    if (getenv("DM_VK_DRAWLOG") && !(g_st_drawn & (g_st_drawn - 1))) {
+    if (drawlog() && !(g_st_drawn & (g_st_drawn - 1))) {
         char m[300]; int q = 0; for (int i = 0; i < 7; i++) if (g_st_skip[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", SKIP[i], (unsigned long long)g_st_skip[i]);
         LOG("vulkan draws: %llu drawn; skipped:%s", (unsigned long long)g_st_drawn, q ? m : " none");
     }
+}
+
+// ---- compute dispatches ----
+static uint64_t g_st_dispatched, g_st_dskip;
+void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p) {
+    static uint64_t why[4];
+    #define DSKIP(k) do { g_st_dskip++; why[k]++; if (!(g_st_dskip & (g_st_dskip - 1))) LOG("[RED] vulkan draws: %llu dispatches skipped (no program %llu, no compute shader %llu, indirect buffer %llu, set %llu)", (unsigned long long)g_st_dskip, (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]); return; } while (0)
+    if (!draw_init() || g_pool_slot < 0 || !S.prog) DSKIP(0);
+    vks *s = NULL; uint8_t k8[8];
+    for (int i = 0; i < NST && !s && prog_key(S.prog, (unsigned)i, k8); i++) { vks *t = shader_get(S.prog, i); if (t && t->stage == 5) s = t; }
+    if (!s) DSKIP(1);
+    if (g_trace) LOG("[pass]   dispatch %s groups %d %d %d%s", s->key, (int)p->x, (int)p->y, (int)p->z, p->ind ? " (indirect)" : "");
+    VkBuffer ib = VK_NULL_HANDLE; VkDeviceSize io = 0;
+    if (p->ind) {   // DispatchComputeIndirect: the group counts are the GPU's; c0's copy of them reads as written at record time (0 here)
+        VkDeviceAddress g; if (!vkm_lookup((const void *)(uintptr_t)p->ind, 12, &ib, &io, &g)) DSKIP(2);
+        memset(g_dispatch, 0, sizeof g_dispatch);
+    } else { g_dispatch[0] = (uint32_t)p->x; g_dispatch[1] = (uint32_t)p->y; g_dispatch[2] = (uint32_t)p->z; }
+    VkDescriptorSet set = stage_set(5, s); if (!set) DSKIP(3);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_pl_cs, 0, 1, &set, 0, NULL);
+    VkShaderStageFlagBits st = VK_SHADER_STAGE_COMPUTE_BIT; g_vkd.bind_shaders(c, 1, &st, &s->sh);
+    if (p->ind) vkCmdDispatchIndirect(c, ib, io); else vkCmdDispatch(c, (uint32_t)p->x, (uint32_t)p->y, (uint32_t)p->z);
+    g_st_dispatched++;
+    if (drawlog() && !(g_st_dispatched & (g_st_dispatched - 1))) LOG("vulkan draws: %llu dispatches, %llu skipped", (unsigned long long)g_st_dispatched, (unsigned long long)g_st_dskip);
 }

@@ -9,6 +9,7 @@ void vkx_bind_buf(int ssbo, const p_bind_buf *b);
 void vkx_bind_handles(int what, const p_bind_handles *b, const uint64_t *h);   // what: 0 textures, 1 samplers, 2 images; h = the handles as they are now
 void vkx_set_pool(int tex, int base);
 void vkx_trace(int on);
+void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p);
 void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int ncolor, uint32_t rt_w, uint32_t rt_h, int samples);
 void vkx_bind_state(const p_bind_state *s);
 void vkx_viewports(const p_viewports *v); void vkx_scissor(const p_scissor *s); void vkx_depth_range(const p_depth_range *r);
