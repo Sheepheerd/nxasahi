@@ -14,6 +14,11 @@
 #include "spv_reflect.h"
 #include "vk_draw.h"
 #include <stdatomic.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <sys/resource.h>
 #include <dirent.h>
 
 #define NST 6
@@ -29,7 +34,7 @@ typedef struct { uint16_t b; char desc; char kind[12]; int reg, off; char skind[
 typedef struct vks {
     char key[17]; uint64_t k64; struct vks *next; int stage, ok;
     VkShaderEXT sh; VkShaderStageFlagBits vstage;
-    VkShaderEXT sh_gl; uint32_t *spv; size_t nspv;   // the GL-depth variant (spvr_gl_depth), made the first time it is needed from the fitted SPIR-V kept here
+    VkShaderEXT sh_gl; uint32_t *spv; size_t nspv; int gl_none;   // the GL-depth variant (spvr_gl_depth), made the first time it is needed from the fitted SPIR-V kept here
     int nb; vkbind bd[NBIND_MAX];
     VkBuffer c1; VkDeviceMemory c1m; uint32_t c1_len;
 } vks;
@@ -64,6 +69,8 @@ static VkShaderStageFlagBits vstage_of(int st) {
     return st >= 0 && st < NST ? m[st] : 0;
 }
 static void parse_vkb(vks *s, const char *txt);
+static void shc_init(uint64_t layout_hash); static void precompile_start(void);
+static char (*g_keys)[17]; static int g_nkeys;   // every shader key of the set (draw_init)
 static int draw_init(void) {
     if (g_init >= 0) return g_init;
     const char *d = getenv("DM_VK_SPV");
@@ -82,6 +89,7 @@ static int draw_init(void) {
         char path[1400]; snprintf(path, sizeof path, "%s/%s", g_spv, de->d_name);
         uint8_t *txt; size_t n; if (!read_file(path, &txt, &n)) continue;
         static vks tmp; tmp.nb = 0; parse_vkb(&tmp, (const char *)txt); free(txt); nfiles++;
+        if (l == 20) { if (!(g_nkeys & 1023)) g_keys = realloc(g_keys, (g_nkeys + 1024) * sizeof *g_keys); memcpy(g_keys[g_nkeys], de->d_name, 16); g_keys[g_nkeys++][16] = 0; }   // <16 hex>.vkb: for the precompiler
         for (int i = 0; i < tmp.nb; i++) { const vkbind *b = &tmp.bd[i]; if (b->b >= 1024) continue;
             if (typ[b->b] && typ[b->b] != b->desc) LOG("[RED] vulkan draws: binding %u is %c in one shader and %c in another", b->b, typ[b->b], b->desc);
             typ[b->b] = b->desc; uint16_t c = b->cnt ? b->cnt : 1; if (c > cnt[b->b]) cnt[b->b] = c; }
@@ -97,6 +105,9 @@ static int draw_init(void) {
                                                          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER}[k]) g_per_set[k] += cnt[i];
     }
     if (!nfiles) { LOG("[RED] vulkan draws: no <key>.vkb in %s (run dm/gfx/tools/dmsh_spv.py)", g_spv); return g_init = 0; }
+    { uint64_t lh = 1469598103934665603ull; for (uint32_t i = 0; i < n; i++) { lh = (lh ^ b[i].binding) * 1099511628211ull; lh = (lh ^ (uint64_t)b[i].descriptorType) * 1099511628211ull; lh = (lh ^ b[i].descriptorCount) * 1099511628211ull; }
+      shc_init(lh); }   // shader binaries depend on the layout they were made with
+    precompile_start();
     VkDescriptorSetLayoutBindingFlagsCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, .bindingCount = n, .pBindingFlags = f};
     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .pNext = &fi, .bindingCount = n, .pBindings = b};
     if (vkCreateDescriptorSetLayout(g_vkd.dev, &li, NULL, &g_dsl)) { LOG("[RED] vulkan draws: no descriptor set layout"); return g_init = 0; }
@@ -130,49 +141,124 @@ static void parse_vkb(vks *s, const char *txt) {
 // The i-th shader of a program, made the first time (its key from prog_key, which takes the index in the program's list, not a stage: a compute program is one
 // shader at index 0; the shader's stage is the one its translation names, in its .vkb header). NULL when there is none or it cannot be made, logged once per key
 static int stage_of_name(const char *s) { static const char *const n[NST] = {"vs", "ps", "gs", "hs", "ds", "cs"}; for (int i = 0; i < NST; i++) if (!strncmp(s, n[i], 2)) return i; return -1; }
+// Shader objects made and the time they took (the long-frame log's "new pipelines + shader libraries": shaders as libraries, GL-depth variants as pipelines)
+static _Atomic uint64_t g_mk_sh, g_mk_sh_ns, g_mk_var, g_mk_var_ns;
+static uint64_t mk_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = atomic_load(&g_mk_sh); *pso = atomic_load(&g_mk_var); }
+void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = atomic_load(&g_mk_sh_ns); *pso_ns = atomic_load(&g_mk_var_ns); }
 static int drawlog(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DRAWLOG") != NULL; return v; }   // DM_VK_DRAWLOG: draw counters at powers of two
-static uint64_t g_st_initout;   // vertex-stage shaders whose outputs were initialized (spvr_init_outputs)
+// ---- shader objects and their disk cache ----
+// A shader's SPIR-V as the device takes it (fitted, outputs initialized), and its stage from the .vkb; with s, the binding table and c1 go into s. NULL when it is not there
+static uint32_t *sh_code(const char *key, int *st_out, size_t *nw, vks *s, unsigned *ch_out) {
+    char path[1200]; uint8_t *code = NULL, *vkb = NULL, *job = NULL; size_t ncode = 0, nvkb = 0, njob = 0;
+    snprintf(path, sizeof path, "%s/%s.vk.spv", g_spv, key); int have = read_file(path, &code, &ncode);
+    snprintf(path, sizeof path, "%s/%s.vkb", g_spv, key); have = have && read_file(path, &vkb, &nvkb);
+    if (have && s) { snprintf(path, sizeof path, "%s/%s.job.json", g_spv, key); read_file(path, &job, &njob); }
+    { const char *ov = getenv("DM_VK_SHOVERRIDE"), *m = ov ? strstr(ov, key) : NULL;   // diagnostic: DM_VK_SHOVERRIDE=<key>=<spv file>[,...] replaces that shader's code
+      if (have && m && m[16] == '=') { char f[1024]; size_t n = strcspn(m + 17, ","); if (n >= sizeof f) n = sizeof f - 1; memcpy(f, m + 17, n); f[n] = 0;
+          uint8_t *oc = NULL; size_t on = 0; if (read_file(f, &oc, &on)) { free(code); code = oc; ncode = on; if (s) LOG("vulkan draws: shader %s replaced by %s", key, f); } } }
+    int st = -1;
+    if (have) { const char *h = strchr((const char *)vkb, ' '); h = h ? strchr(h + 1, ' ') : NULL; st = h ? stage_of_name(h + 1) : -1; }   // "# <key> <stage> set <n>"
+    if (!have || st < 0) { free(code); free(vkb); free(job); return NULL; }
+    if (s) {
+        parse_vkb(s, (const char *)vkb);
+        const char *c1 = job ? strstr((const char *)job, "\"c1\": \"") : NULL;   // c1: the shader's own constants, from its translation job
+        uint8_t *c1d = NULL; size_t c1n = 0;
+        if (c1) { c1 += 7; const char *e = strchr(c1, '"'); c1n = e ? (size_t)(e - c1) / 2 : 0; c1d = malloc(c1n ? c1n : 1); for (size_t i = 0; i < c1n; i++) c1d[i] = (uint8_t)hexbyte(c1 + 2 * i); }
+        buffer_with(c1d, c1n > 65536 ? 65536 : (c1n ? c1n : 256), &s->c1, &s->c1m); s->c1_len = (uint32_t)c1n; free(c1d);
+    }
+    spvr_device dev = {0, 0, 0}; size_t fw; unsigned ch = 0;
+    uint32_t *fit = spvr_fit((const uint32_t *)code, ncode / 4, &dev, &fw, &ch);
+    if (fit && (st == 0 || st == 4)) { size_t iw; uint32_t *io = spvr_init_outputs(fit, fw, &iw); if (io) { free(fit); fit = io; fw = iw; } }   // unwritten output components read 0, as on Maxwell
+    free(code); free(vkb); free(job);
+    *st_out = st; *nw = fw; if (ch_out) *ch_out = ch;
+    return fit;
+}
+// Shader binaries on disk (VK_EXT_shader_object's binary form): the driver does not cache shader objects, so each one compiled again at every run and every new one in
+// play stopped the frame for 5-15 ms (a 1.3 s stop when a level's 120 came at once). Found by key and variant under a directory named by the shader set, the descriptor
+// layout and the driver's binary UUID and version (a driver update starts a new one). DM_VK_SHCACHE=<dir> moves it, DM_VK_SHCACHE=0 turns it off
+static char g_shc[1400]; static int g_shc_on;
+typedef struct { uint32_t magic, version; uint8_t uuid[16]; uint64_t size; } shc_hdr;
+static VkPhysicalDeviceShaderObjectPropertiesEXT g_sop = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_PROPERTIES_EXT};
+static _Atomic uint64_t g_shc_hit, g_shc_saved, g_shc_hit_ns;
+static void shc_init(uint64_t layout_hash) {
+    const char *e = getenv("DM_VK_SHCACHE"); if (e && !strcmp(e, "0")) return;
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &g_sop}; vkGetPhysicalDeviceProperties2(g_vkd.pd, &p2);
+    const char *base = strrchr(g_spv, '/'); base = base ? base + 1 : g_spv;
+    char root[1024];
+    if (e && *e) snprintf(root, sizeof root, "%s", e);
+    else { const char *x = getenv("XDG_CACHE_HOME"), *h = getenv("HOME"); if (x && *x) snprintf(root, sizeof root, "%s/nxasahi/vkshaders", x); else if (h) snprintf(root, sizeof root, "%s/.cache/nxasahi/vkshaders", h); else return; }
+    char u[33]; for (int i = 0; i < 16; i++) snprintf(u + 2 * i, 3, "%02x", g_sop.shaderBinaryUUID[i]);
+    snprintf(g_shc, sizeof g_shc, "%s/%s-%016llx-%s-%u", root, base, (unsigned long long)layout_hash, u, g_sop.shaderBinaryVersion);
+    char mk[1400]; snprintf(mk, sizeof mk, "%s", g_shc);   // mkdir -p
+    for (char *q = mk + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(mk, 0755); *q = '/'; }
+    if (mkdir(mk, 0755) && errno != EEXIST) { LOG("[RED] vulkan draws: no shader cache directory %s", g_shc); return; }
+    g_shc_on = 1; LOG("vulkan draws: shader binaries cached in %s", g_shc);
+}
+static void shc_path(char *out, size_t n, const char *key, int st, int gl) { snprintf(out, n, "%s/%s.%d%d.bin", g_shc, key, st, gl); }
+static int shc_has(const char *key, int st, int gl) { char p[1500]; shc_path(p, sizeof p, key, st, gl); return access(p, R_OK) == 0; }
+static VkShaderCreateInfoEXT sh_ci(int st, VkShaderCodeTypeEXT type, const void *code, size_t size, const VkDescriptorSetLayout *sets) {
+    return (VkShaderCreateInfoEXT){.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = vstage_of(st),
+        .nextStage = st == 0 ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : st == 2 || st == 4 ? VK_SHADER_STAGE_FRAGMENT_BIT :
+                     st == 3 ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : 0,
+        .codeType = type, .codeSize = size, .pCode = code, .pName = "main", .setLayoutCount = st == 5 ? 1 : 5, .pSetLayouts = sets};
+}
+// The shader object of a key's stage and variant (gl: the GL-depth form of the last stage before rasterization), from the disk cache or compiled (and then cached).
+// spv: the fitted code. *compiled: 1 when it had to be compiled
+static VkShaderEXT sh_object(const char *key, int st, int gl, const uint32_t *spv, size_t nw, int *compiled) {
+    VkDescriptorSetLayout sets[5] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl}; VkShaderEXT o = VK_NULL_HANDLE; char p[1500];
+    if (compiled) *compiled = 0;
+    if (g_shc_on) {
+        shc_path(p, sizeof p, key, st, gl); uint8_t *b; size_t n; uint64_t t0 = mk_now();
+        if (read_file(p, &b, &n)) {
+            shc_hdr h; int ok = n >= sizeof h && (memcpy(&h, b, sizeof h), h.magic == 0x31636873u && h.version == g_sop.shaderBinaryVersion && !memcmp(h.uuid, g_sop.shaderBinaryUUID, 16) && h.size == n - sizeof h);
+            if (ok) { VkShaderCreateInfoEXT ci = sh_ci(st, VK_SHADER_CODE_TYPE_BINARY_EXT, b + sizeof h, (size_t)h.size, sets); if (g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &o)) o = VK_NULL_HANDLE; }
+            free(b);
+            if (o) { atomic_fetch_add(&g_shc_hit, 1); atomic_fetch_add(&g_shc_hit_ns, mk_now() - t0);
+                uint64_t hn = atomic_load(&g_shc_hit); if (!(hn & (hn - 1))) LOG("vulkan draws: %llu shaders loaded from the cache, %.2f ms each", (unsigned long long)hn, atomic_load(&g_shc_hit_ns) / 1e6 / hn);
+                return o; }
+        }
+    }
+    size_t gw = 0; uint32_t *g = gl ? spvr_gl_depth(spv, nw, &gw) : NULL;
+    if (gl && !g) return VK_NULL_HANDLE;
+    VkShaderCreateInfoEXT ci = sh_ci(st, VK_SHADER_CODE_TYPE_SPIRV_EXT, g ? g : spv, (g ? gw : nw) * 4, sets);
+    VkResult r = g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &o); free(g);
+    if (r) return VK_NULL_HANDLE;
+    if (compiled) *compiled = 1;
+    if (g_shc_on && g_vkd.shader_binary) {   // into the cache: written to a temporary name and renamed, so a reader never sees half a file
+        size_t n = 0;
+        if (!g_vkd.shader_binary(g_vkd.dev, o, &n, NULL) && n) {
+            uint8_t *b = malloc(sizeof(shc_hdr) + n); shc_hdr h = {0x31636873u, g_sop.shaderBinaryVersion, {0}, n}; memcpy(h.uuid, g_sop.shaderBinaryUUID, 16); memcpy(b, &h, sizeof h);
+            if (b && !g_vkd.shader_binary(g_vkd.dev, o, &n, b + sizeof h)) {
+                char t[1600]; snprintf(t, sizeof t, "%s.%ld.tmp", p, (long)syscall(SYS_gettid)); shc_path(p, sizeof p, key, st, gl);
+                FILE *f = fopen(t, "wb"); if (f) { int w = fwrite(b, 1, sizeof h + n, f) == sizeof h + n; w = !fclose(f) && w; if (w && !rename(t, p)) atomic_fetch_add(&g_shc_saved, 1); else unlink(t); }
+            }
+            free(b);
+        }
+    }
+    return o;
+}
 static vks *shader_get(const prog_t *p, int idx) {
     uint8_t k8[8]; if (!prog_key(p, (unsigned)idx, k8)) return NULL;
-    int st = -1;
     uint64_t k64; memcpy(&k64, k8, 8);   // found by the key's bytes; its hex form only for a shader made now
     unsigned hsh = (k8[0] | k8[1] << 8) & 1023;
     pthread_mutex_lock(&g_shmu);
     for (vks *s = g_sh[hsh]; s; s = s->next) if (s->k64 == k64) { pthread_mutex_unlock(&g_shmu); return s->ok ? s : NULL; }
     char key[17]; for (int i = 0; i < 8; i++) snprintf(key + 2 * i, 3, "%02x", k8[i]);
+    uint64_t mk0 = mk_now();
     vks *s = calloc(1, sizeof *s); snprintf(s->key, sizeof s->key, "%s", key); s->k64 = k64;
     s->next = g_sh[hsh]; g_sh[hsh] = s;
-    char path[1200]; uint8_t *code = NULL, *vkb = NULL, *job = NULL; size_t ncode = 0, nvkb = 0, njob = 0;
-    snprintf(path, sizeof path, "%s/%s.vk.spv", g_spv, key); int have = read_file(path, &code, &ncode);
-    snprintf(path, sizeof path, "%s/%s.vkb", g_spv, key); have = have && read_file(path, &vkb, &nvkb);
-    snprintf(path, sizeof path, "%s/%s.job.json", g_spv, key); if (have) read_file(path, &job, &njob);
-    { const char *ov = getenv("DM_VK_SHOVERRIDE"), *m = ov ? strstr(ov, key) : NULL;   // diagnostic: DM_VK_SHOVERRIDE=<key>=<spv file>[,...] replaces that shader's code
-      if (have && m && m[16] == '=') { char f[1024]; size_t n = strcspn(m + 17, ","); if (n >= sizeof f) n = sizeof f - 1; memcpy(f, m + 17, n); f[n] = 0;
-          uint8_t *oc = NULL; size_t on = 0; if (read_file(f, &oc, &on)) { free(code); code = oc; ncode = on; LOG("vulkan draws: shader %s replaced by %s", key, f); } } }
-    if (!have) { g_st_nokey++; if (g_st_nokey <= 8) LOG("[RED] vulkan draws: no translated shader %s (index %d) in %s", key, idx, g_spv); free(code); free(vkb); pthread_mutex_unlock(&g_shmu); return NULL; }
-    parse_vkb(s, (const char *)vkb);
-    { const char *h = strchr((const char *)vkb, ' '); h = h ? strchr(h + 1, ' ') : NULL; st = h ? stage_of_name(h + 1) : -1; }   // "# <key> <stage> set <n>"
-    if (st < 0) { LOG("[RED] vulkan draws: shader %s: no stage in its .vkb", key); free(code); free(vkb); free(job); pthread_mutex_unlock(&g_shmu); return NULL; }
+    int st = -1; size_t fw = 0; unsigned ch = 0;
+    uint32_t *fit = sh_code(key, &st, &fw, s, &ch);
+    if (!fit) { g_st_nokey++; if (g_st_nokey <= 8) LOG("[RED] vulkan draws: no translated shader %s (index %d) in %s", key, idx, g_spv); pthread_mutex_unlock(&g_shmu); return NULL; }
     s->stage = st; s->vstage = vstage_of(st);
-    // c1: the shader's own constants, from its translation job
-    const char *c1 = job ? strstr((const char *)job, "\"c1\": \"") : NULL;
-    uint8_t *c1d = NULL; size_t c1n = 0;
-    if (c1) { c1 += 7; const char *e = strchr(c1, '"'); c1n = e ? (size_t)(e - c1) / 2 : 0; c1d = malloc(c1n ? c1n : 1); for (size_t i = 0; i < c1n; i++) c1d[i] = (uint8_t)hexbyte(c1 + 2 * i); }
-    buffer_with(c1d, c1n > 65536 ? 65536 : (c1n ? c1n : 256), &s->c1, &s->c1m); s->c1_len = (uint32_t)c1n; free(c1d);
-    spvr_device dev = {0, 0, 0}; size_t fw; unsigned ch;
-    uint32_t *fit = spvr_fit((const uint32_t *)code, ncode / 4, &dev, &fw, &ch);
-    if (fit && (st == 0 || st == 4)) { size_t iw; uint32_t *io = spvr_init_outputs(fit, fw, &iw); if (io) { free(fit); fit = io; fw = iw; g_st_initout++; } }   // unwritten output components read 0, as on Maxwell
-    VkDescriptorSetLayout sets[5] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl};
-    VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = s->vstage,
-        .nextStage = st == 0 ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : st == 2 || st == 4 ? VK_SHADER_STAGE_FRAGMENT_BIT :
-                     st == 3 ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : 0,
-        .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = fw * 4, .pCode = fit, .pName = "main", .setLayoutCount = st == 5 ? 1 : 5, .pSetLayouts = sets};
-    VkResult r = fit ? g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &s->sh) : VK_ERROR_INITIALIZATION_FAILED;
-    if (st == 0 || st == 2 || st == 4) { s->spv = fit; s->nspv = fw; fit = NULL; }   // kept for the GL-depth variant
-    free(fit); free(code); free(vkb); free(job);
-    s->ok = r == VK_SUCCESS;
-    if (s->ok) g_st_load++; else { g_st_fail++; LOG("[RED] vulkan draws: shader %s (stage %d) not made (%d)", key, st, (int)r); }
-    if (s->ok && !(g_st_load & (g_st_load - 1))) LOG("vulkan draws: %llu shader objects made (latest %s, stage %d, %d bindings%s)", (unsigned long long)g_st_load, key, st, s->nb,
+    // Stages that can feed the rasterizer are made when a draw asks for a variant (sh_plain / gl_variant): the GL-depth form is the one drawn in a GL-depth game, and
+    // making the plain one as well compiled every vertex shader twice
+    if (st == 0 || st == 2 || st == 4) { s->spv = fit; s->nspv = fw; s->ok = 1; }
+    else { int comp; s->sh = sh_object(key, st, 0, fit, fw, &comp); free(fit); s->ok = s->sh != VK_NULL_HANDLE;
+        if (comp || !s->ok) { atomic_fetch_add(&g_mk_sh, 1); atomic_fetch_add(&g_mk_sh_ns, mk_now() - mk0); } }
+    if (s->ok) g_st_load++; else { g_st_fail++; LOG("[RED] vulkan draws: shader %s (stage %d) not made", key, st); }
+    if (s->ok && !(g_st_load & (g_st_load - 1))) LOG("vulkan draws: %llu shaders loaded (latest %s, stage %d, %d bindings%s)", (unsigned long long)g_st_load, key, st, s->nb,
                                                      ch & SPVR_FIT_STORES ? ", [RED] writes a vertex-stage buffer the device cannot" : "");
     pthread_mutex_unlock(&g_shmu);
     return s->ok ? s : NULL;
@@ -447,17 +533,53 @@ static VkDescriptorSet stage_set(int st, vks *s) {
     if (e) *e = (setc_ent){h, set};
     return set;
 }
-// The GL-depth variant of a pre-rasterization shader, made the first time (under no lock: the submit thread alone makes them)
+// Background precompiler: every shader of the set into the disk cache, in the form a draw will ask for (the GL-depth form for vertex, geometry and tessellation
+// evaluation shaders in a GL-depth game), on low-priority threads while the game runs. The first run fills the cache (about a minute on the M1's large cores for
+// Mario Wonder's 12,811); after it no shader is compiled in play. DM_VK_PRECOMPILE=<threads> (2 by default), 0 turns it off
+static _Atomic int g_pc_next, g_pc_done; static _Atomic uint64_t g_pc_compiled; static uint64_t g_pc_t0;
+static void *precompile_main(void *arg) {
+    (void)arg; setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+    for (int i; (i = atomic_fetch_add(&g_pc_next, 1)) < g_nkeys;) {
+        const char *key = g_keys[i];
+        uint8_t *vkb; size_t nv; char path[1200]; snprintf(path, sizeof path, "%s/%s.vkb", g_spv, key);   // the stage first, from the header: no work for what is cached
+        if (!read_file(path, &vkb, &nv)) continue;
+        const char *h = strchr((const char *)vkb, ' '); h = h ? strchr(h + 1, ' ') : NULL; int st = h ? stage_of_name(h + 1) : -1; free(vkb);
+        if (st < 0) continue;
+        int gl = (st == 0 || st == 2 || st == 4) && !g_depth_zero;
+        if (shc_has(key, st, gl)) continue;
+        size_t nw; int st2; uint32_t *spv = sh_code(key, &st2, &nw, NULL, NULL); if (!spv) continue;
+        int comp = 0; VkShaderEXT o = sh_object(key, st, gl, spv, nw, &comp); free(spv);
+        if (o) g_vkd.destroy_shader(g_vkd.dev, o, NULL);
+        if (comp) atomic_fetch_add(&g_pc_compiled, 1);
+    }
+    if (atomic_fetch_add(&g_pc_done, 1) == 0) LOG("vulkan draws: shader precompile done: %llu compiled into the cache in %.1f s (%llu shaders in the set)",
+        (unsigned long long)atomic_load(&g_pc_compiled), (mk_now() - g_pc_t0) / 1e9, (unsigned long long)g_nkeys);
+    return NULL;
+}
+static void precompile_start(void) {
+    const char *e = getenv("DM_VK_PRECOMPILE"); int n = e ? atoi(e) : 2;
+    if (!g_shc_on || n <= 0 || !g_nkeys) return;
+    if (n > 8) n = 8;
+    g_pc_t0 = mk_now();
+    for (int i = 0; i < n; i++) { pthread_t t; if (!pthread_create(&t, NULL, precompile_main, NULL)) pthread_detach(t); }
+    LOG("vulkan draws: precompiling %d shaders into the cache on %d background threads", g_nkeys, n);
+}
+// The plain and GL-depth forms of a pre-rasterization shader, made the first time a draw asks (under no lock: the submit thread alone makes them)
+static VkShaderEXT sh_plain(vks *s) {
+    if (s->sh || !s->spv) return s->sh;
+    uint64_t mk0 = mk_now(); int comp;
+    s->sh = sh_object(s->key, s->stage, 0, s->spv, s->nspv, &comp);
+    if (comp) { atomic_fetch_add(&g_mk_sh, 1); atomic_fetch_add(&g_mk_sh_ns, mk_now() - mk0); }
+    if (!s->sh) LOG("[RED] vulkan draws: shader %s (stage %d) not made", s->key, s->stage);
+    return s->sh;
+}
 static VkShaderEXT gl_variant(vks *s) {
     if (s->sh_gl) return s->sh_gl;
-    size_t nw; uint32_t *g = s->spv ? spvr_gl_depth(s->spv, s->nspv, &nw) : NULL;
-    if (!g) { static int w; if (!w++) LOG("[RED] vulkan draws: shader %s writes no gl_Position this pass can find: drawn with GL depth uncorrected", s->key); return s->sh; }
-    VkDescriptorSetLayout sets[5] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl};
-    VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = s->vstage,
-        .nextStage = s->stage == 0 ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : VK_SHADER_STAGE_FRAGMENT_BIT,
-        .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = nw * 4, .pCode = g, .pName = "main", .setLayoutCount = 5, .pSetLayouts = sets};
-    VkResult r = g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &s->sh_gl); free(g);
-    if (r) { LOG("[RED] vulkan draws: GL-depth variant of %s not made (%d)", s->key, (int)r); s->sh_gl = VK_NULL_HANDLE; return s->sh; }
+    if (s->gl_none) return sh_plain(s);
+    uint64_t mk0 = mk_now(); int comp;
+    s->sh_gl = s->spv ? sh_object(s->key, s->stage, 1, s->spv, s->nspv, &comp) : VK_NULL_HANDLE;
+    if (!s->sh_gl) { s->gl_none = 1; static int w; if (!w++) LOG("[RED] vulkan draws: no GL-depth form of shader %s (no gl_Position this pass can find, or not made): drawn with GL depth uncorrected", s->key); return sh_plain(s); }
+    if (comp) { atomic_fetch_add(&g_mk_var, 1); atomic_fetch_add(&g_mk_var_ns, mk_now() - mk0); }
     return s->sh_gl;
 }
 // A draw: the program's shaders and their descriptor sets (bound in c). 0 when the draw cannot be made (no program, a shader missing)
@@ -477,8 +599,9 @@ int vkx_prepare_draw(VkCommandBuffer c) {
     for (int st = 0; st < 5; st++) if (sh[st]) { sets[st] = stage_set(st, sh[st]); if (!sets[st]) return 0; }
     for (int st = 0; st < 5; st++) if (sets[st]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_gfx, (uint32_t)st, 1, &sets[st], 0, NULL);
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
-    VkShaderEXT objs[5]; for (int st = 0; st < 5; st++) objs[st] = sh[st] ? sh[st]->sh : VK_NULL_HANDLE;
-    if (!g_depth_zero) { int last = sh[2] ? 2 : sh[4] ? 4 : 0; objs[last] = gl_variant(sh[last]); }   // GL clip depth: the stage that feeds the rasterizer maps it to Vulkan's
+    VkShaderEXT objs[5]; int last = sh[2] ? 2 : sh[4] ? 4 : 0;
+    for (int st = 0; st < 5; st++) objs[st] = !sh[st] ? VK_NULL_HANDLE : st == 0 || st == 2 || st == 4 ? (st == last && !g_depth_zero ? gl_variant(sh[st]) : sh_plain(sh[st])) : sh[st]->sh;   // GL clip depth: the stage that feeds the rasterizer maps it to Vulkan's
+    for (int st = 0; st < 5; st++) if (sh[st] && !objs[st]) { g_miss[M_NOSHADER]++; return 0; }
     g_vkd.bind_shaders(c, 5, stages, objs);
     if (drawlog() && !(g_st_draws & (g_st_draws - 1))) {
         char m[400]; int q = 0; for (int i = 0; i < 10; i++) if (g_miss[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", MISS[i], (unsigned long long)g_miss[i]);
@@ -697,7 +820,10 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
             D.origin_ll ? "lower left" : "upper left", D.depth_zero ? "zero" : "gl", ({ unsigned m = 0; for (int i = 0; i < 16; i++) if (D.attr[i].fmt) m |= 1u << i; m; }));
         for (int i = 0; i < 16; i++) if (D.attr[i].fmt) LOG("[pass]     attr %d: NVN format %#x (vk %d) offset %u stream %u; stream stride %u divisor %u, buffer %#llx size %llu", i, (unsigned)D.attr[i].fmt, (int)vfmt((int)D.attr[i].fmt),
             (unsigned)D.attr[i].offset, (unsigned)D.attr[i].stream, D.stream[D.attr[i].stream].stride, D.stream[D.attr[i].stream].divisor, (unsigned long long)D.vbuf[D.attr[i].stream].address, (unsigned long long)D.vbuf[D.attr[i].stream].size); }
+    static int slow = -1; if (slow < 0) slow = getenv("DM_VK_SLOWDRAW") != NULL;   // diagnostic: draws whose recording took over 1 ms, by part
+    uint64_t sd0 = slow ? mk_now() : 0;
     if (!vkx_prepare_draw(c)) { g_st_skip[SK_PREP]++; return; }
+    uint64_t sd1 = slow ? mk_now() : 0;
     set_state(c, ncolor, rt_w, rt_h, tp, samples);
     if (!set_vertex(c)) return;
     if (d) {
@@ -712,6 +838,7 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
         if (x->ind) { VkBuffer ib; VkDeviceSize io; if (!lookup_buf(x->ind, 20, &ib, &io)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndexedIndirect(c, ib, io, 1, 20); }
         else vkCmdDrawIndexed(c, (uint32_t)x->count, (uint32_t)(x->instances ? x->instances : 1), 0, x->base_vertex, (uint32_t)x->base_instance);
     }
+    if (slow) { uint64_t sd2 = mk_now(); if (sd2 - sd0 > 1000000) LOG("[slowdraw] %.2f ms: shaders + sets %.2f, state + draw %.2f", (sd2 - sd0) / 1e6, (sd1 - sd0) / 1e6, (sd2 - sd1) / 1e6); }
     g_st_drawn++;
     if (drawlog() && !(g_st_drawn & (g_st_drawn - 1))) {
         char m[300]; int q = 0; for (int i = 0; i < 7; i++) if (g_st_skip[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", SKIP[i], (unsigned long long)g_st_skip[i]);

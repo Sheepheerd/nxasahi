@@ -79,7 +79,8 @@ int vkd_init(int with_window) {
     vkGetDeviceQueue(g_vkd.dev, g_vkd.qf, 0, &g_vkd.q);
     if (g_vkd.placed) g_vkd.map2 = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(g_vkd.dev, "vkMapMemory2KHR");
     if (g_vkd.shader_object) { g_vkd.create_shaders = (PFN_vkCreateShadersEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkCreateShadersEXT");
-        g_vkd.destroy_shader = (PFN_vkDestroyShaderEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkDestroyShaderEXT"); g_vkd.bind_shaders = (PFN_vkCmdBindShadersEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkCmdBindShadersEXT"); }
+        g_vkd.destroy_shader = (PFN_vkDestroyShaderEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkDestroyShaderEXT"); g_vkd.bind_shaders = (PFN_vkCmdBindShadersEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkCmdBindShadersEXT");
+        g_vkd.shader_binary = (PFN_vkGetShaderBinaryDataEXT)vkGetDeviceProcAddr(g_vkd.dev, "vkGetShaderBinaryDataEXT"); }
     g_vkd.window = with_window;
     LOG("vulkan: %s (driver %u.%u.%u, API %u.%u), queue family %u%s%s", g_vkd.props.deviceName, VK_VERSION_MAJOR(g_vkd.props.driverVersion), VK_VERSION_MINOR(g_vkd.props.driverVersion),
         VK_VERSION_PATCH(g_vkd.props.driverVersion), VK_API_VERSION_MAJOR(g_vkd.props.apiVersion), VK_API_VERSION_MINOR(g_vkd.props.apiVersion), g_vkd.qf,

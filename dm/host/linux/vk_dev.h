@@ -10,7 +10,7 @@ typedef struct {
     int placed;                   // VK_EXT_map_memory_placed (guest memory backed in place, vk_mem.c)
     int shader_object;            // VK_EXT_shader_object (the backend's shaders, vk_draw.c)
     int index_u8;                 // VK_KHR_index_type_uint8 (NVN's byte indices drawn as they are)
-    PFN_vkCreateShadersEXT create_shaders; PFN_vkDestroyShaderEXT destroy_shader; PFN_vkCmdBindShadersEXT bind_shaders;
+    PFN_vkCreateShadersEXT create_shaders; PFN_vkDestroyShaderEXT destroy_shader; PFN_vkCmdBindShadersEXT bind_shaders; PFN_vkGetShaderBinaryDataEXT shader_binary;
     PFN_vkMapMemory2KHR map2;
 } vkd_t;
 extern vkd_t g_vkd;

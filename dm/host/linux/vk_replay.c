@@ -197,7 +197,13 @@ static VkCommandBuffer up_cb(void) {   // the upload command buffer of the submi
     }
     return g_up[g_cb_i];
 }
-static int upload(vtex *t, const tex_t *o) {   // under g_tmu, inside a submission
+static _Atomic uint64_t g_up_ns;   // time spent loading textures (the long-frame log)
+void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_uploads; *reuploads = g_reuploads; }
+uint64_t mtl_upload_ns_take(void) { return atomic_exchange(&g_up_ns, 0); }
+uint64_t mtl_upload_bytes(void) { return g_up_bytes; }
+static int upload_(vtex *t, const tex_t *o);
+static int upload(vtex *t, const tex_t *o) { uint64_t t0 = mono_ns(); int r = upload_(t, o); atomic_fetch_add(&g_up_ns, mono_ns() - t0); return r; }
+static int upload_(vtex *t, const tex_t *o) {   // under g_tmu, inside a submission
     const nvn_texdesc *d = &o->d;
     if (!(t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || t->samples > 1 || !o->mem) return 0;   // depth / stencil and multisampled content is the GPU's
     if (o->pool && o->pool->vp) { static int w; if (!w++) LOG("[RED] vulkan replay: a texture in a sparse pool is not loaded yet"); return 0; }

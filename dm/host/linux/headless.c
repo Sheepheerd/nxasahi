@@ -53,9 +53,6 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = *reuse = 0; }
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = *skip = 0; }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full) { *load = *store = *full = 0; }
 void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip) { *resolve = *reuse = *set = *skip = 0; }
-void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = *reuploads = 0; }
-void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = *pso = 0; }
-void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = *pso_ns = 0; }
 void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { *draws = *made = *none = 0; }
 void mtl_alloc_stats(uint64_t *w, uint64_t *g, int *n) { *w = *g = 0; *n = 0; }
 void mtl_pso_line(char *out, size_t n) { snprintf(out, n, "none (headless)"); }
@@ -64,9 +61,7 @@ uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_drawable_ns_take(void) { return 0; }
 uint64_t mtl_pkg_edge_skips(void) { return 0; }
 uint64_t mtl_pkg_miss(void) { return 0; }
-uint64_t mtl_upload_ns_take(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
-uint64_t mtl_upload_bytes(void) { return 0; }
 void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 
