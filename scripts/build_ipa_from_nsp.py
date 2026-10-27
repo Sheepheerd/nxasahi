@@ -474,9 +474,11 @@ def decompress_nsz(nsp_dir, app, fam, keys, env):
             try:
                 # nsz 4.6.1 loads keys.txt beside argv[0] at import time; with argv[0] = 'nsz' that is cwd. That release has no --keys option.
                 (tmp / 'keys.txt').symlink_to(keys.resolve())
+                t0 = time.time()
                 run([sys.executable, '-c', NSZ_MAIN, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
-                if not (tmp / dst.name).is_file(): raise BuildError(f'nsz made no {dst.name} (full output: {log})')
-                (tmp / dst.name).rename(dst)
+                if (tmp / dst.name).is_file(): (tmp / dst.name).rename(dst)
+                elif not (dst.is_file() and dst.stat().st_mtime >= t0 - 1):   # nixpkgs' nsz 4.6.1 writes into the output folder's parent; it exits 0 only after a whole, verified file
+                    raise BuildError(f'nsz made no {dst.name} (full output: {log})')
             finally: rmtree(tmp)
             keyfile.write_text(key + '\n'); made += 1
         conv[p] = dst

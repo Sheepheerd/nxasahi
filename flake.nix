@@ -25,6 +25,7 @@
                 capstone
                 fonttools
                 pygobject3
+                nsz # NSZ / XCZ games, decompressed before extraction (build_ipa_from_nsp.py decompress_nsz)
               ]
             ))
             dotnet-sdk_10
