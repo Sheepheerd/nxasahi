@@ -499,6 +499,15 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
 // SDK 4's constructor has no priority argument (Dark Souls Remastered, NintendoSDK_movie 4.5.0). Without this take-over the SDK built its own decoder and the host's Configure read it as a host one (a call through a null pointer)
 HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", "movie decoder (SDK 4, no priority): host implementation", void, h_movie_Decoder4,
           void **self, int type, int fmt, int mode) { h_movie_Decoder(self, type, fmt, mode, 0); }
+// SDK 3's constructor has no mode either: CPU buffers (mode 1) were the only kind (Hollow Knight, NintendoSDK_movie 3.5.1; its other Decoder methods have the names hooked here).
+// Without this take-over the SDK built Android's ACodec, whose component allocation crashed on the missing hardware decoder (RefBase at 0x18 in onAllocateComponent).
+// Its output formats are numbered one lower than from SDK 4 on: DecoderImpl::ConvertDecoderOutputFormat (subsdk0+0x2dd16c) copies the Y and UV planes for 3 and converts for 2,
+// so 3 is NV12 (4 later) and 2 RGBA (3 later); 1 (PCM16) is the same. Taken as RGBA, Unity's NV12 movie texture showed fine vertical stripes
+static int md_fmt_sdk3(int fmt) { return fmt == 3 ? MD_FMT_NV12 : fmt == 2 ? MD_FMT_ABGR : fmt; }
+HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE", "movie decoder (SDK 3, no mode): host implementation", void, h_movie_Decoder3,
+          void **self, int type, int fmt) { h_movie_Decoder(self, type, md_fmt_sdk3(fmt), 1, 0); }
+HLE_FORCE("_ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatE", "movie decoder base object (SDK 3): host implementation", void, h_movie_Decoder3b,
+          void **self, int type, int fmt) { h_movie_Decoder(self, type, md_fmt_sdk3(fmt), 1, 0); }
 static void md_free(void **self) {
     mdec_t *d = md_of(self); if (!d) return;
     md_defer_drop(d);

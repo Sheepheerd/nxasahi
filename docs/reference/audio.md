@@ -58,6 +58,13 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** `render_once` looks up the `SdkMutexType` functions only when `update_lock` does not find `LockMutex` (`hle_audren.c`).
 - **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md) (SDK 3.5.1), the first SDK 3 game through the audio renderer (Bayonetta 2's 3.6.0 plays through `AudioOut`).
 
+### The `AudioRenderSystem` inside `AudioRendererImpl` (SDK 3.5.1)
+
+- **Symptom:** a movie's sound silent, and the game frozen for good when the movie stops: its main thread in `WaitSystemEvent` on the renderer event, the render thread running, `g_renders` still 1.
+- **Cause:** the takeover of `AudioRendererImpl::ExecuteAudioRendererRendering` took the `AudioRenderSystem` at `this + 0x60`, where it sits from SDK 4 on; in SDK 3.5.1 it is at +0x50 (`sdk+0x188a00`). Read 16 bytes off, the execution mode was not "manual", every render the render thread asked for failed with 0x40299, and the public `ExecuteAudioRendererRendering` signals the renderer event only after a render that succeeded. Unity opens a renderer for a movie's sound and waits on that event when the movie stops.
+- **Fix:** `impl_sys_off` in `hle_audren.c` reads the offset off `AudioRendererImpl::Start`, which every SDK has as `add x0, x0, #off` before its call to `AudioRenderSystem::Start`; anything else keeps +0x60.
+- **Found on:** [Hollow Knight](../../dm/games/0100633007D48000/README.md) (SDK 3.5.1, build `8bb65519…`).
+
 ### The render thread's route through the public `ExecuteAudioRendererRendering` (SDK 20)
 
 - **Symptom:** `CommandListProcessor::Process` crashes now and then (SIGSEGV under `render_main`, once at 60 s and once at 134 s in the shrine); every `RequestUpdate` renders a catch-up frame.

@@ -36,6 +36,6 @@ Base game 1.0.0 (v0), SDK 17.5.4. NintendoWare Bezel Engine on NVN. Modules `mai
 
 ## Open
 
-- The opening movie is H.264, which the Linux host does not decode yet (`[RED] movie: no H.264 decoder in the Linux host yet`).
+- The opening movie is H.264: the Linux host decodes it with FFmpeg now ([Linux: H.264 and AAC through FFmpeg](../../../docs/reference/movies.md#linux-h264-and-aac-through-ffmpeg)), not yet checked on this game.
 - `SetRenderEnableConditional` is drawn unconditionally.
 - Play beyond the title screen; the Mac and iOS.

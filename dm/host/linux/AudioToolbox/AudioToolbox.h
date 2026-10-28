@@ -1,5 +1,5 @@
 // Linux build: the AudioToolbox subset hle_audio.c (AudioUnit output) and hle_movie.c (AAC through AudioConverter) use. The output AudioUnit is SDL3 audio
-// (linux/audiounit_sdl.c: the render callback pulled by an SDL audio stream callback); AudioConverter fails, so AAC movie audio is silent (open: AAC through FFmpeg)
+// (linux/audiounit_sdl.c: the render callback pulled by an SDL audio stream callback); AudioConverter decodes AAC to PCM16 with FFmpeg (linux/audioconverter_ffmpeg.c)
 #pragma once
 #include <darwin_compat.h>
 typedef int32_t OSStatus;
@@ -47,7 +47,7 @@ OSStatus AudioUnitGetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScop
 OSStatus AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope s, AudioUnitElement e, const void *data, UInt32 size);
 OSStatus AudioUnitAddPropertyListener(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc p, void *ctx);
 OSStatus AudioUnitRemovePropertyListenerWithUserData(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc p, void *ctx);
-static inline OSStatus AudioConverterNew(const AudioStreamBasicDescription *in, const AudioStreamBasicDescription *out, AudioConverterRef *c) { (void)in; (void)out; *c = NULL; return DM_AT_FAIL; }
-static inline OSStatus AudioConverterDispose(AudioConverterRef c) { (void)c; return noErr; }
-static inline OSStatus AudioConverterSetProperty(AudioConverterRef c, UInt32 id, UInt32 size, const void *data) { (void)c; (void)id; (void)size; (void)data; return DM_AT_FAIL; }
-static inline OSStatus AudioConverterFillComplexBuffer(AudioConverterRef c, AudioConverterComplexInputDataProc in, void *ud, UInt32 *frames, AudioBufferList *out, AudioStreamPacketDescription *pd) { (void)c; (void)in; (void)ud; (void)out; (void)pd; *frames = 0; return DM_AT_FAIL; }
+OSStatus AudioConverterNew(const AudioStreamBasicDescription *in, const AudioStreamBasicDescription *out, AudioConverterRef *c);
+OSStatus AudioConverterDispose(AudioConverterRef c);
+OSStatus AudioConverterSetProperty(AudioConverterRef c, UInt32 id, UInt32 size, const void *data);
+OSStatus AudioConverterFillComplexBuffer(AudioConverterRef c, AudioConverterComplexInputDataProc in, void *ud, UInt32 *frames, AudioBufferList *out, AudioStreamPacketDescription *pd);

@@ -68,6 +68,7 @@
             pkgs.vulkan-loader
             pkgs.sdl3
             pkgs.libblocksruntime
+            pkgs.ffmpeg-headless # H.264 and AAC movies (dm/host/linux/movie_avc_ffmpeg.c, audioconverter_ffmpeg.c)
           ];
         in
         {
@@ -120,7 +121,7 @@
                 "''${gappsWrapperArgs[@]}" \
                 --add-flags $out/share/nxasahi/frontend/nxasahi.py \
                 --prefix PATH : ${lib.makeBinPath ([ py pkgs.dotnetCorePackages.runtime_10_0 ] ++ buildTools pkgs)} \
-                --prefix PKG_CONFIG_PATH : ${lib.makeSearchPathOutput "dev" "lib/pkgconfig" [ pkgs.sdl3 pkgs.vulkan-loader ]} \
+                --prefix PKG_CONFIG_PATH : ${lib.makeSearchPathOutput "dev" "lib/pkgconfig" [ pkgs.sdl3 pkgs.vulkan-loader pkgs.ffmpeg-headless ]} \
                 --prefix CPATH : ${lib.makeSearchPathOutput "dev" "include" [ pkgs.libblocksruntime pkgs.vulkan-headers ]} \
                 --prefix LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs} \
                 --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs} \
@@ -166,6 +167,7 @@
             spirv-tools
             # Linux front end: window, input, audio; graphics through Vulkan (Honeykrisp)
             sdl3
+            ffmpeg-headless # H.264 and AAC movies
             vulkan-loader
             vulkan-headers
             vulkan-tools
@@ -184,6 +186,7 @@
             pkgs.vulkan-loader
             pkgs.sdl3
             pkgs.libblocksruntime
+            pkgs.ffmpeg-headless
           ];
         };
       });

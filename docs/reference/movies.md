@@ -32,6 +32,13 @@ The SDK's movie library (`movie::Decoder`, `movie::Extractor`), which the host t
 - **Fix:** both forms are taken over now (`hle_movie.c`).
 - **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (SDK 4.5.0; one boot).
 
+### SDK 3's `movie::Decoder` constructor and its output format numbers
+
+- **Symptom:** a crash reading address 0x10 in `android::RefBase::RefBase` (`sdk+0x2ae72c`) from `android::ACodec::UninitializedState::onAllocateComponent` (`subsdk0+0x236360`) on the SDK's looper thread as the first movie starts; with the constructor taken over, Unity's movie texture showed fine vertical stripes.
+- **Cause:** SDK 3's `Decoder` constructor has neither mode nor priority (`_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE`), so the SDK built its own decoder over Android's ACodec, whose component allocation needs the hardware decoder. Its output formats are also numbered one lower than from SDK 4 on: `DecoderImpl::ConvertDecoderOutputFormat` (`subsdk0+0x2dd16c`) copies the Y and UV planes for 3 and converts for 2, so 3 is NV12 (4 later) and 2 RGBA (3 later). Unity asked for 3, which the host read as RGBA and wrote 4-byte pixels where NV12 was expected.
+- **Fix:** the host takes over both SDK 3 forms (`C1`, `C2`) as CPU-buffer decoders (mode 1, the only kind then) and maps the format numbers (`md_fmt_sdk3` in `hle_movie.c`); its other methods have the names already taken over.
+- **Found on:** [Hollow Knight](../../dm/games/0100633007D48000/README.md) (NintendoSDK_movie 3.5.1; Unity 5.6 plays its 14 MP4 movies, H.264 High profile 1280×720 and AAC-LC stereo, through `movie::Extractor` and `movie::Decoder`).
+
 ### The complete-object destructor
 
 - **Cause:** the game calls the complete-object destructor `movie::Decoder::~Decoder` (`D1`); the SDK's own one destroyed the host object as a `DecoderImpl`.
@@ -182,6 +189,12 @@ A decoder hands out as many outputs as it has slots, and while every slot is tak
 ### H.264 into an RGBA texture and AAC through AudioToolbox
 
 - H.264 (type 1) into the client's NVN texture (output 3 = RGBA, mode 2), with AAC 5.1 sound (type 4, PCM16). VideoToolbox decodes to BGRA for that mode (`mavc_set_rgba`), and AAC goes through AudioToolbox's converter with an MPEG-4 ES descriptor built from the AudioSpecificConfig in `csd-0` (as FFmpeg's AudioToolbox decoder does). Found on [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md); its end-of-stream packets and decoder deletes are in [End-of-stream packets with no data, and deleted decoders](#end-of-stream-packets-with-no-data-and-deleted-decoders).
+
+### Linux: H.264 and AAC through FFmpeg
+
+- **Symptom:** on Linux, `[RED] movie: no H.264 decoder in the Linux host yet` and black movies, and AAC movie sound silent (AudioToolbox's converter stood in as a failure).
+- **Fix:** `linux/movie_avc_ffmpeg.c` implements `hle_movie_avc.h` on libavcodec: parameter sets from `Configure`, an avcC record or the stream are put before the next access unit in Annex B form when they change; libavcodec reorders, so pictures leave in presentation order, and at the end of the stream the decoder is drained and then reset; NV12 out (video range), or RGBA through libswscale with the stream's colour matrix. `linux/audioconverter_ffmpeg.c` implements the AudioConverter calls `hle_movie.c` makes (AAC to interleaved PCM16), taking the AudioSpecificConfig out of the magic cookie's ES descriptor. FFmpeg comes from the flake (`ffmpeg-headless`).
+- **Found on:** [Hollow Knight](../../dm/games/0100633007D48000/README.md): its intro and prologue movies play, their AAC sound decoded (1280×720 H.264 at about 2 ms a picture).
 
 ### Vorbis movie sound
 

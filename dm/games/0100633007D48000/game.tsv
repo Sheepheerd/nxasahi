@@ -1,0 +1,35 @@
+# Game profile of Hollow Knight 1.3.2.9 (Unity 5.6.3p2 IL2CPP, SDK 3.5.1, NVN).
+# Format: see dm/games/README.md; bring-up and measurements in README.md beside this file.
+
+# ---- Identity ----
+title_id	0100633007D48000
+program_id	0100633007D48000
+
+# ---- App ----
+name	Hollow Knight
+ipa	HollowKnight.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v0	1.3.2.9	main=155c8506c654fb4db14cc3aa668d029e	subsdk0=80d47ec27d36e0fe5b5643c07d706513	sdk=8bb65519bc6399ab432e0ba7cdb16e2b
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Data/resources.assets.resS
+zip_store	.dat:.mp4:.resource:.ress:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/Data/=data
+shader_note	Hollow Knight shaders

@@ -97,7 +97,6 @@ Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/
 - **Graphics:** open: texel buffers, texture arrays beyond element 0, view format changes, quads and line loops, logic ops, indirect-count multi-draws, discarded rasterization (drawn anyway).
 - **Memory cost of the backing:** Honeykrisp pins device memory when it is allocated, so a chunk is resident from its first commit, where anonymous memory became resident page by page. Mario Wonder commits its 1.44 GB heap at boot: it uses about 1.95 GB instead of 0.5 GB (measured with `free`; device memory is shmem, not in the process's RSS). Chunks are not given back when a region shrinks.
 - **Sparse NVN memory pools** use `vm_remap` to alias memory, which Linux can only do for file-backed memory. Mappings stay in the page table only (`hle_nvn.c` `vpool_map` logs it). Fix with memfd-backed pools.
-- **AAC movie audio:** AudioConverter is not there, so AAC movie audio is silent (open: AAC through FFmpeg). **H.264 movies:** no decoder (`linux/movie_avc_none.c`). VP9/Vorbis movies use the bundled libvpx/stb_vorbis.
 - **Diagnostics:** the ones that read other threads' state (watchdog backtraces, hitch dumps, Mach CPU/energy counters) report nothing.
 - **Saves:** `clonefile` is a recursive copy (reflinked where the file system supports it), so commits cost time proportional to the save's size.
 - **Signals:** the SIGTERM shutdown source blocks SIGTERM only in threads created after it starts.

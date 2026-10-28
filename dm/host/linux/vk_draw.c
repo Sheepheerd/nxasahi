@@ -810,8 +810,9 @@ static void set_state(VkCommandBuffer c, int ncolor, uint32_t rt_w, uint32_t rt_
     VkRect2D sc[16];
     for (int i = 0; i < nvp; i++) {
         if (D.has_sc && D.sc[2] > 0 && D.sc[3] > 0) {
-            int sy = D.origin_ll ? (int)rt_h - D.sc[1] - D.sc[3] : D.sc[1];
-            sc[i] = (VkRect2D){{D.sc[0] < 0 ? 0 : D.sc[0], sy < 0 ? 0 : sy}, {(uint32_t)D.sc[2], (uint32_t)D.sc[3]}};
+            // Both origins as given: lower-left keeps GL's rows bottom-up in memory (the viewport above is not flipped either), so the scissor's y is already a memory row
+            // (flipping it against the target height left Hollow Knight's 1280x720 picture in a 1920x1080 window texture only rows 360..720)
+            sc[i] = (VkRect2D){{D.sc[0] < 0 ? 0 : D.sc[0], D.sc[1] < 0 ? 0 : D.sc[1]}, {(uint32_t)D.sc[2], (uint32_t)D.sc[3]}};
         } else sc[i] = (VkRect2D){{0, 0}, {rt_w, rt_h}};
     }
     vkCmdSetViewportWithCount(c, (uint32_t)nvp, vp); vkCmdSetScissorWithCount(c, (uint32_t)nvp, sc);

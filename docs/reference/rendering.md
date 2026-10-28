@@ -388,6 +388,12 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `vk_draw.c` keeps the range apart from the viewports, 0..1 until `SetDepthRange(s)`.
 - **Found on:** Pokémon Shining Pearl 1.0.0 (Linux; provisional profile, no note yet; the twin of [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)) (with the reversed-Z clear above, it hid nothing on its own).
 
+### Linux: the scissor of a lower-left-origin game
+
+- **Symptom:** a lower-left-origin game's 1280×720 picture in its 1920×1080 window texture had only rows 360–720 drawn, the logo cut off and the menu below it missing; the rest of the texture kept its clear colour.
+- **Cause:** with the lower-left origin (GL), the replay keeps the window image bottom-up in memory, so the viewport is not flipped: GL's y, measured from the bottom row, is the memory row. The scissor was still flipped against the target height (`rt_h − y − h`), so a scissor smaller than the target covered other rows than the viewport, and only their overlap was drawn. The Mac replay flips only the viewport for that origin, never the scissor.
+- **Fix:** `vk_draw.c` passes the scissor's y as given for both origins.
+- **Found on:** [Hollow Knight](../../dm/games/0100633007D48000/README.md) (Unity 5.6, which keeps NVN's default lower-left origin and draws its 1280×720 picture into a 1920×1080 window texture under a scissor of that size). A scissor covering the whole target reads the same either way.
 
 ## Vertex input and draws
 

@@ -97,7 +97,6 @@ Building the host by hand, running a game headless, and the environment variable
 - No amiibo and no online features.
 - Memory: Honeykrisp keeps a game's whole GPU-visible heap resident from the start. Mario Wonder uses about 1.95 GB of RAM where the Mac uses 0.5 GB.
 - Short hitches (up to about 60 ms) when many new textures load at once.
-- Movies: H.264 movies do not play, and AAC movie audio is silent. VP9 movies play.
 - The shared fonts are replaced with DejaVu Sans, so Chinese, Japanese and Korean text is not shown yet.
 - More in [LINUX.md](LINUX.md#known-gaps-open).
 
