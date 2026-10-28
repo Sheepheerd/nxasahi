@@ -72,12 +72,22 @@ If you use [direnv](https://direnv.net), `direnv allow` loads the shell whenever
 
 ## Play: the game library
 
-Start **nxasahi** from your app launcher, or run `nxasahi`.
+Start **nxasahi** from your app launcher, or run `nxasahi`. It opens a console-style home screen: your games in a row, newest played first, with the chosen game's name and state underneath. A controller drives it as on a Switch, and so do the keyboard and the mouse (F11 switches fullscreen):
 
-- **Add a game:** drag its NSP, XCI, NSZ or XCZ files onto the window, or use **+**. A base game is extracted, rewritten and its shaders translated, with progress shown on its tile. The first import takes a few minutes, and a later rebuild reuses every step whose inputs did not change. Drop an update or DLC to add it to its game, or pick it with **Add Update or DLC…** in the game's menu; the game is then rebuilt with it. The newest version you have is used, and any version works (each game was tested on the version its note names).
-- **Play:** double-click a tile. Its menu (or a right-click) has **Rebuild**, **Build Shader Cache** (compiles every shader the game has not compiled yet for your GPU, so nothing stutters in play), **Properties** (game language, extra environment variables), the save and log folders, and **Remove**.
-- **Preferences:** the keys file, game language, fullscreen, sound, fast cores only (on by default, which keeps the game on the performance cores), **Build the full shader cache** (on by default: an import or rebuild ends by compiling every shader for your GPU, a few minutes for a big game; off leaves them to be compiled while you play, with stutter until they are done), and how many threads compile, on the efficiency cores while you play, any shaders not compiled yet.
-- **Add to App Launcher** in the menu writes a desktop entry for the library (the installed package already has one).
+| Button | Keyboard | Home screen | Pages |
+|---|---|---|---|
+| D-pad / left stick | Arrow keys | Choose a game | Move between rows (↕), change a value (↔) |
+| A | Return | Play the game (on the **+** tile: add games) | Select |
+| B | Escape | — | Back |
+| X | X | The game's options | — |
+| Y | Y | Rebuild the game | — |
+| + | + (Ctrl+O) | Add games | — |
+| − | − (Ctrl+,) | Settings | — |
+
+- **Add a game:** drag its NSP, XCI, NSZ or XCZ files onto the window, or press **+**. A base game is extracted, rewritten and its shaders translated, with progress on its tile and in a card at the bottom right (**Output** shows the import's log, **Stop** stops it). The first import takes a few minutes, and a later rebuild reuses every step whose inputs did not change. Drop an update or DLC to add it to its game, or pick it with **Add update or DLC…** in the game's options; the game is then rebuilt with it. The newest version you have is used, and any version works (each game was tested on the version its note names).
+- **A game's options** (X, or right-click its tile): play or stop, its language and extra environment variables, **Add update or DLC…**, **Rebuild**, **Build shader cache** (compiles every shader the game has not compiled yet for your GPU, so nothing stutters in play), its save, log and game folders, and **Remove from library**.
+- **Settings** (−, or the ⚙ button): the keys file, game language, fullscreen, sound, fast cores only (on by default, which keeps the game on the performance cores), **Build the full shader cache** (on by default: an import or rebuild ends by compiling every shader for your GPU, a few minutes for a big game; off leaves them to be compiled while you play, with stutter until they are done), how many threads compile, on the efficiency cores while you play, any shaders not compiled yet, starting the library in fullscreen, and **Add to the app launcher** (the installed package already has an entry).
+- **Controllers** (the 🎮 button, Ctrl+K): each of the eight players' keyboard and controller, the stick deadzone and every binding. Choose a binding, press A, then press the key or controller input to give it; Backspace unbinds.
 
 Where things go:
 
@@ -135,7 +145,7 @@ This project is built on other people's work:
 - **[Atmosphère](https://github.com/Atmosphere-NX/Atmosphere)**: its kernel, mesosphère, is the reference for Horizon's synchronization semantics (address arbiter, condition variables).
 - **yuzu**: Maxwell instruction encodings for the shader reference tool, and a cross-check for kernel behaviour.
 - **[LibHac](https://github.com/Thealexbarney/LibHac)**: reads NSPs and layers updates over the base game in `dm/tools/nx_extract`. **hactool** did the first extractions.
-- **[SDL3](https://libsdl.org)**: the window, input and sound on Linux. **GTK 4** and **libadwaita**: the game library.
+- **[SDL3](https://libsdl.org)**: the window, input and sound on Linux. **Qt 6** (through **PySide6**): the game library.
 - **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)** and **[glslang](https://github.com/KhronosGroup/glslang)**: used by the shader chain shared with nxnative.
 - **deko3d** (zlib): its texture layout size algorithm is ported in `dm/gfx/nvn/nvn_tex.c`.
 - **libvpx** (VP9 movies), **stb_vorbis** (movie sound), the **Vulkan headers** and **NVIDIA FLIP** ship in `dm/third_party` with their licenses ([list](dm/third_party/README.md)).

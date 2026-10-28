@@ -1,39 +1,27 @@
 #!/usr/bin/env python3
 # The software keyboard's input box for the Linux host (dm/host/linux/front_sdl.c front_text_input, DM_TEXT_INPUT): text_input.py <title> <subtitle> <hint> <initial text> <max characters>
-# Prints the text (UTF-8, no newline) and exits 0 when confirmed; exits 1 when cancelled. GTK 4 + libadwaita, as the game library
+# Prints the text (UTF-8, no newline) and exits 0 when confirmed; exits 1 when cancelled. Qt Widgets, in the library's colours
 import sys
 
-import gi
-gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1')
-from gi.repository import Adw, Gtk
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLabel, QLineEdit, QVBoxLayout
 
 title, sub, hint, initial, maxc = (sys.argv[1:] + [''] * 5)[:5]
 maxc = int(maxc) if maxc.isdigit() else 0
-result = {'text': None}
 
-
-def activate(app):
-    win = Adw.ApplicationWindow(application=app, title=title or 'Enter Text', default_width=520, modal=True, resizable=False)
-    tv = Adw.ToolbarView(); hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
-    cancel = Gtk.Button(label='Cancel'); ok = Gtk.Button(label='OK', css_classes=['suggested-action'])
-    hb.pack_start(cancel); hb.pack_end(ok); hb.set_title_widget(Adw.WindowTitle(title=title or 'Enter Text', subtitle=sub)); tv.add_top_bar(hb)
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=18, margin_bottom=18, margin_start=18, margin_end=18)
-    entry = Gtk.Entry(text=initial, placeholder_text=hint, activates_default=True, hexpand=True)
-    if maxc: entry.set_max_length(maxc)
-    box.append(entry)
-    if maxc: box.append(Gtk.Label(label=f'Up to {maxc} characters', xalign=0, css_classes=['dim-label', 'caption']))
-    tv.set_content(box); win.set_content(tv); win.set_default_widget(ok)
-    def done(text):
-        result['text'] = text; win.close()
-    ok.connect('clicked', lambda *a: done(entry.get_text()))
-    entry.connect('activate', lambda *a: done(entry.get_text()))
-    cancel.connect('clicked', lambda *a: done(None))
-    keys = Gtk.EventControllerKey(); keys.connect('key-pressed', lambda c, kv, kc, st: (done(None), True)[1] if kv == 0xff1b else False); win.add_controller(keys)   # Escape cancels
-    win.present(); entry.grab_focus(); entry.select_region(0, -1)
-
-
-app = Adw.Application(application_id='org.nxasahi.TextInput')
-app.connect('activate', activate)
-app.run([sys.argv[0]])
-if result['text'] is None: sys.exit(1)
-sys.stdout.write(result['text']); sys.stdout.flush()
+app = QApplication([sys.argv[0]])
+app.setStyleSheet('QDialog { background: #171b27; } QLabel { color: #eef1f8; font-size: 15px; } QLabel#dim { color: #8b93a9; font-size: 13px; }'
+                  'QLineEdit { background: #10141d; color: #eef1f8; border: 2px solid #4fa3ff; border-radius: 8px; padding: 8px; font-size: 16px; }'
+                  'QPushButton { background: #262c3e; color: #eef1f8; border: 1px solid #323a52; border-radius: 8px; padding: 8px 18px; font-size: 14px; }'
+                  'QPushButton:default { background: #4fa3ff; color: #0b0e14; font-weight: bold; }')
+d = QDialog(); d.setWindowTitle(title or 'Enter Text'); d.setMinimumWidth(520)
+lay = QVBoxLayout(d); lay.setContentsMargins(22, 20, 22, 18); lay.setSpacing(10)
+if sub: lay.addWidget(QLabel(sub))
+entry = QLineEdit(initial); entry.setPlaceholderText(hint)
+if maxc: entry.setMaxLength(maxc)
+lay.addWidget(entry)
+if maxc: n = QLabel(f'Up to {maxc} characters'); n.setObjectName('dim'); lay.addWidget(n)
+bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject); lay.addWidget(bb)
+entry.selectAll(); entry.setFocus()
+ok = d.exec() == QDialog.Accepted
+if not ok: sys.exit(1)
+sys.stdout.write(entry.text()); sys.stdout.flush()

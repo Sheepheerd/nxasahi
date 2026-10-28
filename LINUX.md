@@ -7,7 +7,7 @@ Upstream is the `upstream` remote. The port keeps the shared sources almost unch
 ## Play: the game library
 
 ```sh
-frontend/nxasahi.sh          # GTK 4 / libadwaita, in the dev shell
+frontend/nxasahi.sh          # the game library (Qt 6 / QML), in the dev shell
 ```
 
 Drag NSP, XCI or NSZ files onto the window (or use **+**): a base game is imported (`scripts/build_ipa_from_nsp.py --platform linux`, its progress shown as it builds, a few minutes the first time), an update or DLC joins its game and the game is built again with it. Double-click a tile to play; its menu (or a right-click) has Rebuild, Properties (language, extra environment), the save and log folders, and Remove. Preferences: the keys file (default `~/.switch/prod.keys`), language, fullscreen, sound, fast cores, shader precompile threads. The menu's **Add to App Launcher** writes a desktop entry.
@@ -89,6 +89,7 @@ Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/
   - [x] Audio: the AudioUnit subset `hle_audio.c` uses, on SDL3 audio (`linux/audiounit_sdl.c`; PipeWire, PulseAudio or ALSA through SDL): the render callback pulled by SDL's stream callback, 5 ms device buffers. On by default (`DM_AUDIO=0` for the silent sink); without a device the silent sink stands in and the watchdog retries. Mario Wonder: no underruns
 - [x] Packing script: `--platform linux` (SPIR-V shaders, the Linux host per game, DejaVu stand-ins for the shared fonts, `linux_game.json`)
 - [x] Game library front end (`frontend/nxasahi.py`): drag and drop import with progress, updates and DLC, tiles, properties, preferences
+- [x] Console-style library on Qt 6 / QML (`frontend/qml`, `frontend/backend.py`): a home screen that a controller, the keyboard or the mouse drives; replaces GTK 4 / libadwaita
 
 ## Known gaps (open)
 

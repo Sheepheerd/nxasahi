@@ -17,7 +17,7 @@
             lz4
             capstone
             fonttools
-            pygobject3
+            pyside6 # the game library (frontend/nxasahi.py: Qt 6 / QML)
             nsz # NSZ / XCZ games, decompressed before extraction (build_ipa_from_nsp.py decompress_nsz)
           ]
         );
@@ -39,6 +39,13 @@
           spirv-tools
           glslang
         ];
+
+      # The library's Qt: the QML runtime, its controls and dialogs, and the Wayland platform plugin
+      qtLibs = pkgs: with pkgs.qt6; [ qtbase qtdeclarative qtwayland qtsvg ];
+      qtEnv = pkgs: {
+        QT_PLUGIN_PATH = pkgs.lib.makeSearchPath "lib/qt-6/plugins" (qtLibs pkgs);
+        QML_IMPORT_PATH = pkgs.lib.makeSearchPath "lib/qt-6/qml" (qtLibs pkgs);
+      };
 
       # The shared fonts' stand-ins: the Mac tools read macOS fonts
       fontDir = pkgs: "${pkgs.dejavu_fonts}/share/fonts/truetype";
@@ -81,15 +88,11 @@
 
             nativeBuildInputs = [
               pkgs.makeShellWrapper # --run lines: NXASAHI_STATE and VK_DRIVER_FILES are set at start
-              pkgs.wrapGAppsHook4
-              pkgs.gobject-introspection
+              pkgs.qt6.wrapQtAppsHook # Qt's plugin and QML paths (qtWrapperArgs) for the library
               pkgs.copyDesktopItems
             ];
-            buildInputs = [
-              pkgs.gtk4
-              pkgs.libadwaita
-            ];
-            dontWrapGApps = true; # its arguments go into the one wrapper below
+            buildInputs = qtLibs pkgs;
+            dontWrapQtApps = true; # its arguments go into the one wrapper below
             dontBuild = true;
 
             desktopItems = [
@@ -119,7 +122,7 @@
             # under NXASAHI_STATE (build_ipa_from_nsp.py linux_state), and nx_extract comes built
             preFixup = ''
               makeShellWrapper ${py}/bin/python3 $out/bin/nxasahi \
-                "''${gappsWrapperArgs[@]}" \
+                "''${qtWrapperArgs[@]}" \
                 --add-flags $out/share/nxasahi/frontend/nxasahi.py \
                 --prefix PATH : ${lib.makeBinPath ([ py pkgs.dotnetCorePackages.runtime_10_0 ] ++ buildTools pkgs)} \
                 --prefix PKG_CONFIG_PATH : ${lib.makeSearchPathOutput "dev" "lib/pkgconfig" [ pkgs.sdl3 pkgs.vulkan-loader pkgs.ffmpeg-headless pkgs.libglvnd ]} \
@@ -176,11 +179,10 @@
             vulkan-validation-layers
             # debugging
             gdb
-            # game library front end (frontend/nxasahi.py): GTK 4 and libadwaita through PyGObject
-            gtk4
-            libadwaita
-            gobject-introspection
-          ];
+          ]
+          # game library front end (frontend/nxasahi.py): Qt 6 / QML through PySide6
+          ++ qtLibs pkgs;
+          inherit (qtEnv pkgs) QT_PLUGIN_PATH QML_IMPORT_PATH;
           # The .NET apphost (nx_extract) looks for the runtime here
           DOTNET_ROOT = "${pkgs.dotnet-sdk_10}/share/dotnet";
           NXASAHI_FONT_DIR = fontDir pkgs;
