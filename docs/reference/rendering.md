@@ -331,6 +331,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [The Legend of Zelda: Breath of the Wild — upscaling and measurements](../../dm/games/01007EF00011E000/README.md#upscaling-current).
 - **Limit:** the scaler takes the presented frame, including any filtering and HUD drawing the game already performed. Feeding it an earlier scene target would mean replacing a draw of the game's own, and nothing general identifies which draw is a plain upscale. Scaler support is checked at runtime; unsupported devices, sizes and formats use standard scaling.
 
+### Linux: multisampled render targets were never cleared
+
+- **Symptom:** on Linux, a 3D scene missing behind a correct UI: Shining Pearl's professor and rival absent from its intro, Let's Go's bedroom black after Oak's speech; no `[RED]` line.
+- **Cause:** `op_clear_color` / `op_clear_ds` (`dm/host/linux/vk_replay.c`) cleared only single-sampled images. Both games draw the scene into a 4x target whose depth, never cleared, held stale values, and the reversed-Z `GEQUAL` test rejected every fragment.
+- **Fix:** both clear multisampled images too (`vkCmdClearColorImage` / `vkCmdClearDepthStencilImage` take any sample count). `DM_VK_PASSLOG` now logs each depth-stencil clear.
+- **Found on:** Pokémon Shining Pearl 1.0.0 (Linux; provisional profile, no note yet; the twin of [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)); Pokémon: Let's Go, Eevee! 1.0.0 (Linux; provisional profile, no note yet).
+
+
 ## Blend, depth and stencil
 
 ### No writes to colour outputs the shader does not write
@@ -372,6 +380,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Cause:** Unreal's stencil shader resources are second textures on the depth buffer's storage built with `nvnTextureBuilderSetDepthStencilMode(STENCIL)`, which the host only logged, so the character occlusion mask read depth where it tests stencil bits.
 - **Fix:** the builder's mode now goes to the texture (`tex_t.stencil`), whose sampling view is the `X32_Stencil8` one a stencil-mode texture view already got.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the character occlusion mask, `edbfc7a088be545e`).
+
+### Linux: viewport depth range without `SetDepthRange`
+
+- **Symptom:** a pass log showing `depth 0.00..0.00` for draws of a game that never sets a depth range.
+- **Cause:** the Linux replay took near / far from the viewport records, whose depth fields `SetViewports` never fills, so every fragment landed at depth 0. NVN's default is 0..1, as the Mac replay starts it (`S.dr`).
+- **Fix:** `vk_draw.c` keeps the range apart from the viewports, 0..1 until `SetDepthRange(s)`.
+- **Found on:** Pokémon Shining Pearl 1.0.0 (Linux; provisional profile, no note yet; the twin of [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)) (with the reversed-Z clear above, it hid nothing on its own).
+
 
 ## Vertex input and draws
 
@@ -515,6 +531,21 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Cause:** the game keeps NVN's lower-left window origin (handled as for Link's Awakening, [Lower-left window origin](#lower-left-window-origin)) and, twice a frame, sets viewport 0's swizzle with `nvnCommandBufferSetViewportSwizzles` to (x, −y, z, w), which negates clip-space y: how a renderer with OpenGL heritage flips its picture.
 - **Fix:** the swizzle is recorded (`OP_VP_SWIZZLE`) and applied at the draw as a viewport flipped about its centre, the same mapping. Facing is decided after the swizzle on the GPU as in Metal, so the winding stays. Other swizzles (axis exchanges, negated x / z / w) give a red line and are drawn unswizzled.
 - **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (FNA3D's NVN driver, `FNA3D_Driver_NVN.cpp`).
+
+### Linux: quads
+
+- **Symptom:** on Linux, Unity's post-processing missing: the scene never composited into the final image (black behind the UI) and the picture left unscaled; `DM_VK_DRAWLOG=1` reports `skipped: quads` for about half of all draws.
+- **Cause:** Vulkan has no quad primitive, and the replay skipped NVN's `QUADS` (7). Unity draws its blits (bloom, composite, upscale) as quads.
+- **Fix:** `vkx_draw` draws non-indexed quads as two triangles each (0-1-2, 0-2-3, the Mac's order) from a fixed index buffer of 65,536 quads, with the draw's first vertex as the vertex offset. Open: indexed and indirect quads (still skipped and counted).
+- **Found on:** Pokémon Shining Pearl 1.0.0 (Linux; provisional profile, no note yet; the twin of [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)).
+
+### Linux: programs bound per stage
+
+- **Symptom:** a draw logged with a vertex shader and no pixel shader (`ps -`), or the wrong shader in a stage, and nothing drawn.
+- **Cause:** `nvnCommandBufferBindProgram(program, stages)` binds the stages in its bits and leaves the others; the Linux replay replaced one bound program for every stage, so a game binding its vertex and fragment programs apart kept only the last one. The Mac replay merges them (`bind_stages`).
+- **Fix:** `vk_draw.c` keeps a program per stage and takes each stage's shader from its own program; dispatches use the compute stage's.
+- **Found on:** Pokémon FireRed Version 1.0.0 (Linux; provisional profile, no note yet): its only draw lost its vertex shader and the screen stayed black.
+
 
 ## Uniforms, copies and ordering
 

@@ -30,6 +30,7 @@ static int one(const char *name, char *why, size_t cap) {
     size_t words; uint32_t *raw = slurp(path, &words); if (!raw) { snprintf(why, cap, "unreadable"); return -2; }
     unsigned ch; size_t fw; uint32_t *code = spvr_fit(raw, words, &g_devf, &fw, &ch); free(raw);   // fitted to the device, as the backend loads it
     if (!code) { snprintf(why, cap, "spvr_fit failed"); return -2; }
+    { size_t nw; unsigned nc; uint32_t *nn = spvr_nan(code, fw, &nw, &nc); if (nn) { free(code); code = nn; fw = nw; } }   // Maxwell's sin / cos and stores of NaN, as vk_draw.c loads it
     words = fw; for (int b = 0; b < 4; b++) if (ch & (1u << b)) g_fit[b]++;
     spvr_info r; if (spvr_reflect(code, words, &r, why, cap)) { free(code); return -2; }
     // one set layout per set number up to the highest used; every binding visible to every stage, a runtime array as 1024 partially bound descriptors
@@ -95,7 +96,7 @@ int main(int argc, char **argv) {
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
     vkGetPhysicalDeviceFeatures2(pd, &f);
     if (!so.shaderObject) { printf("FAIL: %s has no shader objects\n", pp.deviceName); return 1; }
-    g_devf = (spvr_device){f.features.shaderFloat64, 0, f.features.vertexPipelineStoresAndAtomics};   // no VK_EXT_fragment_shader_interlock here (not enabled)
+    g_devf = (spvr_device){f.features.shaderFloat64, 0, f.features.vertexPipelineStoresAndAtomics, 1};   // SignedZeroInfNanPreserve: Honeykrisp has it for 32-bit floats   // no VK_EXT_fragment_shader_interlock here (not enabled)
     printf("device %s; storage images without format: read %d write %d; shaderFloat64 %d; geometry %d\n", pp.deviceName, f.features.shaderStorageImageReadWithoutFormat,
            f.features.shaderStorageImageWriteWithoutFormat, f.features.shaderFloat64, f.features.geometryShader);
     float prio = 1; VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &prio};

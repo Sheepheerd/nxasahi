@@ -41,9 +41,9 @@ Put your keys in `~/.switch/prod.keys`, or choose another path in the library's 
 frontend/nxasahi.sh
 ```
 
-- **Add a game:** drag its NSP, XCI, NSZ or XCZ files onto the window, or use **+**. A base game is extracted, rewritten and its shaders translated, with progress shown on its tile. The first import takes a few minutes, and a later rebuild reuses every step whose inputs did not change. Drop an update or DLC to add it to its game, which is then rebuilt with it. The newest version you have is used, and any version works (each game was tested on the version its note names).
-- **Play:** double-click a tile. Its menu (or a right-click) has **Rebuild**, **Properties** (game language, extra environment variables), the save and log folders, and **Remove**.
-- **Preferences:** the keys file, game language, fullscreen, sound, fast cores only (on by default, which keeps the game on the performance cores), and how many threads precompile shaders in the background.
+- **Add a game:** drag its NSP, XCI, NSZ or XCZ files onto the window, or use **+**. A base game is extracted, rewritten and its shaders translated, with progress shown on its tile. The first import takes a few minutes, and a later rebuild reuses every step whose inputs did not change. Drop an update or DLC to add it to its game, or pick it with **Add Update or DLC…** in the game's menu; the game is then rebuilt with it. The newest version you have is used, and any version works (each game was tested on the version its note names).
+- **Play:** double-click a tile. Its menu (or a right-click) has **Rebuild**, **Build Shader Cache** (compiles every shader the game has not compiled yet for your GPU, so nothing stutters in play), **Properties** (game language, extra environment variables), the save and log folders, and **Remove**.
+- **Preferences:** the keys file, game language, fullscreen, sound, fast cores only (on by default, which keeps the game on the performance cores), **Build the full shader cache** (on by default: an import or rebuild ends by compiling every shader for your GPU, a few minutes for a big game; off leaves them to be compiled while you play, with stutter until they are done), and how many threads compile, on the efficiency cores while you play, any shaders not compiled yet.
 - **Add to App Launcher** in the menu writes a desktop entry for the library.
 
 Where things go:

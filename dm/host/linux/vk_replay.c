@@ -488,7 +488,8 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
     if (t && (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         t->gpu_owned = 1;
         tex_ready(c, t);
-        if (g_passlog) LOG("[pass] clear colour %d serial %llu to %g %g %g %g", p->index, (unsigned long long)t->serial, p->rgba[0], p->rgba[1], p->rgba[2], p->rgba[3]);
+        if (g_passlog) { int sc[4], hs = vkx_scissor_get(sc); LOG("[pass] clear colour %d serial %llu to %g %g %g %g mask %#x scissor %s %d %d %d %d (image %ux%u)", p->index, (unsigned long long)t->serial,
+                                p->rgba[0], p->rgba[1], p->rgba[2], p->rgba[3], p->mask, hs ? "on" : "off", sc[0], sc[1], sc[2], sc[3], t->w, t->h); }
         VkClearColorValue v; memcpy(v.float32, p->rgba, sizeof v.float32);   // a float clear; integer targets take the same bits (open: NVN's integer clears)
         VkImageSubresourceRange r = view_range(t, &g_rt_view[p->index], g_rt_has_view[p->index], VK_IMAGE_ASPECT_COLOR_BIT);
         vkCmdClearColorImage(c, t->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r); full_barrier(c); g_clears++;
@@ -653,6 +654,9 @@ void mtl_exec(const uint8_t *handle) {
             VkBuffer b; VkDeviceSize off; VkDeviceAddress g;
             if (n && n <= 65536 && !(n & 3) && !(dst & 3) && vkm_lookup((const void *)(uintptr_t)dst, n, &b, &off, &g)) {
                 rp_end(c); vkCmdUpdateBuffer(c, b, off, n, (const uint8_t *)a + 16); full_barrier(c); g_ub_updates++;
+                if (g_passlog) { const float *f = (const float *)((const uint8_t *)a + 16); LOG("[pass] uniform update %#llx + %llu bytes; first %g %g %g %g", (unsigned long long)dst, (unsigned long long)n, n >= 16 ? f[0] : 0.f, n >= 16 ? f[1] : 0.f, n >= 16 ? f[2] : 0.f, n >= 16 ? f[3] : 0.f);
+                    static unsigned seq; const char *dd = getenv("DM_VK_SBUFDUMP");   // the update's bytes too, in order: <dir>/u<sequence>_<address>.bin
+                    if (dd) { char path[600]; snprintf(path, sizeof path, "%s/u%05u_%llx.bin", dd, seq++, (unsigned long long)dst); FILE *o = fopen(path, "wb"); if (o) { fwrite(f, 1, n, o); fclose(o); } } }
             } else { static int w; if (!w++) LOG("[RED] vulkan replay: uniform update of %llu bytes at %#llx not made (not 4-aligned or not in GPU-visible memory)", (unsigned long long)n, (unsigned long long)dst); }
             break;
         }
@@ -737,12 +741,15 @@ static void shoot_vt_flip(vtex *t, uint32_t layer, int flip, uint64_t fence, con
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, t->fmt, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) { LOG("[RED] screenshot %s: format %d cannot be blitted to RGBA8 here", path, (int)t->fmt); return; }
     uint32_t w = t->w, h = t->h; VkDevice d = g_vkd.dev;
-    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1,
+    // DM_VK_RTFLOAT=1 (debugging): the values as 32-bit floats, unclamped, in <path>.f32 beside the PNG (u32 width, u32 height, then RGBA per pixel)
+    static int rtf = -1; if (rtf < 0) rtf = getenv("DM_VK_RTFLOAT") != NULL;
+    const uint32_t bpp = rtf ? 16 : 4;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = rtf ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1,
         .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
     VkImage im; vkCreateImage(d, &ci, NULL, &im); VkMemoryRequirements mr; vkGetImageMemoryRequirements(d, im, &mr);
     VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = pick_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     VkDeviceMemory imm; vkAllocateMemory(d, &ma, NULL, &imm); vkBindImageMemory(d, im, imm, 0);
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * bpp, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; vkCreateBuffer(d, &bi, NULL, &buf); vkGetBufferMemoryRequirements(d, buf, &mr);
     ma.allocationSize = mr.size; ma.memoryTypeIndex = pick_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     VkDeviceMemory bm; vkAllocateMemory(d, &ma, NULL, &bm); vkBindBufferMemory(d, buf, bm, 0);
@@ -772,7 +779,13 @@ static void shoot_vt_flip(vtex *t, uint32_t layer, int flip, uint64_t fence, con
     pthread_mutex_lock(&g_vkd_qlock); VkResult r = vkQueueSubmit(g_vkd.q, 1, &si, fe); pthread_mutex_unlock(&g_vkd_qlock);
     if (!r) vkWaitForFences(d, 1, &fe, VK_TRUE, UINT64_MAX);
     void *px = NULL; vkMapMemory(d, bm, 0, VK_WHOLE_SIZE, 0, &px);
-    int ok = !r && px && write_png(path, px, w, h);
+    int ok = !r && px;
+    if (ok && rtf) {
+        char fp32[600]; snprintf(fp32, sizeof fp32, "%s.f32", path); FILE *o = fopen(fp32, "wb");
+        if (o) { fwrite(&w, 4, 1, o); fwrite(&h, 4, 1, o); fwrite(px, bpp, (size_t)w * h, o); fclose(o); }
+        uint8_t *q = malloc((size_t)w * h * 4); const float *f = px;   // the PNG: the floats clamped to 0..1
+        if (q) { for (size_t i = 0; i < (size_t)w * h * 4; i++) { float v = f[i]; q[i] = (uint8_t)(v != v || v <= 0 ? 0 : v >= 1 ? 255 : v * 255 + 0.5f); } ok = write_png(path, q, w, h); free(q); }
+    } else if (ok) ok = write_png(path, px, w, h);
     LOG("%sscreenshot %s: %ux%u (image format %d)%s", ok ? "" : "[RED] ", path, w, h, (int)t->fmt, ok ? "" : " not written");
     vkUnmapMemory(d, bm); vkDestroyFence(d, fe, NULL); vkFreeCommandBuffers(d, g_pool, 1, &c);
     vkDestroyBuffer(d, buf, NULL); vkFreeMemory(d, bm, NULL); vkDestroyImage(d, im, NULL); vkFreeMemory(d, imm, NULL);

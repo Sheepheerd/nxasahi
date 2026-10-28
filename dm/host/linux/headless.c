@@ -54,7 +54,7 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (!vkm_lookup((const void *)(uintptr_t)addr, len ? len : 1, &b, &o, &g)) { *buf = NULL; *off = 0; return 0; }
     *buf = (void *)b; *off = o; return 1;
 }
-int mtl_pso_prebuild_tool(void) { return 0; }
+int mtl_pso_prebuild_tool(void) { int vkx_precompile_tool(void); return vkx_precompile_tool(); }   // DM_VK_PRECOMPILE_ONLY=1: the shader cache alone, no game (vk_draw.c)
 // Statistics: nothing measured
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = *draws = 0; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = *reuse = 0; }

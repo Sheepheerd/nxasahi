@@ -19,7 +19,7 @@ GAMES, SAVES = DATA / 'games', DATA / 'saves'
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'nxasahi' / 'settings.json'
 GAME_EXT = ('.nsp', '.xci', '.nsz', '.xcz')
 ART = 180   # tile art size
-DEFAULTS = {'keys': str(Path.home() / '.switch/prod.keys'), 'language': '', 'fullscreen': False, 'audio': True, 'big_cores': True, 'precompile': 2, 'extra_env': ''}
+DEFAULTS = {'keys': str(Path.home() / '.switch/prod.keys'), 'language': '', 'fullscreen': False, 'audio': True, 'big_cores': True, 'precompile': 2, 'full_cache': True, 'extra_env': ''}
 
 sys.path.insert(0, str(REPO / 'dm/tools'))
 import nacp   # noqa: E402  (the game languages, the name and version in control data)
@@ -105,6 +105,7 @@ class Game:
 
 class Build:
     """One import / rebuild: the script with --progress json, its events into the card and the game's tile"""
+    what, done_title, done_text = 'Building', 'is ready', 'Double-click its tile to play'
     def __init__(self, app, game):
         self.app, self.game = app, game
         self.stage, self.frac, self.step, self.lines, self.proc, self.ok = 'waiting', None, '', [], None, None
@@ -114,7 +115,8 @@ class Build:
         s = self.app.settings
         if not Path(os.path.expanduser(s['keys'])).is_file():
             self.finish(False, f'no prod.keys at {s["keys"]}: set it in Preferences'); return
-        cmd = [sys.executable, str(SCRIPT), str(self.game.folder), '-k', os.path.expanduser(s['keys']), '--platform', 'linux', '--progress', 'json']
+        cmd = [sys.executable, str(SCRIPT), str(self.game.folder), '-k', os.path.expanduser(s['keys']), '--platform', 'linux', '--progress', 'json',
+               '--shader-cache' if s['full_cache'] else '--no-shader-cache']
         self.log.parent.mkdir(parents=True, exist_ok=True)
         self.logf = open(self.log, 'w')
         self.stage = 'starting'
@@ -133,7 +135,10 @@ class Build:
         if line.startswith('{'):
             try: ev = json.loads(line)
             except ValueError: ev = None
-        if ev:
+        pc = None if ev else re.fullmatch(r'precompile: (\d+) / (\d+)', line)   # the host's precompiler alone (CacheBuild): its count, not a line of the output
+        if pc:
+            d, t = int(pc[1]), int(pc[2]); self.frac = min(d / t, 0.99) if t else None; self.step = f'{d:,} / {t:,} shaders'
+        elif ev:
             e = ev.get('ev')
             if e == 'stage': self.stage = f'[{ev.get("k")}/{ev.get("n")}] {ev.get("name")}'; self.frac = None; self.step = ev.get('step') or ''
             elif e == 'step': self.step = ev.get('step') or ''
@@ -161,6 +166,40 @@ class Build:
 
     def cancel(self):
         if self.proc: self.proc.send_signal(signal.SIGINT)
+
+
+class CacheBuild(Build):
+    """Build Shader Cache: the game's host with DM_VK_PRECOMPILE_ONLY=1 (dm/host/linux/vk_draw.c vkx_precompile_tool), every shader compiled for this GPU into
+    ~/.cache/nxasahi/vkshaders on every core, so nothing is compiled while the game runs. What is cached already is skipped"""
+    what, done_title, done_text = 'Building the shader cache of', 'shader cache is full', 'Every shader is compiled: nothing is left to compile in play'
+
+    def __init__(self, app, game):
+        super().__init__(app, game); self.log = game.work() / 'logs' / 'shader_cache.log'
+
+    def start(self):
+        m = self.game.manifest
+        env = dict(os.environ); env.update(m['env']); env.pop('DM_WINDOW', None)
+        env['DM_VK_PRECOMPILE_ONLY'] = '1'; env['DM_AUDIO'] = '0'
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        self.logf = open(self.log, 'w')
+        self.stage = 'compiling the shaders for this GPU'
+        launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        launcher.set_environ([f'{k}={v}' for k, v in env.items()]); launcher.set_cwd(m['cwd'])
+        try: self.proc = launcher.spawnv([m['host']])
+        except GLib.Error as e: self.finish(False, f'the host did not start: {e.message}'); return
+        self.stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self.stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line)
+        self.proc.wait_async(None, self._exited)
+        self.app.build_changed(self)
+
+    def finish(self, ok, msg=''):   # the game's build state is not this job's: a failure is only reported
+        self.ok = ok; self.stage = 'done' if ok else 'failed'; self.error = msg
+        try: self.logf.close()
+        except Exception: pass
+        self.app.build_done(self)
+
+    def cancel(self):   # SIGTERM: what is compiled so far stays cached (each shader is written whole, then renamed)
+        if self.proc: self.proc.send_signal(signal.SIGTERM)
 
 
 class GameTile(Gtk.Box):
@@ -224,8 +263,8 @@ class BuildCard(Gtk.Box):
 
     def update(self):
         b = self.build
-        self.title.set_label(f'Building {b.game.name}' if b.ok is None else (f'{b.game.name} is ready' if b.ok else f'{b.game.name}: build failed'))
-        self.stage.set_label(b.stage + (f' — {b.step}' if b.step else '') if b.ok is None else (b.error if not b.ok else 'Double-click its tile to play'))
+        self.title.set_label(f'{b.what} {b.game.name}' if b.ok is None else (f'{b.game.name}: {b.done_title}' if b.ok else f'{b.game.name}: build failed'))
+        self.stage.set_label(b.stage + (f' — {b.step}' if b.step else '') if b.ok is None else (b.error if not b.ok else b.done_text))
         if b.ok is not None: self.bar.set_fraction(1.0 if b.ok else self.bar.get_fraction()); self.cancel.set_visible(False)
         elif b.frac is None: self.bar.pulse()
         else: self.bar.set_fraction(b.frac)
@@ -256,7 +295,7 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         for name, fn, param in (('play', self.play, 's'), ('rebuild', lambda t: self.enqueue(self.games[t]), 's'), ('properties', self.properties, 's'),
                                 ('open-saves', lambda t: self.open_dir(SAVES / t), 's'), ('open-logs', lambda t: self.open_dir(self.games[t].work() / 'logs'), 's'),
-                                ('open-folder', lambda t: self.open_dir(self.games[t].folder), 's'), ('remove', self.remove, 's'), ('stop', self.stop, 's'),
+                                ('open-folder', lambda t: self.open_dir(self.games[t].folder), 's'), ('remove', self.remove, 's'), ('stop', self.stop, 's'), ('add-content', self.content_dialog, 's'), ('build-cache', self.build_cache, 's'),
                                 ('add', lambda: self.add_dialog(), None), ('preferences', lambda: self.preferences(), None), ('controllers', lambda: self.controllers(), None), ('library', lambda: self.open_dir(GAMES), None),
                                 ('desktop', lambda: self.install_desktop(), None), ('about', lambda: self.about(), None)):
             act = Gio.SimpleAction.new(name, GLib.VariantType.new(param) if param else None)
@@ -305,7 +344,7 @@ class App(Adw.Application):
     def game_menu(self, tid):
         m = Gio.Menu()
         s1 = Gio.Menu(); s1.append('Play', f'app.play::{tid}'); s1.append('Stop', f'app.stop::{tid}'); m.append_section(None, s1)
-        s2 = Gio.Menu(); s2.append('Properties', f'app.properties::{tid}'); s2.append('Rebuild', f'app.rebuild::{tid}'); m.append_section(None, s2)
+        s2 = Gio.Menu(); s2.append('Properties', f'app.properties::{tid}'); s2.append('Add Update or DLC…', f'app.add-content::{tid}'); s2.append('Rebuild', f'app.rebuild::{tid}'); s2.append('Build Shader Cache', f'app.build-cache::{tid}'); m.append_section(None, s2)
         s3 = Gio.Menu(); s3.append('Open Save Folder', f'app.open-saves::{tid}'); s3.append('Open Build Logs', f'app.open-logs::{tid}'); s3.append('Open Game Folder', f'app.open-folder::{tid}'); m.append_section(None, s3)
         s4 = Gio.Menu(); s4.append('Remove from Library…', f'app.remove::{tid}'); m.append_section(None, s4)
         return m
@@ -347,6 +386,26 @@ class App(Adw.Application):
             self.add_paths([files.get_item(i).get_path() for i in range(files.get_n_items())])
         d.open_multiple(self.win, None, done)
 
+    def content_dialog(self, tid):   # an update or DLC chosen for one game: files of another title are refused
+        g = self.games[tid]
+        d = Gtk.FileDialog(title=f'Add Update or DLC to {g.name}')
+        flt = Gtk.FileFilter(name='Switch updates and DLC (NSP, XCI, NSZ, XCZ)')
+        for e in GAME_EXT: flt.add_suffix(e[1:])
+        fl = Gio.ListStore.new(Gtk.FileFilter); fl.append(flt); d.set_filters(fl)
+        def done(dlg, res):
+            try: files = dlg.open_multiple_finish(res)
+            except GLib.Error: return
+            keep = []
+            for p in (files.get_item(i).get_path() for i in range(files.get_n_items())):
+                if not p: continue
+                try: app, kind, _ = identify(p)
+                except ValueError as e: self.toast(str(e), 6); continue
+                if f'{app:016X}' != tid: self.toast(f'{Path(p).name}: belongs to {app:016X}, not {g.name}', 6)
+                elif kind == 'base': self.toast(f'{Path(p).name}: the base game, not an update or DLC', 6)
+                else: keep.append(p)
+            if keep: self.add_paths(keep)
+        d.open_multiple(self.win, None, done)
+
     def add_paths(self, paths):
         touched, bad = {}, []
         for p in paths:
@@ -377,10 +436,10 @@ class App(Adw.Application):
         self.refresh()
 
     # ---- builds ----
-    def enqueue(self, g):
+    def enqueue(self, g, kind=Build):
         if g.tid in self.builds and self.builds[g.tid].ok is None: self.toast(f'{g.name} is already building'); return
         if g.tid in self.cards: self.cardbox.remove(self.cards.pop(g.tid))
-        b = Build(self, g); self.builds[g.tid] = b
+        b = kind(self, g); self.builds[g.tid] = b
         card = BuildCard(self, b); self.cards[g.tid] = card; self.cardbox.append(card)
         self.queue.append(b); self.pump(); self.refresh()
 
@@ -396,9 +455,17 @@ class App(Adw.Application):
 
     def build_done(self, b):
         b.game.reload(); self.build_changed(b); self.refresh()
-        self.toast(f'{b.game.name} is ready to play' if b.ok else f'{b.game.name}: build failed — {b.error}', 5 if b.ok else 8)
+        self.toast(f'{b.game.name}: {b.done_title}' if b.ok else f'{b.game.name}: build failed — {b.error}', 5 if b.ok else 8)
         if b.ok: GLib.timeout_add_seconds(8, lambda: (self.drop_card(b), False)[1])
         self.pump()
+
+    def build_cache(self, tid):
+        g = self.games[tid]
+        if not g.ready: self.toast(f'{g.name} is not built yet'); return
+        try: new = b'DM_VK_PRECOMPILE_ONLY' in Path(g.manifest['host']).read_bytes()   # a host built before the precompiler could run alone
+        except OSError: new = False
+        if not new: self.toast(f'{g.name} was built before shader caches could be built ahead: Rebuild it (that builds the cache too)', 8); return
+        self.enqueue(g, CacheBuild)
 
     def drop_card(self, b):
         c = self.cards.get(b.game.tid)
@@ -529,7 +596,10 @@ class App(Adw.Application):
         g3 = Adw.PreferencesGroup(title='Performance')
         bc = Adw.SwitchRow(title='Fast cores only', subtitle='Keep games on the performance cores (much faster on Apple silicon)', active=bool(s['big_cores']))
         bc.connect('notify::active', lambda r, p: put('big_cores', r.get_active())); g3.add(bc)
-        pc = Adw.SpinRow.new_with_range(0, 8, 1); pc.set_title('Shader precompile threads'); pc.set_subtitle('Background threads that fill the shader cache while you play (0 = off)'); pc.set_value(int(s['precompile']))
+        fc = Adw.SwitchRow(title='Build the full shader cache', subtitle='Compile every shader for your GPU when a game is imported or rebuilt (a few minutes for a big game). Off: the game compiles them while you play, with stutter until they are all done',
+                           active=bool(s['full_cache']))
+        fc.connect('notify::active', lambda r, p: put('full_cache', r.get_active())); g3.add(fc)
+        pc = Adw.SpinRow.new_with_range(0, 8, 1); pc.set_title('Shader precompile threads'); pc.set_subtitle('Threads on the efficiency cores that compile, while you play, what the import left (0 = off)'); pc.set_value(int(s['precompile']))
         pc.connect('notify::value', lambda r, p: put('precompile', int(r.get_value()))); g3.add(pc)
         page.add(g3)
         g4 = Adw.PreferencesGroup(title='Advanced')

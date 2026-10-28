@@ -113,13 +113,16 @@ int spvr_reflect(const uint32_t *code, size_t words, spvr_info *out, char *err, 
 // ---- spvr_fit ----
 enum { OpExtension = 10, OpCapability = 17, OpCopyMemory = 63, OpStore = 62, OpAccessChain = 65, OpInBoundsAccessChain = 66, OpPtrAccessChain = 67,
        OpInBoundsPtrAccessChain = 70, OpFunctionCall = 57, OpCopyObject = 83, OpBitcast = 124, OpSelect = 169, OpPhi = 245, OpAtomicFirst = 227, OpAtomicLast = 242, OpBeginInvocationInterlockEXT = 5364, OpEndInvocationInterlockEXT = 5365 };
+enum { OpMemoryModel = 14, ModeSignedZeroInfNanPreserve = 4461, CapSignedZeroInfNanPreserve = 4466 };
+enum { OpExtInstImport = 11, OpExtInst = 12, GlslFMin = 37, GlslFMax = 40, GlslFClamp = 43, GlslNMin = 79, GlslNMax = 80, GlslNClamp = 81 };
 enum { CapFloat64 = 10, CapSampleInterlock = 5363, CapShadingRateInterlock = 5372, CapPixelInterlock = 5378, DecNonWritable = 24 };
 uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, size_t *out_words, unsigned *changes) {
     *changes = 0; *out_words = 0;
     if (words < 5 || code[0] != 0x07230203) return NULL;
     uint32_t nid = code[3];
     // what the module has and uses
-    int f64type = 0, interlock_used = 0, model = -1;
+    int f64type = 0, interlock_used = 0, model = -1; uint32_t glsl = 0;   // glsl: the GLSL.std.450 import
+    uint32_t entries[8]; int nentry = 0, has_nanp = 0;   // entry points; the module already declares SignedZeroInfNanPreserve
     uint8_t *ptr_sc = calloc(nid, 1), *bufblock = calloc(nid, 1), *nonwr = calloc(nid, 1);   // pointer type → storage class + 1; struct ids decorated BufferBlock; NonWritable ids
     uint32_t *ptr_t = calloc(nid, sizeof *ptr_t), *arr = calloc(nid, sizeof *arr), *root = calloc(nid, sizeof *root);   // pointer → pointee; array → element; pointer value → its storage buffer variable
     uint8_t *isbuf = calloc(nid, 1), *written = calloc(nid, 1);
@@ -127,7 +130,10 @@ uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, s
     for (int pass = 0; pass < 2; pass++)   // twice: an OpPhi can name a pointer defined further down (a loop's back edge)
     for (size_t i = 5; i < words;) {
         const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16; if (!n || i + n > words) goto fail;
+        if (op == OpEntryPoint && !pass && nentry < 8) entries[nentry++] = w[2];
+        if (op == OpCapability && w[1] == CapSignedZeroInfNanPreserve) has_nanp = 1;
         if (op == OpEntryPoint && model < 0) model = (int)w[1];
+        else if (op == OpExtInstImport && n >= 3 && !strcmp((const char *)(w + 2), "GLSL.std.450")) glsl = w[1];
         else if (op == OpTypeFloat && w[2] == 64) f64type = 1;
         else if (op == OpBeginInvocationInterlockEXT || op == OpEndInvocationInterlockEXT) interlock_used = 1;
         else if (op == OpDecorate && w[1] < nid && w[2] == DecBufferBlock) bufblock[w[1]] = 1;
@@ -153,8 +159,9 @@ uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, s
     uint32_t nmark = 0; int stores = 0;
     if (!dev->vertex_stores && vertex_stage)
         for (uint32_t id = 0; id < nid; id++) if (isbuf[id] && !nonwr[id]) { if (written[id]) stores = 1; else nmark++; }
-    uint32_t *o = malloc((words + 4 * nmark) * sizeof *o); if (!o) goto fail;
-    size_t k = 0; int marked = 0;
+    int nanp = dev->nan_preserve && !has_nanp && nentry;
+    uint32_t *o = malloc((words + 4 * nmark + 16 + 4 * (size_t)nentry) * sizeof *o); if (!o) goto fail;
+    size_t k = 0; int marked = 0, nanp_state = 0;   // nanp_state: 1 capability in, 2 extension in, 3 execution modes in
     memcpy(o, code, 5 * sizeof *o); k = 5;
     for (size_t i = 5; i < words;) {
         const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16, drop = 0;
@@ -163,11 +170,33 @@ uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, s
         if (op == OpCapability && drop_il && (w[1] == CapPixelInterlock || w[1] == CapSampleInterlock || w[1] == CapShadingRateInterlock)) { drop = 1; *changes |= SPVR_FIT_INTERLOCK; }
         if (op == OpExtension && drop_il && !strcmp((const char *)(w + 1), "SPV_EXT_fragment_shader_interlock")) { drop = 1; *changes |= SPVR_FIT_INTERLOCK; }
         if (op == OpExecutionMode && drop_il && w[2] >= 5366 && w[2] <= 5371) { drop = 1; *changes |= SPVR_FIT_INTERLOCK; }   // Pixel / Sample / ShadingRate Interlock Ordered / Unordered
+        // SignedZeroInfNanPreserve, each part where the module layout wants it: the capability among the capabilities, the extension before the imports and the memory
+        // model, an execution mode per entry point after the last entry point. Maxwell keeps NaN and infinities through every operation, and the translated shaders depend on
+        // it (their isnan selects, NMin / NMax); without the mode Mesa may assume neither occurs and fold the checks away
+        if (nanp && nanp_state == 0 && op == OpCapability) { o[k++] = (2u << 16) | OpCapability; o[k++] = CapSignedZeroInfNanPreserve; nanp_state = 1; }
+        if (nanp && nanp_state == 1 && (op == OpExtInstImport || op == OpMemoryModel)) {
+            static const char ext[] = "SPV_KHR_float_controls"; uint32_t nw = 1 + (uint32_t)(sizeof ext + 3) / 4;
+            o[k] = (nw << 16) | OpExtension; memset(o + k + 1, 0, (nw - 1) * 4); memcpy(o + k + 1, ext, sizeof ext); k += nw; nanp_state = 2;
+        }
+        if (nanp && nanp_state == 2 && op != OpEntryPoint && op != OpExtInstImport && op != OpMemoryModel && op != OpExtension && op != OpCapability) {
+            for (int e = 0; e < nentry; e++) { o[k++] = (4u << 16) | OpExecutionMode; o[k++] = entries[e]; o[k++] = ModeSignedZeroInfNanPreserve; o[k++] = 32; }
+            nanp_state = 3; *changes |= SPVR_FIT_NANPRESERVE;
+        }
         if (op == OpDecorate && !marked && nmark) {   // the decorations go before the first one
             for (uint32_t id = 0; id < nid; id++) if (isbuf[id] && !nonwr[id] && !written[id]) { o[k++] = (3u << 16) | OpDecorate; o[k++] = id; o[k++] = DecNonWritable; }
             marked = 1; *changes |= SPVR_FIT_NONWRITABLE;
         }
-        if (!drop) { memcpy(o + k, w, n * sizeof *o); k += n; }
+        if (!drop) {
+            memcpy(o + k, w, n * sizeof *o);
+            // Maxwell's FMNMX returns the other operand when one is NaN, and saturation gives 0 for NaN; GLSL.std.450's FMin / FMax / FClamp leave the result undefined, and
+            // Honeykrisp returns the NaN. NMin / NMax / NClamp are defined as Maxwell's (NClamp of NaN is its lower bound). Pokemon Shining Pearl's soft particles take
+            // min(exp2(log2(0) * 0), 1) for a particle at the scene's depth: NaN, stored in an R11G11B10 target as its largest value, which the bloom spread over the bedroom.
+            // The Mac's libraries do the same with Metal's precise:: functions (docs/reference/shaders.md, min, max and clamp with a NaN operand)
+            if (op == OpExtInst && n >= 5 && glsl && w[3] == glsl && (w[4] == GlslFMin || w[4] == GlslFMax || w[4] == GlslFClamp)) {
+                o[k + 4] = w[4] == GlslFMin ? GlslNMin : w[4] == GlslFMax ? GlslNMax : GlslNClamp; *changes |= SPVR_FIT_NMINMAX;
+            }
+            k += n;
+        }
         i += n;
     }
     if (stores) *changes |= SPVR_FIT_STORES;
@@ -296,4 +325,88 @@ uint32_t *spvr_init_outputs(const uint32_t *code, size_t words, size_t *out_word
 fail:
     free(builtin); free(ptr_sc); free(ptr_t);
     return NULL;
+}
+
+// ---- spvr_nan ----
+// Two places where Maxwell and this GPU part ways on non-finite values (Pokemon Shining Pearl's bedroom: its TV's flicker divides by a speed of 0, the angle becomes
+// infinity - infinity, and the colour comes from cos(NaN)):
+// - MUFU.SIN / MUFU.COS of NaN or of an infinity give NaN; GLSL.std.450's Sin / Cos leave it undefined, and the driver gave a large finite number, which no NaN check
+//   downstream catches. Each float Sin / Cos is made select(isnan(x) || isinf(x), NaN, sin(x)).
+// - A NaN written to a float render target stays NaN on Maxwell, and what reads it later (FMNMX, saturation: the bloom's threshold, the tonemapper) drops it. This GPU
+//   stores it as the format's largest value (65024 in R11G11B10, 65504 in RGBA16F), which the bloom spread over the bedroom as a white glow. Fragment outputs are
+//   written as select(isnan(v), 0, v): what a Maxwell reader using min / max or saturation makes of the NaN. Open: a reader that tests isnan itself sees 0 instead.
+// - A NaN output of the vertex, tessellation or geometry stage reaches the fragment shader as NaN on Maxwell; here interpolation turns it into a large finite number
+//   (the TV's colour arrived as one, and the fragment shader's own NaN check could not see it). Their user outputs (not the builtins) get the same select: the
+//   fragment shader computes from 0 where Maxwell's would have computed NaN and had it stored as 0
+enum { OpIsNan = 156, OpIsInf = 157, OpLogicalOr = 166, OpTypeBool = 20, GlslSin = 13, GlslCos = 14, ExecFragment = 4 };
+uint32_t *spvr_nan(const uint32_t *code, size_t words, size_t *out_words, unsigned *changes) {
+    *changes = 0; *out_words = 0;
+    if (words < 5 || code[0] != 0x07230203) return NULL;
+    uint32_t bound = code[3], model = UINT32_MAX, glsl = 0, t_float = 0, t_v4 = 0, t_bool = 0, t_bv4 = 0;
+    size_t first_fn = 0, nsin = 0, nstore = 0;
+    uint8_t *builtin = calloc(bound, 1), *out_ptr = calloc(bound, 1);   // ids decorated BuiltIn (variables, and blocks with a BuiltIn member: gl_PerVertex); pointers into a user Output variable
+    uint32_t *ptr_t = calloc(bound, sizeof *ptr_t), *id_t = calloc(bound, sizeof *id_t), *arr_t = calloc(bound, sizeof *arr_t);   // pointer type → pointee; pointer id → its type; array → element
+    uint32_t *o = NULL;
+    if (!builtin || !out_ptr || !ptr_t || !id_t || !arr_t) goto done;
+    for (int pass = 0; pass < 2; pass++)   // twice: the counts need the types and output pointers the first pass found
+    for (size_t i = 5; i < words;) {
+        const uint32_t *w = code + i; uint32_t op = w[0] & 0xFFFF, n = w[0] >> 16; if (!n || i + n > words) goto done;
+        if (!pass) {
+            if (op == OpEntryPoint && model == UINT32_MAX) model = w[1];
+            else if (op == OpExtInstImport && n >= 3 && !strcmp((const char *)(w + 2), "GLSL.std.450")) glsl = w[1];
+            else if (op == OpTypeFloat && w[2] == 32 && !t_float) t_float = w[1];
+            else if (op == OpTypeBool && !t_bool) t_bool = w[1];
+            else if (op == OpTypeVector && w[3] == 4 && t_float && w[2] == t_float && !t_v4) t_v4 = w[1];
+            else if (op == OpTypeVector && w[3] == 4 && t_bool && w[2] == t_bool && !t_bv4) t_bv4 = w[1];
+            else if (op == OpDecorate && w[2] == DecBuiltIn && w[1] < bound) builtin[w[1]] = 1;
+            else if (op == OpMemberDecorate2 && n >= 4 && w[3] == DecBuiltIn && w[1] < bound) builtin[w[1]] = 1;   // the struct type
+            else if (op == OpTypePointer && w[1] < bound) ptr_t[w[1]] = w[3];
+            else if (op == OpVariable2 && w[1] < bound && w[2] < bound) {
+                id_t[w[2]] = w[1]; uint32_t pt = ptr_t[w[1]];   // an arrayed output (tessellation control): its element type
+                for (int a = 0; a < 2 && pt < bound && arr_t[pt]; a++) pt = arr_t[pt];
+                if (w[3] == SCOutput && !builtin[w[2]] && !(pt < bound && builtin[pt])) out_ptr[w[2]] = 1;
+            }
+            else if ((op == OpTypeArray || op == OpTypeRuntimeArray) && w[1] < bound) arr_t[w[1]] = w[2];
+            else if ((op == OpAccessChain || op == OpInBoundsAccessChain) && w[1] < bound && w[2] < bound && w[3] < bound) { id_t[w[2]] = w[1]; if (out_ptr[w[3]]) out_ptr[w[2]] = 1; }
+            else if (op == OpFunction && !first_fn) first_fn = i;
+        } else if (op == OpExtInst && n >= 6 && glsl && w[3] == glsl && (w[4] == GlslSin || w[4] == GlslCos) && w[1] == t_float) nsin++;
+        else if (op == OpStore && model <= ExecFragment && w[1] < bound && out_ptr[w[1]] && id_t[w[1]] < bound) { uint32_t vt = ptr_t[id_t[w[1]]]; if ((vt == t_float && t_float) || (vt == t_v4 && t_v4)) nstore++; }
+        i += n;
+    }
+    if ((!nsin && !nstore) || !first_fn || !t_float) goto done;   // nothing to do: NULL, the caller keeps its code
+    // declarations, before the first function: the bool types where missing, 0 and NaN, a vec4 of 0
+    uint32_t decl[32]; size_t nd = 0;
+    if (!t_bool) { t_bool = bound++; decl[nd++] = (2u << 16) | OpTypeBool; decl[nd++] = t_bool; }
+    if (t_v4 && !t_bv4) { t_bv4 = bound++; decl[nd++] = (4u << 16) | OpTypeVector; decl[nd++] = t_bv4; decl[nd++] = t_bool; decl[nd++] = 4; }
+    uint32_t c0 = bound++, cnan = bound++, cv0 = t_v4 ? bound++ : 0;
+    decl[nd++] = (4u << 16) | OpConstant; decl[nd++] = t_float; decl[nd++] = c0; decl[nd++] = 0;
+    decl[nd++] = (4u << 16) | OpConstant; decl[nd++] = t_float; decl[nd++] = cnan; decl[nd++] = 0x7fc00000u;
+    if (t_v4) { decl[nd++] = (7u << 16) | OpConstantComposite; decl[nd++] = t_v4; decl[nd++] = cv0; decl[nd++] = c0; decl[nd++] = c0; decl[nd++] = c0; decl[nd++] = c0; }
+    o = malloc((words + nd + 25 * nsin + 10 * nstore) * sizeof *o); if (!o) goto done;
+    size_t k = 0;
+    for (size_t i = 0; i < words;) {
+        if (i == first_fn) { memcpy(o + k, decl, nd * sizeof *o); k += nd; }
+        const uint32_t *w = code + i; uint32_t op = i < 5 ? 0 : w[0] & 0xFFFF, n = i < 5 ? 5 : w[0] >> 16;
+        if (i >= 5 && op == OpExtInst && n >= 6 && glsl && w[3] == glsl && (w[4] == GlslSin || w[4] == GlslCos) && w[1] == t_float) {
+            uint32_t x = w[5], r0 = bound++, isn = bound++, isi = bound++, bad = bound++;
+            uint32_t seq[] = {(6u << 16) | OpExtInst, t_float, r0, glsl, w[4], x,
+                              (4u << 16) | OpIsNan, t_bool, isn, x, (4u << 16) | OpIsInf, t_bool, isi, x, (5u << 16) | OpLogicalOr, t_bool, bad, isn, isi,
+                              (6u << 16) | OpSelect, t_float, w[2], bad, cnan, r0};
+            memcpy(o + k, seq, sizeof seq); k += sizeof seq / sizeof *seq; *changes |= 1;
+        } else if (i >= 5 && op == OpStore && model <= ExecFragment && w[1] < bound && out_ptr[w[1]] && id_t[w[1]] < bound
+                   && ((ptr_t[id_t[w[1]]] == t_float && t_float) || (ptr_t[id_t[w[1]]] == t_v4 && t_v4))) {
+            int v4 = ptr_t[id_t[w[1]]] == t_v4; uint32_t isn = bound++, sel = bound++;
+            uint32_t seq[] = {(4u << 16) | OpIsNan, v4 ? t_bv4 : t_bool, isn, w[2], (6u << 16) | OpSelect, v4 ? t_v4 : t_float, sel, isn, v4 ? cv0 : c0, w[2]};
+            memcpy(o + k, seq, sizeof seq); k += sizeof seq / sizeof *seq;
+            memcpy(o + k, w, n * sizeof *o); o[k + 2] = sel; k += n;   // the store itself (with any memory-access operands), of the selected value
+            *changes |= 2;
+        } else { memcpy(o + k, w, n * sizeof *o); k += n; }
+        i += n;
+    }
+    o[3] = bound;
+    *out_words = k;
+done:
+    free(builtin); free(out_ptr); free(ptr_t); free(id_t); free(arr_t);
+    if (o && !*out_words) { free(o); o = NULL; }
+    return o;
 }

@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <sys/resource.h>
 #include <dirent.h>
+#include <sched.h>
 
 #define NST 6
 typedef struct { uint64_t addr, size; } bbuf;
@@ -107,7 +108,6 @@ static int draw_init(void) {
     if (!nfiles) { LOG("[RED] vulkan draws: no <key>.vkb in %s (run dm/gfx/tools/dmsh_spv.py)", g_spv); return g_init = 0; }
     { uint64_t lh = 1469598103934665603ull; for (uint32_t i = 0; i < n; i++) { lh = (lh ^ b[i].binding) * 1099511628211ull; lh = (lh ^ (uint64_t)b[i].descriptorType) * 1099511628211ull; lh = (lh ^ b[i].descriptorCount) * 1099511628211ull; }
       shc_init(lh); }   // shader binaries depend on the layout they were made with
-    precompile_start();
     VkDescriptorSetLayoutBindingFlagsCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, .bindingCount = n, .pBindingFlags = f};
     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .pNext = &fi, .bindingCount = n, .pBindings = b};
     if (vkCreateDescriptorSetLayout(g_vkd.dev, &li, NULL, &g_dsl)) { LOG("[RED] vulkan draws: no descriptor set layout"); return g_init = 0; }
@@ -117,6 +117,7 @@ static int draw_init(void) {
     if (vkCreatePipelineLayout(g_vkd.dev, &pi, NULL, &g_pl_gfx) || vkCreatePipelineLayout(g_vkd.dev, &pc, NULL, &g_pl_cs)) { LOG("[RED] vulkan draws: no pipeline layouts"); return g_init = 0; }
     LOG("vulkan draws: shaders from %s (%d), one set layout of %u bindings for every stage (%u uniform, %u storage, %u textures, %u images, %u texel buffers per set)", g_spv, nfiles, n,
         g_per_set[0], g_per_set[1], g_per_set[2], g_per_set[3], g_per_set[4]);
+    precompile_start();   // after the layouts: a shader is compiled against g_dsl (started before it, a compiler thread passed a null layout and Mesa crashed in lookup_ycbcr_conversion)
     return g_init = 1;
 }
 static void parse_vkb(vks *s, const char *txt) {
@@ -167,9 +168,13 @@ static uint32_t *sh_code(const char *key, int *st_out, size_t *nw, vks *s, unsig
         if (c1) { c1 += 7; const char *e = strchr(c1, '"'); c1n = e ? (size_t)(e - c1) / 2 : 0; c1d = malloc(c1n ? c1n : 1); for (size_t i = 0; i < c1n; i++) c1d[i] = (uint8_t)hexbyte(c1 + 2 * i); }
         buffer_with(c1d, c1n > 65536 ? 65536 : (c1n ? c1n : 256), &s->c1, &s->c1m); s->c1_len = (uint32_t)c1n; free(c1d);
     }
-    spvr_device dev = {0, 0, 0}; size_t fw; unsigned ch = 0;
+    static int nanp = -1;   // the driver keeps NaN and infinities when the module asks (SignedZeroInfNanPreserve for 32-bit floats)
+    if (nanp < 0) { VkPhysicalDeviceFloatControlsProperties fc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+                    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &fc}; vkGetPhysicalDeviceProperties2(g_vkd.pd, &p2); nanp = fc.shaderSignedZeroInfNanPreserveFloat32 != 0; }
+    spvr_device dev = {0, 0, 0, nanp}; size_t fw; unsigned ch = 0;
     uint32_t *fit = spvr_fit((const uint32_t *)code, ncode / 4, &dev, &fw, &ch);
     if (fit && (st == 0 || st == 4)) { size_t iw; uint32_t *io = spvr_init_outputs(fit, fw, &iw); if (io) { free(fit); fit = io; fw = iw; } }   // unwritten output components read 0, as on Maxwell
+    if (fit) { size_t nw2; unsigned nc; uint32_t *nn = spvr_nan(fit, fw, &nw2, &nc); if (nn) { free(fit); fit = nn; fw = nw2; } }   // Maxwell's sin / cos and stores of NaN
     free(code); free(vkb); free(job);
     *st_out = st; *nw = fw; if (ch_out) *ch_out = ch;
     return fit;
@@ -189,7 +194,7 @@ static void shc_init(uint64_t layout_hash) {
     if (e && *e) snprintf(root, sizeof root, "%s", e);
     else { const char *x = getenv("XDG_CACHE_HOME"), *h = getenv("HOME"); if (x && *x) snprintf(root, sizeof root, "%s/nxasahi/vkshaders", x); else if (h) snprintf(root, sizeof root, "%s/.cache/nxasahi/vkshaders", h); else return; }
     char u[33]; for (int i = 0; i < 16; i++) snprintf(u + 2 * i, 3, "%02x", g_sop.shaderBinaryUUID[i]);
-    snprintf(g_shc, sizeof g_shc, "%s/%s-%016llx-%s-%u", root, base, (unsigned long long)layout_hash, u, g_sop.shaderBinaryVersion);
+    snprintf(g_shc, sizeof g_shc, "%s/%s-%016llx-%s-%u-f%d", root, base, (unsigned long long)layout_hash, u, g_sop.shaderBinaryVersion, SPVR_FIT_VERSION);   // f: spvr_fit's rewrites
     char mk[1400]; snprintf(mk, sizeof mk, "%s", g_shc);   // mkdir -p
     for (char *q = mk + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(mk, 0755); *q = '/'; }
     if (mkdir(mk, 0755) && errno != EEXIST) { LOG("[RED] vulkan draws: no shader cache directory %s", g_shc); return; }
@@ -470,7 +475,9 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             else if ((b->k == BK_CBUF)) { int ok = b->reg >= 0 && b->reg < 16 && buf_desc(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, 64, 65536, &bi[nw]); if (!ok) g_miss[M_UBO]++;
                 if (g_trace && b->reg >= 0 && b->reg < 16) { const float *f = (const float *)(uintptr_t)S.ubo[st][b->reg].addr;
                     LOG("[pass]     stage %d cbuf binding %u c%d: addr %#llx size %llu%s; first %g %g %g %g", st, b->b, b->reg, (unsigned long long)S.ubo[st][b->reg].addr, (unsigned long long)S.ubo[st][b->reg].size,
-                        ok ? "" : " [NOT BOUND]", f ? f[0] : 0.f, f ? f[1] : 0.f, f ? f[2] : 0.f, f ? f[3] : 0.f); } }
+                        ok ? "" : " [NOT BOUND]", f ? f[0] : 0.f, f ? f[1] : 0.f, f ? f[2] : 0.f, f ? f[3] : 0.f);
+                    const char *dd = getenv("DM_VK_SBUFDUMP");   // constant buffers too, as c<address>.bin
+                    if (dd && f && S.ubo[st][b->reg].size <= 65536) { char path[600]; snprintf(path, sizeof path, "%s/c%llx.bin", dd, (unsigned long long)S.ubo[st][b->reg].addr); FILE *o = fopen(path, "wb"); if (o) { fwrite(f, 1, S.ubo[st][b->reg].size, o); fclose(o); } } } }
             else if ((b->k == BK_DRVCB)) { if (!drv_fill(st, b->b == 17 ? 2 : b->b == 16 ? 0 : -1, &bi[nw])) g_miss[M_OTHER]++; }   // binding 16 = c0, 17 = c2 (dmsh_spv.py)
             else g_miss[M_OTHER]++;
         } else if (b->desc == 's') {
@@ -540,34 +547,82 @@ static VkDescriptorSet stage_set(int st, vks *s) {
 }
 // Background precompiler: every shader of the set into the disk cache, in the form a draw will ask for (the GL-depth form for vertex, geometry and tessellation
 // evaluation shaders in a GL-depth game), on low-priority threads while the game runs. The first run fills the cache (about a minute on the M1's large cores for
-// Mario Wonder's 12,811); after it no shader is compiled in play. DM_VK_PRECOMPILE=<threads> (2 by default), 0 turns it off
-static _Atomic int g_pc_next, g_pc_done; static _Atomic uint64_t g_pc_compiled; static uint64_t g_pc_t0;
+// Mario Wonder's 12,811); after it no shader is compiled in play. DM_VK_PRECOMPILE=<threads> (2 by default), 0 turns it off. In play the threads run on the cores
+// of less than the highest capacity when there are any (the M1's Icestorm cores): the process keeps the game on the large ones (darwin_compat.c prefer_big_cores),
+// and two compiler threads there took half of Super Smash Bros. Ultimate's four, about half of its frames over 16.7 ms.
+// DM_VK_PRECOMPILE_ONLY=1 (vkx_precompile_tool): the precompiler alone, no game, on every core, then the process exits; the Linux import runs it last
+// (scripts/build_ipa_from_nsp.py --platform linux), so the first run starts with a full cache.
+// The depth mode decides a pre-rasterization shader's form, and only the game sets it (NVN's depth mode; Smash sets near = 0 at start, so its vertex shaders are
+// plain). The first draw of a run records it in the cache as depth_mode; the tool takes it from there, and without it makes both forms
+static _Atomic int g_pc_next, g_pc_done, g_pc_threads; static _Atomic uint64_t g_pc_compiled; static uint64_t g_pc_t0; static int g_pc_tool, g_pc_depth = -1;
+static void shc_note_depth(void) {   // the first draw: the game's depth mode into the cache, for the tool
+    static int noted; if (noted || !g_shc_on) return; noted = 1;
+    if (g_pc_depth == g_depth_zero) return;
+    char p[1500], t[1600]; snprintf(p, sizeof p, "%s/depth_mode", g_shc); snprintf(t, sizeof t, "%s.%d.tmp", p, (int)getpid());
+    FILE *f = fopen(t, "w"); if (!f) return;
+    int w = fprintf(f, "%d\n", g_depth_zero) > 0; w = !fclose(f) && w; if (!w || rename(t, p)) unlink(t);
+}
+static void pc_cores(void) {   // a compiler thread in play: onto the cores of less than the highest capacity, when the CPU has cores of different capacity
+    int cap[CPU_SETSIZE], n = 0, best = -1;
+    for (int c = 0; c < CPU_SETSIZE; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+        FILE *f = fopen(p, "r"); cap[c] = -1; if (f) { if (fscanf(f, "%d", &cap[c]) != 1) cap[c] = -1; fclose(f); }
+        if (cap[c] < 0) break; n = c + 1; if (cap[c] > best) best = cap[c]; }
+    cpu_set_t set; CPU_ZERO(&set); int k = 0;
+    for (int c = 0; c < n; c++) if (cap[c] < best) { CPU_SET(c, &set); k++; }
+    if (k) sched_setaffinity(0, sizeof set, &set);
+}
 static void *precompile_main(void *arg) {
-    (void)arg; setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+    (void)arg;
+    if (!g_pc_tool) { setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10); pc_cores(); }
     for (int i; (i = atomic_fetch_add(&g_pc_next, 1)) < g_nkeys;) {
         const char *key = g_keys[i];
         uint8_t *vkb; size_t nv; char path[1200]; snprintf(path, sizeof path, "%s/%s.vkb", g_spv, key);   // the stage first, from the header: no work for what is cached
         if (!read_file(path, &vkb, &nv)) continue;
         const char *h = strchr((const char *)vkb, ' '); h = h ? strchr(h + 1, ' ') : NULL; int st = h ? stage_of_name(h + 1) : -1; free(vkb);
         if (st < 0) continue;
-        int gl = (st == 0 || st == 2 || st == 4) && !g_depth_zero;
-        if (shc_has(key, st, gl)) continue;
-        size_t nw; int st2; uint32_t *spv = sh_code(key, &st2, &nw, NULL, NULL); if (!spv) continue;
-        int comp = 0; VkShaderEXT o = sh_object(key, st, gl, spv, nw, &comp); free(spv);
-        if (o) g_vkd.destroy_shader(g_vkd.dev, o, NULL);
-        if (comp) atomic_fetch_add(&g_pc_compiled, 1);
+        int pre = st == 0 || st == 2 || st == 4, zero = g_pc_tool ? g_pc_depth : g_depth_zero;   // zero < 0: not known (the tool before any run): both forms
+        int forms = !pre ? 1 : zero < 0 ? 3 : zero ? 1 : 2;   // bit 0 the plain form, bit 1 the GL-depth form
+        for (int gl = 0; gl < 2; gl++) {
+            if (!(forms >> gl & 1) || shc_has(key, st, gl)) continue;
+            size_t nw; int st2; uint32_t *spv = sh_code(key, &st2, &nw, NULL, NULL); if (!spv) break;
+            int comp = 0; VkShaderEXT o = sh_object(key, st, gl, spv, nw, &comp); free(spv);
+            if (o) g_vkd.destroy_shader(g_vkd.dev, o, NULL);
+            if (comp) atomic_fetch_add(&g_pc_compiled, 1);
+        }
     }
-    if (atomic_fetch_add(&g_pc_done, 1) == 0) LOG("vulkan draws: shader precompile done: %llu compiled into the cache in %.1f s (%llu shaders in the set)",
+    if (atomic_fetch_add(&g_pc_done, 1) + 1 == atomic_load(&g_pc_threads)) LOG("vulkan draws: shader precompile done: %llu compiled into the cache in %.1f s (%llu shaders in the set)",
         (unsigned long long)atomic_load(&g_pc_compiled), (mk_now() - g_pc_t0) / 1e9, (unsigned long long)g_nkeys);
     return NULL;
 }
 static void precompile_start(void) {
-    const char *e = getenv("DM_VK_PRECOMPILE"); int n = e ? atoi(e) : 2;
+    const char *e = getenv("DM_VK_PRECOMPILE"); int n = g_pc_tool ? (int)sysconf(_SC_NPROCESSORS_ONLN) : e ? atoi(e) : 2;
     if (!g_shc_on || n <= 0 || !g_nkeys) return;
-    if (n > 8) n = 8;
-    g_pc_t0 = mk_now();
-    for (int i = 0; i < n; i++) { pthread_t t; if (!pthread_create(&t, NULL, precompile_main, NULL)) pthread_detach(t); }
-    LOG("vulkan draws: precompiling %d shaders into the cache on %d background threads", g_nkeys, n);
+    if (n > 8 && !g_pc_tool) n = 8;
+    char p[1500]; snprintf(p, sizeof p, "%s/depth_mode", g_shc); FILE *f = fopen(p, "r");
+    if (f) { int v; if (fscanf(f, "%d", &v) == 1 && (v == 0 || v == 1)) g_pc_depth = v; fclose(f); }
+    if (g_pc_tool) {   // every core: the process limit to the large ones (prefer_big_cores) is lifted for its threads
+        cpu_set_t all; CPU_ZERO(&all); for (int c = 0; c < n && c < CPU_SETSIZE; c++) CPU_SET(c, &all); sched_setaffinity(0, sizeof all, &all);
+    }
+    g_pc_t0 = mk_now(); atomic_store(&g_pc_threads, n);
+    for (int i = 0; i < n; i++) { pthread_t t; if (pthread_create(&t, NULL, precompile_main, NULL)) atomic_fetch_sub(&g_pc_threads, 1); else pthread_detach(t); }
+    LOG("vulkan draws: precompiling %d shaders into the cache on %d %sthreads%s", g_nkeys, n, g_pc_tool ? "" : "background ",
+        g_pc_tool ? (g_pc_depth < 0 ? " (depth mode not recorded yet: both forms of the pre-rasterization shaders)" : g_pc_depth ? " (depth mode near = 0)" : " (depth mode GL)") : "");
+}
+// DM_VK_PRECOMPILE_ONLY=1: the shader cache filled with no game (the precompiler above on every core), its progress on stdout as "precompile: <done> / <total>"
+// every second, then exit (0 when the set was gone through). Called from main before anything loads (headless.c mtl_pso_prebuild_tool)
+int vkx_precompile_tool(void) {
+    const char *e = getenv("DM_VK_PRECOMPILE_ONLY"); if (!e || !atoi(e)) return 0;
+    g_pc_tool = 1;
+    if (!vkd_init(0) || !draw_init()) { LOG("[RED] shader precompile: no Vulkan device or no shader set (see the lines above)"); exit(1); }
+    if (!g_shc_on) { LOG("[RED] shader precompile: no shader cache (DM_VK_SHCACHE=0?)"); exit(1); }
+    if (!atomic_load(&g_pc_threads)) { LOG("[RED] shader precompile: no threads started"); exit(1); }
+    for (;;) {
+        int d = atomic_load(&g_pc_next); if (d > g_nkeys) d = g_nkeys;
+        printf("precompile: %d / %d\n", d, g_nkeys); fflush(stdout);
+        if (atomic_load(&g_pc_done) >= atomic_load(&g_pc_threads)) break;
+        usleep(1000000);
+    }
+    exit(0);
 }
 // The plain and GL-depth forms of a pre-rasterization shader, made the first time a draw asks (under no lock: the submit thread alone makes them)
 static VkShaderEXT sh_plain(vks *s) {
@@ -590,6 +645,7 @@ static VkShaderEXT gl_variant(vks *s) {
 // A draw: the program's shaders and their descriptor sets (bound in c). 0 when the draw cannot be made (no program, a shader missing)
 int vkx_prepare_draw(VkCommandBuffer c) {
     if (!draw_init() || g_pool_slot < 0 || !S.prog[0]) return 0;
+    shc_note_depth();
     g_st_draws++;
     vks *sh[5] = {0};
     for (int st = 0; st < 5; st++) {   // each stage's shader from the program bound to that stage
@@ -669,6 +725,7 @@ void vkx_bind_state(const p_bind_state *s) {
     }
 }
 void vkx_viewports(const p_viewports *v) { for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(D.vp[v->first + i], v->v[i], sizeof D.vp[0]); if (v->first + v->n > D.nvp) D.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; }
+int vkx_scissor_get(int r[4]) { memcpy(r, D.sc, sizeof D.sc); return D.has_sc; }   // the scissor rectangle, and whether one was set
 void vkx_scissor(const p_scissor *s) { D.sc[0] = s->x; D.sc[1] = s->y; D.sc[2] = s->w; D.sc[3] = s->h; D.has_sc = 1; }
 void vkx_depth_range(const p_depth_range *r) { D.dn = r->n; D.df = r->f; D.has_dr = 1; }
 void vkx_stencil(const p_stencil *s) {
@@ -839,6 +896,8 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
     if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog[st] && prog_key(S.prog[st], (unsigned)(S.prog[st] == S.prog[0] ? st : 0), k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
         LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d func %d, stencil %d func %d ref %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
             d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.ds.df, (int)D.ds.st, (int)D.ds.sf_f, D.st_ref[0], (int)D.poly.cull);
+        if (D.color.blend_en & 1) LOG("[pass]     blend 0: rgb src %d dst %d eq %d, alpha src %d dst %d eq %d; blend colour %g %g %g %g", (int)D.blend[0].src_rgb, (int)D.blend[0].dst_rgb, (int)D.blend[0].eq_rgb,
+            (int)D.blend[0].src_a, (int)D.blend[0].dst_a, (int)D.blend[0].eq_a, D.bc[0], D.bc[1], D.bc[2], D.bc[3]);
         LOG("[pass]     viewports %d: %.1f %.1f %.1f %.1f depth %.2f..%.2f%s; scissor %s %d %d %d %d; front %s; origin %s; depth mode %s; attrs %#x", D.nvp, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3],
             D.dn, D.df, D.has_dr ? " (depth range)" : "", D.has_sc ? "on" : "off", D.sc[0], D.sc[1], D.sc[2], D.sc[3], D.poly.front ? "ccw" : "cw",
             D.origin_ll ? "lower left" : "upper left", D.depth_zero ? "zero" : "gl", ({ unsigned m = 0; for (int i = 0; i < 16; i++) if (D.attr[i].fmt) m |= 1u << i; m; }));

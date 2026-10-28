@@ -14,7 +14,7 @@
 #   in ~/Library/Application Support/nxnative/<title ID>/, the log in ~/Library/Logs/nxnative/<title ID>.log. Signed ad-hoc, or with MAC_SIGN / --mac-sign; no hardened runtime, no notarization.
 # PLATFORM = 'linux' / --platform linux (nxasahi: Linux on Apple silicon, Asahi): the same steps up to the shader split, then the SPIR-V shaders of the Vulkan backend (dmsh_spv.py),
 #   the Linux host for the profile (dm/host/Makefile.linux) and the shared-font stand-ins (DejaVu: NXASAHI_FONT_DIR); writes <id>_build/linux_game.json (what the game runs from: the front end
-#   frontend/nxasahi.py reads it) and prints the command that runs the game. NVN games only: their files' shaders, and those a game compiles with its own GLSLC (captured by booting it headless in the Linux host); not Unreal or Oodle packs, which the Mac host decodes
+#   frontend/nxasahi.py reads it), fills the shader cache for this GPU (the host's precompiler on every core) and prints the command that runs the game. NVN games only: their files' shaders, and those a game compiles with its own GLSLC (captured by booting it headless in the Linux host); not Unreal or Oodle packs, which the Mac host decodes
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
@@ -55,6 +55,7 @@ PSO_GPUS = ''                           # NVN games: GPU architectures the app g
                                         #   another device's name is in its log when the app has none for it), so the device does not build them on its first start; each adds about 650 MB to the app (Breath of the Wild) and minutes to a first build; 'none' = no archive;
                                         #   empty = by the game's profile: 'g18p' when it sets pso_mtl4 on (the Metal 4 path, the only one that reads the archive on iOS, is on for it), else 'none'
                                         #   PLATFORM 'mac-app': the Mac app's archive (Resources/pso), empty = this Mac's GPU (e.g. 'g14s' for an M2 Max), 'none' = the app builds its bases on its first start
+SHADER_CACHE = True                     # PLATFORM 'linux': compile every shader for this GPU at the end of the build (the stage "Shader cache", a few minutes for a big game); False leaves it to the game, which compiles them while it runs
 SHOW_FPS = True                         # True shows the game's frame rate on the iPhone (frames on screen per second, top left); DM_SHOW_FPS=0 / 1 in the app's Documents/env.txt changes it without a rebuild
 SURVEY_ONLY = False                     # a game with no profile in dm/games: only write the survey, no provisional profile and no IPA
 PROFILE_OUT = ''                        # where a provisional profile goes (empty = <NSP folder>/<title ID>_build/profile; the profile is <this>/<title ID>/)
@@ -1759,6 +1760,23 @@ def linux_run(work, game, patched, host, font, spv, aoc, lang, g, app, name, ver
     return f'cd {q(rd)} && ' + ' '.join(f'{k}={q(v)}' for k, v in renv.items()) + f' DM_WINDOW=1 {q(host)} {q(patched)}'
 
 
+def linux_shader_cache(work, host, env, logs):
+    """The stage "Shader cache": the host's precompiler alone (DM_VK_PRECOMPILE_ONLY=1, vk_draw.c vkx_precompile_tool) on every core, with the game's environment from linux_game.json,
+    so the first run starts with every shader compiled for this GPU (~/.cache/nxasahi/vkshaders) instead of compiling them in play (Super Smash Bros. Ultimate: 35,012 shaders, 100-480 ms
+    frames while its cache filled). Shaders already cached are skipped. A failure is reported and the build goes on: the game then fills the cache while it runs"""
+    m = json.loads((work / 'linux_game.json').read_text())
+    henv = linux_boot_env(dict(env, **m['env'])); henv['DM_VK_PRECOMPILE_ONLY'] = '1'
+    PROG.add(1); PROG.stage('Shader cache', step='compiling for this GPU')
+    def line(l):
+        r = re.fullmatch(r'precompile: (\d+) / (\d+)', l)
+        if r: PROG.set(done=int(r[1]), total=int(r[2]))
+    log = logs / 'shader_cache.log'
+    try: run([host], log, env=henv, cwd=m['cwd'], on_line=line)
+    except BuildError as e: say(f'[RED] shader cache not filled ({e}); the game compiles its shaders while it runs'); return
+    r = re.search(r'precompile done: (\d+) compiled into the cache in ([\d.]+) s \((\d+) shaders', log.read_text(errors='replace'))
+    PROG.end(f'{int(r[1]):,} compiled ({int(r[3]):,} shaders) in {float(r[2]):.0f} s' if r else '')
+
+
 MTL_ARCH_M = '''#import <Metal/Metal.h>
 int main(void) { @autoreleasepool { id<MTLDevice> d = MTLCreateSystemDefaultDevice(); if (!d) return 1; printf("%s\\n", d.architecture.name.UTF8String); return 0; } }
 '''
@@ -1863,6 +1881,7 @@ def parse_args(argv):
     ap.add_argument('--gpu', help='NVN games: GPU architectures the app gets its pipeline archive for, made on this Mac with metal-tt, comma-separated: g18p (A19 / A19 Pro), or the name a device\'s log gives when the app has no archive for its GPU; '
                     'none = no archive, the device builds the bases on its first start (default: the PSO_GPUS setting; when that is empty, g18p for a game whose profile sets pso_mtl4 on, else none). '
                     'With --platform mac-app: the Mac app\'s archive, by default for this Mac\'s GPU (none: the app builds the bases on its first start)')
+    ap.add_argument('--shader-cache', action=argparse.BooleanOptionalAction, help='--platform linux: compile every shader for this GPU at the end of the build; --no-shader-cache leaves it to the game, which compiles them while it runs (default: the SHADER_CACHE setting, on)')
     ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check): write them as read and go on instead of stopping')
@@ -1903,7 +1922,7 @@ def main(args=None):
     prepare_xcode = args.prepare_xcode or PREPARE_XCODE
     platform = args.platform or PLATFORM
     if platform not in ('ios', 'mac', 'mac-app', 'linux'): raise BuildError(f'PLATFORM / --platform must be ios, mac, mac-app or linux: {platform}')
-    linux = platform == 'linux'   # Linux on Apple silicon: like 'mac' up to the shader split, then the SPIR-V shaders, the Linux host and linux_game.json (linux_run)
+    linux = platform == 'linux'   # Linux on Apple silicon: like 'mac' up to the shader split, then the SPIR-V shaders, the Linux host, linux_game.json (linux_run) and the shader cache (linux_shader_cache)
     mac = platform in ('mac', 'mac-app', 'linux')   # the host's shaders and host only: no iOS shaders, Xcode project or IPA (mac_run prints the command; mac-app packs a Mac app, mac_app)
     mac_pack = platform == 'mac-app'
     if args.mac_sign and not mac_pack: raise BuildError('--mac-sign signs the Mac app: it needs --platform mac-app')
@@ -2102,6 +2121,8 @@ def main(args=None):
     if linux:   # a Linux build ends with the Linux host, the game's manifest for the front end and the command that runs it
         host, font = linux_host(py, repo, work, env, logs, g)
         cmd = linux_run(work, game, patched, host, font, ios, aoc, lang, g, app, app_name, app_version, pkg_ver, icon, args.env_file or DM_ENV_FILE)
+        if SHADER_CACHE if args.shader_cache is None else args.shader_cache: linux_shader_cache(work, host, env, logs)
+        else: say('shader cache: not filled (--no-shader-cache); the game compiles its shaders while it runs')
         rmtree(work / 'tmp')
         say(f'done: the game runs on Linux with this command (its save in {work / "run/save"}, kept from run to run):')
         PROG.say(cmd)

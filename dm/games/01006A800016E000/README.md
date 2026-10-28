@@ -58,6 +58,7 @@ General host changes first needed here; each applies to every game:
 - **`nvnSetExternalDebuggerEnabledNVX`** as a no-op (`names.txt`, `NVN_NOPROTO`): [Extensions fetched by name and called unchecked](../../../docs/reference/nvn-objects.md#extensions-fetched-by-name-and-called-unchecked).
 - **The residency set committed at present** (`present_now` → `res_commit`): [The residency set committed before a present](../../../docs/reference/rendering.md#the-residency-set-committed-before-a-present).
 - **The indexed archive reader** (`smash_arc.py`, `smash_arc_jobs`): [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content).
+- **Linux: the shader cache filled at import, the precompiler off the large cores:** [Linux: shaders compiled in play, and the compiler on the game's cores](../../../docs/reference/shaders.md#linux-shaders-compiled-in-play-and-the-compiler-on-the-games-cores).
 
 ## Open
 

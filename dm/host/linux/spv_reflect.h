@@ -16,12 +16,15 @@ int spvr_reflect(const uint32_t *code, size_t words, spvr_info *out, char *err, 
 
 // Fit a module to the device: what the translator declares but the shader does not use, the device may lack. Only provably unused declarations are dropped and only
 // never-written buffers marked read-only, so the shader's behaviour is unchanged. Returns a malloc'd copy (*out_words), and in *changes what was done (a bit per kind)
-typedef struct { int float64, interlock, vertex_stores; } spvr_device;
+typedef struct { int float64, interlock, vertex_stores, nan_preserve; } spvr_device;   // nan_preserve: shaderSignedZeroInfNanPreserveFloat32
 #define SPVR_FIT_FLOAT64 1     // OpCapability Float64 dropped: no 64-bit float type in the module
 #define SPVR_FIT_INTERLOCK 2   // the fragment shader interlock extension, capabilities and execution modes dropped: no interlock begun
 #define SPVR_FIT_NONWRITABLE 4 // vertex-stage storage buffers that nothing writes decorated NonWritable
 #define SPVR_FIT_STORES 8      // a vertex-stage storage buffer is written, which the device cannot do (not changed: the caller must not use the shader as is)
 #define SPVR_FIT_RELAXED 16    // RelaxedPrecision decorations dropped: Mesa computes such values in 16 bits (Metal did not); the translator's precision hints do not
+#define SPVR_FIT_NMINMAX 32  // FMin / FMax / FClamp made NMin / NMax / NClamp: a NaN operand gives the other one, as Maxwell's FMNMX and saturation do
+#define SPVR_FIT_NANPRESERVE 64 // SignedZeroInfNanPreserve on every entry point: without it Mesa may fold isnan() to false and reorder away infinities and NaN, which Maxwell keeps
+#define SPVR_FIT_VERSION 5     // what spvr_fit and spvr_nan change; in the disk cache's directory name (vk_draw.c), so binaries made before a change are not taken
                                // describe Maxwell, which computes everything in 32 bits
 uint32_t *spvr_fit(const uint32_t *code, size_t words, const spvr_device *dev, size_t *out_words, unsigned *changes);
 
@@ -33,3 +36,6 @@ uint32_t *spvr_gl_depth(const uint32_t *code, size_t words, size_t *out_words);
 // the next stage, where Vulkan leaves it undefined. Mario Wonder's tile and model shaders write one component of each tangent-frame output (_41.y = 1.0) and Mesa passed garbage
 // for the rest, so the normals overflowed to NaN and lit surfaces came out black. Returns a malloc'd copy, or NULL when there is nothing to do
 uint32_t *spvr_init_outputs(const uint32_t *code, size_t words, size_t *out_words);
+// Maxwell's non-finite values (spv_reflect.c): Sin / Cos of NaN or of an infinity give NaN, and a NaN user output of any graphics stage is written as 0. A malloc'd copy, or NULL when
+// there is nothing to change; changes: 1 Sin / Cos, 2 outputs
+uint32_t *spvr_nan(const uint32_t *code, size_t words, size_t *out_words, unsigned *changes);
