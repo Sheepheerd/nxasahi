@@ -339,6 +339,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** Pokémon Shining Pearl 1.0.0 (Linux; provisional profile, no note yet; the twin of [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)); Pokémon: Let's Go, Eevee! 1.0.0 (Linux; provisional profile, no note yet).
 
 
+
+### Linux: the sample count of a depth-only pass
+
+- **Symptom:** on Linux, walls and parts of characters drawn as flat triangles of one colour (the scene target's clear colour), with stair-stepped, tile-shaped edges; no `[RED]` line, nothing skipped.
+- **Cause:** `rp_begin` (`dm/host/linux/vk_replay.c`) took the rasterization sample count from the colour targets and fell back to the depth's only when the pass had no colour slots. A depth pre-pass that binds colour slots but no image in any of them rasterized at one sample into a 4x depth buffer, which Vulkan does not allow; on Apple's GPU the pre-pass depth came out wrong in tile-shaped areas, and the material pass after it (other vertex shaders, depth writes off, less-or-equal) failed there.
+- **Fix:** the depth's sample count is taken whenever no colour target is actually bound.
+- **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (the Undead Asylum cell: a depth pre-pass over the 4x scene target, then the materials).
+- **Check:** `DM_VK_SKIPSH=<shader key>[,…]` (`vk_draw.c`) leaves out the draws of those vertex or pixel shaders: skipping the pass's materials turned the whole scene that flat colour, and the resolved target after the material pass (`DM_VK_PASSSTOP`, `DM_VK_RTFLOAT`) already held it. Ruled out on the way: deferred uniform updates (`DM_VK_UB_DEFER=0`), face culling (`DM_VK_NOCULL`), fused multiply-adds in the vertex shaders (`NoContraction` changed nothing) and a small depth bias.
 ## Blend, depth and stencil
 
 ### No writes to colour outputs the shader does not write

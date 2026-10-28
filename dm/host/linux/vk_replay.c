@@ -508,7 +508,7 @@ static int rt_same(const p_set_rt *s) {   // s binds exactly the targets of the 
 }
 static int rp_begin(VkCommandBuffer c) {
     if (g_rp_on) return 1;
-    VkRenderingAttachmentInfo ca[8], da, sa; int nc = 0, have = 0, samples = 1; uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1;
+    VkRenderingAttachmentInfo ca[8], da, sa; int nc = 0, have = 0, have_c = 0, samples = 1; uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1;
     memset(ca, 0, sizeof ca); memset(&da, 0, sizeof da); memset(&sa, 0, sizeof sa);
     pthread_mutex_lock(&g_tmu);
     for (int i = 0; i < g_rt_n; i++) {
@@ -523,7 +523,7 @@ static int rp_begin(VkCommandBuffer c) {
             ca[i].imageView = att_view_n(t, r.baseMipLevel, z0, nz, VK_IMAGE_ASPECT_COLOR_BIT); if (nz > layers) layers = nz;
         } else ca[i].imageView = att_view(t, r.baseMipLevel, r.baseArrayLayer, VK_IMAGE_ASPECT_COLOR_BIT);
         if (!ca[i].imageView) continue;
-        t->gpu_owned = 1; have = 1; samples = (int)t->samples;
+        t->gpu_owned = 1; have = have_c = 1; samples = (int)t->samples;
         uint32_t lw = t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, lh = t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1;
         if (lw < w) w = lw; if (lh < h) h = lh;
     }
@@ -535,7 +535,10 @@ static int rp_begin(VkCommandBuffer c) {
         if (v) {
             has_d = (dt->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0; has_s = (dt->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
             da = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-            sa = da; dt->gpu_owned = 1; have = 1; if (!nc) samples = (int)dt->samples;
+            // the depth's sample count when no colour target is bound, also with colour slots that are all empty: DARK SOULS: REMASTERED's depth pre-pass binds four
+            // empty slots over its 4x depth, and rasterized at 1 sample into it the pre-pass depth came out wrong in tile-shaped areas, where the material pass then failed its
+            // less-or-equal test and the target's clear colour showed (flat grey walls and armour)
+            sa = da; dt->gpu_owned = 1; have = 1; if (!have_c) samples = (int)dt->samples;
             uint32_t lw = dt->w >> r.baseMipLevel ? dt->w >> r.baseMipLevel : 1, lh = dt->h >> r.baseMipLevel ? dt->h >> r.baseMipLevel : 1;
             if (lw < w) w = lw; if (lh < h) h = lh;
         }

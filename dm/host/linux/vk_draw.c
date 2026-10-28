@@ -897,6 +897,10 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
     VkPrimitiveTopology tp = topo(d ? d->prim : x->prim, &ok);
     if (!ok || (ok == 2 && (x || d->ind || d->count > 4 * QUAD_MAX || !quad_ib()))) { g_st_skip[SK_QUADS]++; return; }
     if ((d ? d->mdi_cnt : x->mdi_cnt)) { g_st_skip[SK_INDIRECT]++; return; }   // open: indirect-count multi-draws
+    // diagnostic: DM_VK_SKIPSH=<shader key>[,...] leaves out the draws whose vertex or pixel shader is one of those (which draw makes which surface: bisect over a pass log's keys)
+    { static const char *skip = (const char *)1; if (skip == (const char *)1) skip = getenv("DM_VK_SKIPSH");
+      for (int st = 0; skip && st < 2; st++) { uint8_t k[8]; char ks[17];
+          if (S.prog[st] && prog_key(S.prog[st], (unsigned)(S.prog[st] == S.prog[0] ? st : 0), k)) { for (int i = 0; i < 8; i++) snprintf(ks + 2 * i, 3, "%02x", k[i]); if (strstr(skip, ks)) return; } } }
     if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog[st] && prog_key(S.prog[st], (unsigned)(S.prog[st] == S.prog[0] ? st : 0), k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
         LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d func %d, stencil %d func %d ref %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
             d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.ds.df, (int)D.ds.st, (int)D.ds.sf_f, D.st_ref[0], (int)D.poly.cull);
