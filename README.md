@@ -51,11 +51,11 @@ nxnative's [games table](dm/games/README.md#games) lists the 70-odd games that r
 You need Asahi Linux (or another Linux on Apple silicon with the Asahi Mesa drivers) and [Nix](https://nixos.org/download) with flakes enabled. nxasahi is one Nix package: the game library, the import tools and everything they run.
 
 ```sh
-nix profile install github:Sheepheerd/nxasahi/linux-headless   # installs the nxasahi command and its app launcher entry
-nix run github:Sheepheerd/nxasahi/linux-headless               # or try it without installing
+nix profile install github:Sheepheerd/nxasahi/main   # installs the nxasahi command and its app launcher entry
+nix run github:Sheepheerd/nxasahi/main               # or try it without installing
 ```
 
-On NixOS you can add it to your system flake instead: take `github:Sheepheerd/nxasahi/linux-headless` as an input and put `inputs.nxasahi.packages.aarch64-linux.default` in `environment.systemPackages`.
+On NixOS you can add it to your system flake instead: take `github:Sheepheerd/nxasahi/main` as an input and put `inputs.nxasahi.packages.aarch64-linux.default` in `environment.systemPackages`.
 
 The first import of a game compiles that game's host. The package brings the compiler with it; what it builds goes to `~/.local/share/nxasahi/build` (`NXASAHI_STATE` moves it).
 
