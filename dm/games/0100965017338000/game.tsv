@@ -1,0 +1,36 @@
+# Game profile of Super Mario Party Jamboree 1.0.0 (NintendoWare Bezel Engine, SDK 17.5.4, NVN).
+# Format: see dm/games/README.md; bring-up and measurements in README.md beside this file.
+
+# ---- Identity ----
+title_id	0100965017338000
+program_id	0100965017338000
+
+# ---- App ----
+name	Super Mario Party Jamboree
+ipa	SuperMarioPartyJamboree.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v0	1.0.0	main=0451231f26f181157cec81b4385b5ed1	subsdk0=d0c48eef6dc2f1e7ac8b8dd5b5b03a60	sdk=1ea0b9fe6cd6867b18e374a5d53d7950
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	movie/flow/op/movie/bq_op.mp4
+zip_store	.bea:.bfstm:.mp4:.metallib
+
+# ---- Memory ----
+# Virtual address memory (the NPDM's 16 MB system resource). The engine's StandardAllocator is cut from 56 GB to 4 GB of address space (patches.py) and the SDK's node area
+# to 62 MB (dm/tools/sdk_patches.py); it maps up to +3 GB of other regions before it, so an 8.38 GB alias region in a 9 GB block. See README.md, Memory
+mem_reserve	0x240000000
+mem_alias	0x218000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 16 MB of system resource
+sys_resource	0x1000000
+
+# ---- Shader split ----
+shader_groups	/Archive/=archive /stream/=stream /nro/=nro /movie/=movie /.nrr/=nrr
+shader_note	Super Mario Party Jamboree shaders

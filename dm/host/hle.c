@@ -20,9 +20,6 @@ uint64_t unimpl_c(unsigned idx, uint64_t *regs) {
     return 0;
 }
 
-// Per module, one cache of symbol number → resolved address
-static uint64_t g_cache[MAX_MOD][8192];
-
 // Name hash over the swhle section, built at the first lookup. Startup resolution is single-threaded;
 // runtime NRO relocation holds the loader's module write lock, so later lookups and stub insertions are serialized too.
 // resolve_import used to strcmp its way through the whole section for every import no module defines, and

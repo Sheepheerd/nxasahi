@@ -39,7 +39,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 - **How it is stored:** the shaders are BNSH in the `.bfsha` entries of the `.bea` archives (zstd entries, [01](../agents/01-extract.md)), most of them the engine's own in `System.nx.bea` (`_BezelSystemResources/<system>/shader/*.bfsha`: PBR shadow maps 846, post effects 770, …), the rest in the layouts' `__ArchiveShader.bnsh` and the per-archive shader packs (`.bnbshpk`), plus one BNSH in `main`.
 - **Reader:** `shader_split.py` scans each archive entry as a file of its own (`bea_members`). It knows two archive versions: 0x10100 (+0x28 points at an array of u64 offsets of 0x30-byte `ASST` entries, data and name offsets at +0x20) and 0x60000 (+0x28 points at the entries themselves, back to back, each `ASST` + u32 its own length 0x48, data and name offsets at +0x38). Reading a 0x60000 archive as 0x10100 stopped with `entry 0 @0x4854535341 is not an ASST entry` (the `ASST` magic read as an offset); another version stops with its number.
-- **Found on:** [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (NintendoWare Bezel Engine 1.56): 2,125 shaders in about 90 s. Super Mario Party Jamboree (0100965017338000, no profile yet): 949 archives of version 0x60000, 127,203 entries (10.5 GB unpacked), 16 `.bfsha`.
+- **Found on:** [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (NintendoWare Bezel Engine 1.56): 2,125 shaders in about 90 s. [Super Mario Party Jamboree](../../dm/games/0100965017338000/README.md): 949 archives of version 0x60000, 127,203 entries (10.5 GB unpacked), 16 `.bfsha`.
 
 ### BNSH entries of GFPAK archives
 

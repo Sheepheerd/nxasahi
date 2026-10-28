@@ -596,6 +596,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** the NROs are collected at pack time by the SHA-256s the NRRs list (`dm/tools/nro_collect.py`: loose files, the current files of an indexed archive, or a scan for stored and zstd-framed NROs; Smash's NRRs of older releases also register 666 superseded copies, which `data.arc` still holds and which are left out), rewritten like any module (`patch_nso.py` reads NROs: the flat image, segments at +0x20, build ID at +0x40) and listed in `<patched dir>/nro.tsv`. The host maps them all at start and keeps them out of symbol lookups; `LoadModule` finds one by the image's SHA-256, restores its data and bss (after the first load), relocates it against the modules loaded then in load order, binds the earlier modules' symbol relocations it defines (main's `lua2cpp` stubs), fills `nn::ro::Module` as the SDK does (+0 module, +8 state 1, +0x10 image, +0x18 buffer) and calls its `DT_INIT`; `UnloadModule` calls `DT_FINI` and binds every relocation that pointed into it again (`loader.c` "NRO modules", `hle_ro.c`). `GetBufferSize` returns the bss size from header +0x38 as the SDK does. The startup init pass must skip NROs (their init ran unrelocated and crashed). Only data is written at a load, so it works with code embedded in the iOS executable: `gen_embed.py` packs the NROs into three sections (`__dm_nro_x0`, `__DM_NRO_W`, `__dm_nro_x1`) and a table of their pieces (`__dm_nro_tab`), since a Mach-O file has at most 255 sections and three per NRO would pass it, and `map_image` maps an NRO from there (`loader.c` `nro_pieces`).
 - **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (13.0.5): it loads six NROs in its first 30 s and calls none of the stubs. Played on an iPhone.
 
+### More NROs than module slots
+
+- **Symptom:** the host stops before the game starts: `FATAL …/nro.tsv: more NROs than module slots (MAX_MOD 128)`.
+- **Cause:** the host keeps the profile's modules and every NRO the game can load in `g_mod[MAX_MOD]`; Super Mario Party Jamboree ships 139 NROs, 142 modules with `main`, `subsdk0` and `sdk`. Nothing encodes a module's index in fewer bits.
+- **Fix:** `MAX_MOD` is 256 (`dm/host/dm.h`).
+- **Found on:** [Super Mario Party Jamboree](../../dm/games/0100965017338000/README.md).
+
 ### Online SDKs in NROs are never loaded
 
 - **Symptom:** `[EOS] Failed to create platform` (the game plays offline); `refused …: an online SDK (Epic Online Services), not loaded`; `refused an NRR that registers only online SDKs (1 hashes)`.

@@ -688,6 +688,11 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
+// The queue's memory use (Super Mario Party Jamboree reads it every frame): the host's queues keep no command, control or compute memory of their own, so 0, and nothing to reset
+NVN(nvnQueueGetTotalCommandMemoryUsed, size_t, NVNqueue *q) { (void)q; return 0; }
+NVN(nvnQueueGetTotalControlMemoryUsed, size_t, NVNqueue *q) { (void)q; return 0; }
+NVN(nvnQueueGetTotalComputeMemoryUsed, size_t, NVNqueue *q) { (void)q; return 0; }
+NVN(nvnQueueResetMemoryUsageCounts, void, NVNqueue *q) { (void)q; }
 NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
