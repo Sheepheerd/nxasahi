@@ -571,11 +571,17 @@ def same_build(nsp_dir, app, fam, keys, repo, env):
     import game as gamemod   # dm/games (main put it on the path)
     work = nsp_dir / f'{app:016X}_survey'; logs = work / 'logs'
     # main's build IDs are kept for these exact files (a converted file by its conversion's key: it may have been pruned), so a rebuild reads no game file here; matching them
-    # against the profiles is redone every time (a profile added since is found)
-    ident = lambda p: p.with_name(p.name + '.key').read_text().strip() if p.with_name(p.name + '.key').is_file() else [p.name, p.stat().st_size, p.stat().st_mtime_ns]
-    ck = fingerprint([ident(fam['base'])] + [ident(p) for _, p in fam['updates']])
+    # against the profiles is redone every time (a profile added since is found). A file that cannot be stat'd (gone, or not a real file) leaves the lookup uncached
+    def ident(p):
+        k = p.with_name(p.name + '.key')
+        if k.is_file(): return k.read_text().strip()
+        try: st = p.stat()
+        except OSError: return None
+        return [p.name, st.st_size, st.st_mtime_ns]
+    ids = [ident(fam['base'])] + [ident(p) for _, p in fam['updates']]
+    ck = fingerprint(ids) if None not in ids else None
     cache = work / 'build_id_lookup.json'
-    try: bids = json.loads(cache.read_text()) if json.loads(cache.read_text()).get('key') == ck else None
+    try: bids = json.loads(cache.read_text()) if ck and json.loads(cache.read_text()).get('key') == ck else None
     except (OSError, ValueError): bids = None
     if bids:
         PROG.plan(1); PROG.stage('build ID lookup')
@@ -587,8 +593,9 @@ def same_build(nsp_dir, app, fam, keys, repo, env):
         PROG.end('no profile registers its main build (build IDs as at the last build)'); return None
     seen = []
     r = same_build_lookup(work, logs, fam, keys, repo, env, gamemod, seen)
-    try: work.mkdir(parents=True, exist_ok=True); cache.write_text(json.dumps({'key': ck, 'bids': seen}))
-    except OSError: pass
+    if ck:
+        try: work.mkdir(parents=True, exist_ok=True); cache.write_text(json.dumps({'key': ck, 'bids': seen}))
+        except OSError: pass
     return r
 
 
