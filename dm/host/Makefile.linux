@@ -19,9 +19,9 @@ GAME_H = $(GEN)/$(GAME)/game_profile.h
 O = $(GEN)/linux$(if $(strip $(GAME)),/$(GAME))
 CC = clang
 CFLAGS = -O1 -g -Wall -Wno-unused-function -std=gnu11 -fblocks -D_GNU_SOURCE -Ilinux -include darwin_compat.h \
-         -I. -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I../third_party/libvpx -I../third_party/stb_vorbis $(shell pkg-config --cflags sdl3 libavcodec libswscale)
+         -I. -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I../third_party/libvpx -I../third_party/stb_vorbis $(shell pkg-config --cflags sdl3 libavcodec libswscale egl)
 LDFLAGS = -fuse-ld=lld -rdynamic -Wl,-T,linux/sections.ld
-LIBS = -lBlocksRuntime -lm -lpthread -ldl $(shell pkg-config --libs sdl3 vulkan libavcodec libswscale libavutil)
+LIBS = -lBlocksRuntime -lm -lpthread -ldl $(shell pkg-config --libs sdl3 vulkan libavcodec libswscale libavutil egl)
 
 # hle_movie_avc.c is VideoToolbox: linux/movie_avc_ffmpeg.c implements its interface (and linux/audioconverter_ffmpeg.c AAC), on FFmpeg. hle_bigstack.c has Mach-O inline assembly: built from its translation
 HOST_C = main.c loader.c hle.c crash.c probe.c thread.c $(filter-out hle_movie_avc.c hle_bigstack.c,$(sort $(wildcard hle_*.c)))

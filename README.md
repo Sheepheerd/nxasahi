@@ -16,7 +16,7 @@ This is an early port. **One game has been tested on Linux so far:**
 
 What works so far:
 
-- **Graphics:** NVN games only, drawn on Vulkan. Games that use Vulkan or OpenGL on the Switch are not supported on Linux yet.
+- **Graphics:** NVN games are drawn on Vulkan, OpenGL games on the system's OpenGL (Mesa). Games that use Vulkan on the Switch are not supported on Linux yet.
 - **Shaders:** only from games whose shaders are all in their files. The import stops on games whose shaders have to be captured or decoded by booting them (run-time compiles, Unreal Engine or Oodle packs), because nxnative does that step in its Mac host.
 - **Input and sound:** keyboard and SDL gamepads work, and sound plays through SDL3 (PipeWire, PulseAudio or ALSA).
 

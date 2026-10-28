@@ -29,6 +29,11 @@ LÖVE's graphics module is its own OpenGL backend, so its choices follow what th
 - **Textures:** made with `glTexStorage2D` (every level up front: the game's images are mipmapped, filled by `glGenerateMipmap` as a blit) or `glTexStorage3D`: LÖVE makes a 1x1 default texture of each type, 3D and 2D array among them, and the layer's units hold all four targets (96 of them, as `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS` says). Font glyphs are RG8 with a `GL_TEXTURE_SWIZZLE_*` of R, R, R, G, applied when the texture is made (a swizzled texture cannot be a render target).
 - **Draws and framebuffers:** batched quads share one 16-bit index buffer through `glDrawElementsBaseVertex`; instanced draws; canvases bind GL_FRAMEBUFFER (read and draw), check completeness, discard depth and stencil after use (`glInvalidateFramebuffer`) and clear with `glClearBufferfv`. Separate read and draw framebuffers, `glBlitFramebuffer` (colour, same size) and `glReadPixels` (RGBA8) are there for multisample resolves and `Canvas:newImageData`, which the game does not use.
 
+## Linux
+
+- 2026-10-28, headless, base game 1.0 (v0) from a profile derived from 1.1.3's: the intro, the title, and a new run's tutorial by touch (`f1300:T0.35x0.86,f1700:T0.35x0.86,f2100:T0.5x0.68`), at about 59 fps, the audio renderer playing. The window presents too (not looked at on screen yet).
+- It renders with the host's Mesa OpenGL, not the GL layer, and needs no shader capture ([Linux: OpenGL games on the host's Mesa](../../../docs/reference/rendering.md#linux-opengl-games-on-the-hosts-mesa)).
+
 ## Shaders
 
 - **Current:** LÖVE puts each shader's GLSL together at run time, in Lua, from its own header and built-in code and the game's 19 `resources/shaders/*.fs`: 35 sources (`#version 330 core`), all made by `Game:start_up` before the first frame. No game file holds them, so the NSP script captures them on the Mac (`DM_GL_CAPTURE` at `<id>_build/extract/<version>/gl_capture` until every file in `gl_capture.tsv` is there) and `gl_shaders.py` translates them; the host finds each by the hash of its text.
@@ -56,6 +61,7 @@ LÖVE's graphics module is its own OpenGL backend, so its choices follow what th
 
 General host changes first needed here; each applies to every game:
 
+- **OpenGL games on Linux through the host's Mesa** (`dm/host/linux/gl_egl.c`): [Linux: OpenGL games on the host's Mesa](../../../docs/reference/rendering.md#linux-opengl-games-on-the-hosts-mesa).
 - **Resolved: Homebrew .NET runtime discovery** for the first extraction and shader tools: [Homebrew .NET is on PATH but apphosts cannot find the runtime](../../../docs/reference/packing.md#homebrew-net-is-on-path-but-apphosts-cannot-find-the-runtime).
 - **The GL layer's core-profile paths** (`GL_CONTEXT_PROFILE_MASK`, persistently mapped buffers and fences, attribute bindings and current values, uniform queries, texture storage, 3D and array textures, swizzles, mipmaps, base-vertex and instanced draws, blits) in `hle_gl.m`, and **`DM_GL_STUBS=1`**: [The GL core profile and persistently mapped buffers](../../../docs/reference/rendering.md#the-gl-core-profile-and-persistently-mapped-buffers), [GL uniforms, pipelines and attributes](../../../docs/reference/rendering.md#gl-uniforms-pipelines-and-attributes), [GL textures, swizzles and uploads](../../../docs/reference/rendering.md#gl-textures-swizzles-and-uploads), [GL draws and framebuffers](../../../docs/reference/rendering.md#gl-draws-and-framebuffers), [Which GL functions a game calls](../../../docs/reference/rendering.md#which-gl-functions-a-game-calls).
 - **`loader_census.py` following registers** (LÖVE's glad), and `vkGetInstanceProcAddr` left out of `profile_guess.py`'s Vulkan count: same section.

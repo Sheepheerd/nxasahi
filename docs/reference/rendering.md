@@ -770,6 +770,14 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 - **Fix:** the host's GL layer (`dm/gfx/gl/hle_gl.m`) answers the EGL imports and `eglGetProcAddress` (the rest of this section).
 - **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md) (SDK 6.4.0, Media.Vision's MVGL engine; one boot).
 
+### Linux: OpenGL games on the host's Mesa
+
+- **Symptom:** the Linux import stopped: `the Linux host draws NVN games only so far (the Vulkan and GL layers are the Mac host's)`.
+- **Cause:** the GL layer translates GL to Metal (`hle_gl.m`, the Mac and iOS only).
+- **Fix:** on Linux the game's GL calls go to the host's own OpenGL, Mesa's GL 4.6 core for Apple's GPU (`dm/host/linux/gl_egl.c`). The game's code runs in the host's address space with the same calling convention, so its pointers are host pointers and Mesa's functions are called as they are; Mesa compiles the game's GLSL, so the import has no shader stage and no capture. The guest's EGL runs on a surfaceless Mesa display: the Switch window is a pbuffer of the layer's size (configs asked for with the pbuffer bit, also when the game names no surface type, since EGL's default is the window bit), and `eglSwapBuffers` reads the frame back (`glReadPixels` with the pack state saved and restored) for the window (`vkw_present_rgba`) or the screenshots, paced to the swap interval. `eglGetProcAddress` hands out Mesa's pointers; the calls that can compile shaders (compiles, links, draws, dispatches, clears, mipmap generation) through stubs that run them on the thread's big host stack, the others directly (the stub carries register arguments only, and some GL functions take nine or more).
+- **Found on:** [Balatro](../../dm/games/0100CD801CE5E000/README.md) (LÖVE 11.4, base game 1.0): the intro, the title and a new run's tutorial by touch at about 59 fps, with sound.
+- **Open:** the read-back stalls the GL thread for one frame's transfer; a shared image (exporting the window's Vulkan memory to GL) would avoid it. Vulkan games still need the Mac host.
+
 ### Telling a GL game from an NVN or Vulkan one
 
 - **Symptom:** the NSP script's provisional profile said Vulkan, and the capture boot crashed in the GL layer.

@@ -2162,11 +2162,13 @@ def main(args=None):
     vkcap = gfx == 'vulkan' and src['vk_capture'][0]   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_shaders)
     glcap = gfx == 'gl' and src['gl_capture'][0]   # GLSL the game puts together at run time (LÖVE), captured in the Mac host (capture_shaders)
     uedec = gfx == 'nvn' and src['ue_decode'][0]   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
-    if linux and gfx != 'nvn': raise BuildError(f'{src["graphics"][1]}: the Linux host draws NVN games only so far (the Vulkan and GL layers are the Mac host\'s)')
+    # On Linux an OpenGL game runs on the host's own OpenGL (Mesa: dm/host/linux/gl_egl.c), which compiles its GLSL: no shader translation and no capture
+    if linux and gfx == 'vulkan': raise BuildError(f'{src["graphics"][1]}: the Linux host draws NVN and OpenGL games only so far (the Vulkan layer is the Mac host\'s)')
+    if linux and gfx == 'gl': glcap = False
     if linux and (uedec or src['oodle_packs'][0] or src['ue_legacy'][0]):   # a GLSLC capture boots the Linux host (capture_glslc)
         raise BuildError('this game\'s shaders are decoded by booting it in the Mac host (Unreal or Oodle packs): not done on Linux yet')
     if gfx == 'vulkan': say(f'Vulkan game ({src["graphics"][1]}): vk_shaders.py translates the shaders instead of the NVN shader chain')
-    if gfx == 'gl': say(f'OpenGL game ({src["graphics"][1]}): gl_shaders.py translates the shaders instead of the NVN shader chain')
+    if gfx == 'gl': say(f'OpenGL game ({src["graphics"][1]}): ' + ('the host\'s Mesa OpenGL compiles its shaders; nothing to translate' if linux else 'gl_shaders.py translates the shaders instead of the NVN shader chain'))
     for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (glcap, 'gl_capture'), (uedec, 'ue_decode'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs'), (gfx == 'nvn' and src['ue_legacy'][0], 'ue_legacy')):
         if on: say(src[k][1])
     PROG.add(glslc + vkcap + glcap + uedec + (gfx == 'nvn'))
@@ -2205,6 +2207,8 @@ def main(args=None):
     if gfx == 'vulkan':   # the packed version's merged RomFS holds the SPIR-V files the game loads; a capture holds those it generates
         cap = capture_shaders(repo, game, patched, work, env, logs, g, 'vk') if vkcap else None
         ios = build_vk_shaders(py, repo, [game / 'RomFS'] + ([cap] if cap else []), sh, env, logs, g, reuse=not ALLOW_DAMAGED, mac=mac, provisional=bool(provisional or derived))
+    elif gfx == 'gl' and linux:   # Mesa compiles the game's GLSL as the game hands it over: no shader stage, an empty shader folder for the run command
+        ios = sh / 'none'; ios.mkdir(parents=True, exist_ok=True)
     elif gfx == 'gl':   # the GLSL sources in the packed version's archives and in its main (the game compiles them at run time; the host finds each by the hash of its text), and a capture of those it puts together
         cap = capture_shaders(repo, game, patched, work, env, logs, g, 'gl') if glcap else None
         ios = build_gl_shaders(py, repo, [game / 'RomFS', game / 'ExeFS/main'] + ([cap] if cap else []), sh, env, logs, g, reuse=not ALLOW_DAMAGED, mac=mac, provisional=bool(provisional or derived))
@@ -2228,7 +2232,8 @@ def main(args=None):
     if linux:   # a Linux build ends with the Linux host, the game's manifest for the front end and the command that runs it
         host, font = linux_host(py, repo, work, env, logs, g)
         cmd = linux_run(work, game, patched, host, font, ios, aoc, lang, g, app, app_name, app_version, pkg_ver, icon, args.env_file or DM_ENV_FILE)
-        if SHADER_CACHE if args.shader_cache is None else args.shader_cache: linux_shader_cache(work, host, env, logs)
+        if gfx == 'gl': say('shader cache: none needed (Mesa compiles and caches an OpenGL game\'s shaders itself)')
+        elif SHADER_CACHE if args.shader_cache is None else args.shader_cache: linux_shader_cache(work, host, env, logs)
         else: say('shader cache: not filled (--no-shader-cache); the game compiles its shaders while it runs')
         rmtree(work / 'tmp')
         prune_linux(work, fam, versions, Path(ios))

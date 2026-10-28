@@ -888,9 +888,9 @@ static void dump_uploads(uint64_t fence) {
 }
 static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER; static long g_shot_k; static char g_shot_path[1024]; static uint64_t g_presents;
 void dm_gfx_shot_at(long k, const char *path) { pthread_mutex_lock(&g_shot_mu); g_shot_k = (long)g_presents + k; snprintf(g_shot_path, sizeof g_shot_path, "%s", path); pthread_mutex_unlock(&g_shot_mu); }
+static int env_shot_init;
 static void shot_check(const tex_t *t) {
-    static int env = 0;
-    if (!env) { env = 1; const char *e = getenv("DM_SHOT"); char *c; long k; if (e && (k = strtol(e, &c, 10)) > 0 && *c == ':') dm_gfx_shot_at(k, c + 1); }
+    if (!env_shot_init) { env_shot_init = 1; const char *e = getenv("DM_SHOT"); char *c; long k; if (e && (k = strtol(e, &c, 10)) > 0 && *c == ':') dm_gfx_shot_at(k, c + 1); }
     pthread_mutex_lock(&g_shot_mu);
     g_presents++;
     { static long pk = -1; if (pk < 0) { const char *e = getenv("DM_VK_PASSLOG"); pk = e ? atol(e) : 0; } g_passlog = pk > 0 && (long)g_presents + 1 == pk; vkx_trace(g_passlog); g_pass0 = g_passes;
@@ -912,6 +912,27 @@ static void shot_check(const tex_t *t) {
     static long every = -1; static char edir[900]; static int shots;
     if (every < 0) { const char *e = getenv("DM_SHOT_EVERY"); char *c; every = 0; if (e && (every = strtol(e, &c, 10)) > 0 && *c == ':') snprintf(edir, sizeof edir, "%s", c + 1); else every = 0; }
     if (every > 0 && g_on > 0 && shots < 40 && g_presents % (uint64_t)every == 0) { char p[1000]; snprintf(p, sizeof p, "%s/present%05llu.png", edir, (unsigned long long)g_presents); shots++; shoot(t, atomic_load(&g_fence), p); }
+}
+
+// ---- a picture from host memory (an OpenGL game, linux/gl_egl.c) ----
+// RGBA8 rows bottom-up, as glReadPixels gives them: shown in the window (vkw_present_rgba), counted as a present for DM_SHOT / DM_SHOT_EVERY, which write it upright
+uint64_t vkr_present_pixels(const uint8_t *rgba, uint32_t w, uint32_t h) {
+    if (!env_shot_init) { env_shot_init = 1; const char *e = getenv("DM_SHOT"); char *c; long k; if (e && (k = strtol(e, &c, 10)) > 0 && *c == ':') dm_gfx_shot_at(k, c + 1); }
+    static long every = -1; static char edir[900]; static int shots;
+    if (every < 0) { const char *e = getenv("DM_SHOT_EVERY"); char *c; every = 0; if (e && (every = strtol(e, &c, 10)) > 0 && *c == ':') snprintf(edir, sizeof edir, "%s", c + 1); else every = 0; }
+    pthread_mutex_lock(&g_shot_mu);
+    uint64_t n = ++g_presents; char path[1024] = "";
+    if (g_shot_k && (long)n >= g_shot_k) { snprintf(path, sizeof path, "%s", g_shot_path); g_shot_k = 0; }
+    pthread_mutex_unlock(&g_shot_mu);
+    if (!path[0] && every > 0 && shots < 40 && n % (uint64_t)every == 0) { snprintf(path, sizeof path, "%s/present%05llu.png", edir, (unsigned long long)n); shots++; }
+    if (path[0]) {
+        uint8_t *up = malloc((size_t)w * h * 4);
+        if (up) { for (uint32_t y = 0; y < h; y++) memcpy(up + (size_t)y * w * 4, rgba + (size_t)(h - 1 - y) * w * 4, (size_t)w * 4);
+                  if (write_png(path, up, w, h)) LOG("screenshot %s: %ux%u (OpenGL frame)", path, w, h); free(up); }
+    }
+    if (vkw_active()) return vkw_present_rgba(rgba, w, h);
+    if (n == 1 || !(n & (n - 1))) LOG("[headless] present %llu (no window: frames are not drawn)", (unsigned long long)n);
+    return n;
 }
 
 // ---- for vk_draw.c ----
