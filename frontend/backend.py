@@ -12,7 +12,8 @@ import controllers
 import library as L
 
 
-def _local(u):   # a QML url (file:///…) or a path → a path string
+def _local(u):   # a QML url (a QUrl or file:///… text) or a path → a path string
+    if isinstance(u, QUrl): return u.toLocalFile() if u.isLocalFile() else u.toString()
     u = str(u)
     return QUrl(u).toLocalFile() if u.startswith('file:') else u
 
