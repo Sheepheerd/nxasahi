@@ -13,6 +13,14 @@ gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def launcher():   # what starts the library: the installed app (flake.nix sets NXASAHI_LAUNCHER; the command on PATH when it is the same app), else the source checkout's script
+    inst = os.environ.get('NXASAHI_LAUNCHER')
+    if inst:
+        on_path = shutil.which('nxasahi')
+        return 'nxasahi' if on_path and Path(on_path).resolve() == Path(inst).resolve() else inst
+    return str(REPO / 'frontend/nxasahi.sh')
 SCRIPT = REPO / 'scripts/build_ipa_from_nsp.py'
 DATA = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'nxasahi'
 GAMES, SAVES = DATA / 'games', DATA / 'saves'
@@ -620,7 +628,7 @@ class App(Adw.Application):
         apps = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'applications'; apps.mkdir(parents=True, exist_ok=True)
         (apps / 'org.nxasahi.Library.desktop').write_text(
             '[Desktop Entry]\nType=Application\nName=nxasahi\nComment=Switch game library\nIcon=input-gaming\nCategories=Game;\n'
-            f'Exec={REPO / "frontend/nxasahi.sh"} %F\nMimeType=application/x-nx-nsp;application/x-nx-xci;\nTerminal=false\n')
+            f'Exec={launcher()} %F\nMimeType=application/x-nx-nsp;application/x-nx-xci;\nTerminal=false\n')
         self.toast('Added nxasahi to the app launcher')
 
     def about(self):

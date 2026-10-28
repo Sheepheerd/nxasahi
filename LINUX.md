@@ -14,6 +14,8 @@ Drag NSP, XCI or NSZ files onto the window (or use **+**): a base game is import
 
 Where things go: `~/.local/share/nxasahi/games/<title ID>/` (links to the game files, and `<id>_build/` with the extracted files, shaders and host: several GB per game), saves in `~/.local/share/nxasahi/saves/<title ID>/` (kept when a game is rebuilt or removed), settings in `~/.config/nxasahi/`.
 
+The flake's package (`nix build`, `nix profile install`) holds the source read-only: its wrapper sets `NXASAHI_STATE` (default `~/.local/share/nxasahi/build`), where an import builds each game's host (`make -f Makefile.linux GEN=<dir> OUT=<file>`), and `NXASAHI_NX_EXTRACT`, the package's own build of `nx_extract` (its NuGet dependency pinned in `dm/tools/nx_extract/deps.json`). Without them, as in a source checkout, both build in the repository as before.
+
 The same import from a terminal, for one game's folder of NSPs: `python3 scripts/build_ipa_from_nsp.py <folder> -k ~/.switch/prod.keys --platform linux` (inside `nix develop`); it ends with the command that runs the game and writes `<id>_build/linux_game.json`. NVN games only so far, and not those whose shaders are captured or decoded at run time (the Mac host boots them for that).
 
 ## Build

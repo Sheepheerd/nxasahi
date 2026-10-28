@@ -365,6 +365,10 @@ def rmtree(p):
 def build_nx_extract(repo, work, logs, env):
     """Build nx_extract into <work>/tools/nx_extract/. It is built in a temporary folder and copied over: with an apostrophe in the output path (e.g. "Bowser's Fury") MSBuild's conditions break,
     LibHac.dll and the executable are not copied, and the build still reports success"""
+    pre = os.environ.get('NXASAHI_NX_EXTRACT')   # the installed app's own build (flake.nix): nothing to build
+    if pre:
+        if not os.access(pre, os.X_OK): raise BuildError(f'NXASAHI_NX_EXTRACT names no executable: {pre}')
+        return Path(pre)
     nx = work / 'tools/nx_extract/nx_extract'
     with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
         run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
@@ -1708,11 +1712,20 @@ def linux_shaders(py, repo, sh, env, logs, g, pkg_key=None):
 
 
 def build_linux_host(repo, work, env, logs, g):   # dm/host/Makefile.linux for the profile, copied to <id>_build/tools/dmhost-linux (dm/host/dmhost is the last game's); make skips what is up to date
-    host = repo / 'dm/host'
-    run(['make', '-f', 'Makefile.linux', f'GAME={g.id}', f'-j{os.cpu_count() or 8}'], logs / 'linux_host_build.log', env=env, cwd=host)
+    host, gen = repo / 'dm/host', linux_state('host')   # the installed app's source is read-only: everything built goes to NXASAHI_STATE (flake.nix), each game's objects in a folder of their own
+    built = gen / 'out' / g.id / 'dmhost' if gen else host / 'dmhost'
+    run(['make', '-f', 'Makefile.linux', f'GAME={g.id}', f'-j{os.cpu_count() or 8}'] + ([f'GEN={gen}', f'OUT={built}'] if gen else []), logs / 'linux_host_build.log', env=env, cwd=host)
     out = work / 'tools/dmhost-linux'; out.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(host / 'dmhost', out)
+    shutil.copy2(built, out)
     return out
+
+
+def linux_state(sub):   # <NXASAHI_STATE>/<sub>, made when missing; None in a source checkout (the tools build in the repository, as before)
+    st = os.environ.get('NXASAHI_STATE')
+    if not st: return None
+    d = Path(st).expanduser() / sub; d.mkdir(parents=True, exist_ok=True)
+    if ' ' in str(d): raise BuildError(f'NXASAHI_STATE has a space ({d}): make cannot take such paths')
+    return d
 
 
 def linux_boot_env(henv):   # a headless, silent Linux run for a capture: no window, no sound; on NixOS the Vulkan loader kept to the Asahi driver, as linux_run does

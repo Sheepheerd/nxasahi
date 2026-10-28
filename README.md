@@ -24,27 +24,36 @@ nxnative's [games table](dm/games/README.md#games) lists the 70-odd games that r
 
 ## Install
 
-You need Asahi Linux (or another Linux on Apple silicon with the Asahi Mesa drivers) and [Nix](https://nixos.org/download) with flakes enabled. The dev shell provides every tool: clang, Python with its packages, .NET, SDL3, Vulkan, GTK 4 and libadwaita.
+You need Asahi Linux (or another Linux on Apple silicon with the Asahi Mesa drivers) and [Nix](https://nixos.org/download) with flakes enabled. nxasahi is one Nix package: the game library, the import tools and everything they run.
+
+```sh
+nix profile install github:Sheepheerd/nxasahi/linux-headless   # installs the nxasahi command and its app launcher entry
+nix run github:Sheepheerd/nxasahi/linux-headless               # or try it without installing
+```
+
+On NixOS you can add it to your system flake instead: take `github:Sheepheerd/nxasahi/linux-headless` as an input and put `inputs.nxasahi.packages.aarch64-linux.default` in `environment.systemPackages`.
+
+The first import of a game compiles that game's host. The package brings the compiler with it; what it builds goes to `~/.local/share/nxasahi/build` (`NXASAHI_STATE` moves it).
+
+Put your keys in `~/.switch/prod.keys`, or choose another path in the library's Preferences.
+
+**From source** (to work on nxasahi): clone the repository and run the library from it, in the dev shell, which has the same tools and the .NET SDK:
 
 ```sh
 git clone https://github.com/Sheepheerd/nxasahi.git && cd nxasahi
-nix develop          # once, to fetch the tools (later runs are instant)
+frontend/nxasahi.sh  # enters nix develop and starts the library; `nix build` builds the package
 ```
 
 If you use [direnv](https://direnv.net), `direnv allow` loads the shell whenever you enter the folder.
 
-Put your keys in `~/.switch/prod.keys`, or choose another path in the library's Preferences.
-
 ## Play: the game library
 
-```sh
-frontend/nxasahi.sh
-```
+Start **nxasahi** from your app launcher, or run `nxasahi`.
 
 - **Add a game:** drag its NSP, XCI, NSZ or XCZ files onto the window, or use **+**. A base game is extracted, rewritten and its shaders translated, with progress shown on its tile. The first import takes a few minutes, and a later rebuild reuses every step whose inputs did not change. Drop an update or DLC to add it to its game, or pick it with **Add Update or DLC…** in the game's menu; the game is then rebuilt with it. The newest version you have is used, and any version works (each game was tested on the version its note names).
 - **Play:** double-click a tile. Its menu (or a right-click) has **Rebuild**, **Build Shader Cache** (compiles every shader the game has not compiled yet for your GPU, so nothing stutters in play), **Properties** (game language, extra environment variables), the save and log folders, and **Remove**.
 - **Preferences:** the keys file, game language, fullscreen, sound, fast cores only (on by default, which keeps the game on the performance cores), **Build the full shader cache** (on by default: an import or rebuild ends by compiling every shader for your GPU, a few minutes for a big game; off leaves them to be compiled while you play, with stutter until they are done), and how many threads compile, on the efficiency cores while you play, any shaders not compiled yet.
-- **Add to App Launcher** in the menu writes a desktop entry for the library.
+- **Add to App Launcher** in the menu writes a desktop entry for the library (the installed package already has one).
 
 Where things go:
 

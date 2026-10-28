@@ -7,12 +7,16 @@ ifneq ($(filter-out clean t_tpslot t_sigctx linux-tests t_spv_compile t_placed,$
 $(error GAME is not set: make -f Makefile.linux GAME=<base game title ID>)
 endif
 endif
+# GEN: where everything built goes (objects, generated headers, linked profiles), and OUT the host binary. Both default to this folder; the installed app (flake.nix)
+# builds from its read-only source with them in a writable folder (scripts/build_ipa_from_nsp.py, NXASAHI_STATE)
+GEN ?= gen
+OUT ?= dmhost
 ifneq ($(strip $(GAME)),)
-GAME_DIR := $(if $(and $(wildcard ../games/$(GAME)/game.tsv),$(if $(DM_GAMES_FIRST),,1)),../games/$(GAME),$(shell python3 ../games/game.py link $(GAME) gen/$(GAME)/profile >&2 && echo gen/$(GAME)/profile))
+GAME_DIR := $(if $(and $(wildcard ../games/$(GAME)/game.tsv),$(if $(DM_GAMES_FIRST),,1)),../games/$(GAME),$(shell python3 ../games/game.py link $(GAME) $(GEN)/$(GAME)/profile >&2 && echo $(GEN)/$(GAME)/profile))
 endif
-GAME_H = gen/$(GAME)/game_profile.h
+GAME_H = $(GEN)/$(GAME)/game_profile.h
 # Objects per game: they are compiled against its profile header, and a shared folder took one game's objects for another's when its header was the older
-O = gen/linux$(if $(strip $(GAME)),/$(GAME))
+O = $(GEN)/linux$(if $(strip $(GAME)),/$(GAME))
 CC = clang
 CFLAGS = -O1 -g -Wall -Wno-unused-function -std=gnu11 -fblocks -D_GNU_SOURCE -Ilinux -include darwin_compat.h \
          -I. -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I../third_party/libvpx -I../third_party/stb_vorbis $(shell pkg-config --cflags sdl3)
@@ -31,7 +35,7 @@ vpath %.S . ../gfx/nvn
 # Mach-O → ELF assembly: linux/darwin_asm.sed
 DARWIN_ASM = sed -E -f linux/darwin_asm.sed
 
-.DEFAULT_GOAL := dmhost
+.DEFAULT_GOAL := $(OUT)
 $(GAME_H): $(GAME_DIR)/game.tsv ../games/game.py FORCE
 	@python3 ../games/game.py header $(GAME) $@
 .PHONY: FORCE clean
@@ -65,10 +69,15 @@ $(O)/vpx/%.o: $(VPX)/%.c
 $(O)/libvpx.a: $(VPX_OBJ)
 	rm -f $@; ar rcs $@ $^
 
-dmhost: $(OBJ) $(O)/libvpx.a linux/sections.ld
+$(OUT): $(OBJ) $(O)/libvpx.a linux/sections.ld
+	@mkdir -p $(dir $(OUT))
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(O)/libvpx.a $(LIBS)
+ifneq ($(OUT),dmhost)
+.PHONY: dmhost
+dmhost: $(OUT)
+endif
 clean:
-	rm -rf $(O) dmhost
+	rm -rf $(O) $(OUT)
 
 # Tests of the Linux layer itself (linux/tests): the thread-slot scheme and the Darwin-shaped signal context
 .PHONY: t_tpslot t_sigctx linux-tests
