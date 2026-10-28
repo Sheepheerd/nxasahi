@@ -644,6 +644,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** before the next frame's first encoder, `gp_periodic_finish` snapshots the sampled frame's labels and registers a shared-event notification at its last committed fence. The report resolves the heap after all of that frame's segments complete, without a GPU wait or an extra command buffer. The heap cannot be reused while the report is pending.
 - **Found on:** review of the measurement tools for [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md); reproduced with synthetic counters and completion events, without game execution. `t_gpuprof` checks consecutive and sparse frame selection, completion ordering and heap ownership; it runs in CPU CI.
 
+### Linux: a render pass per draw
+
+- **Symptom:** on Linux, a game far below its frame rate with the GPU busy (`[nvn] timing` GPU p50 55 ms) on an ordinary scene; `DM_VK_PASSLOG` shows about as many passes as draws.
+- **Cause:** the Linux replay ended the render pass at every uniform update (`vkCmdUpdateBuffer` cannot run inside one) and at every target set. Unity updates a uniform buffer and sets its targets before nearly every draw, so Shining Pearl's town drew 531 draws in 506 passes, and on this tiled GPU each pass loads and stores its attachments (a 4x 1280x720 colour and depth, a 4096x4096 shadow map).
+- **Fix:** `vk_replay.c` keeps the pass when a target set binds the targets already bound (`rt_same`), and defers a uniform update made inside a pass to its end, as the Mac replay does (`ubd`): a draw whose uniform binding overlaps one reads a shadow (`vkr_ub_shadow`), guest memory with every update the GPU has not executed yet laid over it in order (`g_ulog`). The town frame: 47 passes, GPU 11 ms, the game back at its 30 fps. `DM_VK_UB_DEFER=0` turns the deferral off. Open: storage, vertex or index reads of deferred bytes in the same pass read memory without them.
+- **Found on:** Pokémon Shining Pearl 1.0.0 (Linux; provisional profile, no note yet; the twin of [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)).
+
 ## Conditional rendering and queries
 
 ### Conditional rendering evaluated at replay

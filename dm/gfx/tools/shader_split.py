@@ -630,16 +630,23 @@ def mtarc_shaders(d, label, out):
 SCNE, ZSTD_MAGIC = b'SCNE', bytes.fromhex('28b52ffd')
 LZ4_FRAME_MAGIC = bytes.fromhex('04224d18')   # the frame of HAL's other .cmp container (the ubin/ map data)
 def bea_members(d, label):
-    """NintendoWare Bezel Engine archive ('.bea', magic 'SCNE', a NintendoWare binary file of version 0x10100; Big Brain Academy: Brain vs. Brain keeps nearly all of RomFS in 603 of them):
-    +0x20 u64 entry count, +0x28 u64 offset of the entry pointer array (u64 each), each pointing at a 0x30-byte 'ASST' entry {+0x10 u16 kind, u16 alignment shift, u32 stored length,
-    u32 length, +0x20 u64 data offset, +0x28 u64 name offset (u16 length + the path)}. Every entry of the game's 7,665 is one zstd frame (kind 2, and 258 for the one sound project),
-    even the two whose stored length equals their length, so the frame magic decides. → (path, data) of each entry"""
-    n, arr = struct.unpack_from('<QQ', d, 0x20)
+    """NintendoWare Bezel Engine archive ('.bea', magic 'SCNE', a NintendoWare binary file): +0x20 u64 entry count, +0x28 u64 offset of the entries. Two versions are known:
+    - 0x10100 (Big Brain Academy: Brain vs. Brain, 603 archives): +0x28 points at an array of u64 entry offsets, each at a 0x30-byte 'ASST' entry {+0x10 u16 kind, u16 alignment shift,
+      u32 stored length, u32 length, +0x20 u64 data offset, +0x28 u64 name offset}.
+    - 0x60000 (Super Mario Party Jamboree, 949 archives, 127,203 entries): +0x28 points at the entries themselves, back to back, each 'ASST', u32 its own length (0x48), then the same
+      kind, alignment shift and lengths at +0x10, an 8-byte tag and a 16-byte hash, +0x38 u64 data offset, +0x40 u64 name offset.
+    A name is a u16 length + the path. In both games every entry is one zstd frame (kind 2, and 258 for the sound projects), even ones whose stored length equals their length,
+    so the frame magic decides. → (path, data) of each entry"""
+    ver = struct.unpack_from('<I', d, 8)[0]
+    n, o = struct.unpack_from('<QQ', d, 0x20)
+    if ver not in (0x10100, 0x60000): red(f'{label}: Bezel Engine archive version {ver:#x}: only 0x10100 and 0x60000 are known')
     zstd = None
     for i in range(n):
-        o = struct.unpack_from('<Q', d, arr + 8 * i)[0]
-        if d[o:o + 4] != b'ASST': red(f'{label}: entry {i} @{o:#x} is not an ASST entry')
-        csz, usz, off, nm = struct.unpack_from('<II4xQQ', d, o + 0x14)
+        e = struct.unpack_from('<Q', d, o + 8 * i)[0] if ver == 0x10100 else o
+        if d[e:e + 4] != b'ASST': red(f'{label}: entry {i} @{e:#x} is not an ASST entry')
+        csz, usz = struct.unpack_from('<II', d, e + 0x14)
+        off, nm = struct.unpack_from('<QQ', d, e + (0x20 if ver == 0x10100 else 0x38))
+        if ver == 0x60000: o += struct.unpack_from('<I', d, e + 4)[0]
         path = d[nm + 2:nm + 2 + struct.unpack_from('<H', d, nm)[0]].decode('utf-8', 'replace')
         data = d[off:off + csz]
         if data[:4] == ZSTD_MAGIC:

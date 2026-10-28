@@ -472,7 +472,10 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             bi[nw] = (VkDescriptorBufferInfo){g_zero, 0, 65536};
             if ((b->k == BK_SUPPORT)) bi[nw].buffer = g_support;
             else if ((b->k == BK_C1)) bi[nw] = (VkDescriptorBufferInfo){s->c1, 0, VK_WHOLE_SIZE};
-            else if ((b->k == BK_CBUF)) { int ok = b->reg >= 0 && b->reg < 16 && buf_desc(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, 64, 65536, &bi[nw]); if (!ok) g_miss[M_UBO]++;
+            else if ((b->k == BK_CBUF)) {
+                VkBuffer shb; VkDeviceSize sho; uint64_t usz = b->reg >= 0 && b->reg < 16 ? (S.ubo[st][b->reg].size > 65536 ? 65536 : S.ubo[st][b->reg].size) : 0;
+                int ok = b->reg >= 0 && b->reg < 16 && vkr_ub_shadow(S.ubo[st][b->reg].addr, usz, &shb, &sho) ? (bi[nw] = (VkDescriptorBufferInfo){shb, sho, usz}, 1)   // deferred updates over it (vk_replay.c)
+                       : b->reg >= 0 && b->reg < 16 && buf_desc(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, 64, 65536, &bi[nw]); if (!ok) g_miss[M_UBO]++;
                 if (g_trace && b->reg >= 0 && b->reg < 16) { const float *f = (const float *)(uintptr_t)S.ubo[st][b->reg].addr;
                     LOG("[pass]     stage %d cbuf binding %u c%d: addr %#llx size %llu%s; first %g %g %g %g", st, b->b, b->reg, (unsigned long long)S.ubo[st][b->reg].addr, (unsigned long long)S.ubo[st][b->reg].size,
                         ok ? "" : " [NOT BOUND]", f ? f[0] : 0.f, f ? f[1] : 0.f, f ? f[2] : 0.f, f ? f[3] : 0.f);

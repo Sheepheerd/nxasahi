@@ -457,39 +457,72 @@ def scan_nsps(nsp_dir):
 NSZ_MAIN = "import sys; sys.argv[0] = 'nsz'; from nsz import main; main()"   # the nsz tool of the Python running this file (Spyder does not have its bin folder on PATH)
 
 
+PENDING = {}   # a converted NSP / XCI that was deleted after its extraction (prune_decompressed): its path → what converts it again when a step needs the file (need)
+
+
 def decompress_nsz(nsp_dir, app, fam, keys, env):
     """NSZ / XCZ files of fam converted once with nsz -D into <title ID>_build/nsp/; returns fam with the converted files in their place. nsz writes into an empty temporary folder
     and the file is moved into nsp/ only when nsz exits 0, so a partial one is never taken for a whole one; a conversion is reused while its source has the same name, size and
-    modification time. nsz -D prints an NCA hash mismatch but goes on and exits 0: nx_extract's hash check catches a damaged file (ALLOW_DAMAGED)"""
+    modification time. nsz -D prints an NCA hash mismatch but goes on and exits 0: nx_extract's hash check catches a damaged file (ALLOW_DAMAGED).
+    A conversion deleted after its extraction (the Linux import keeps only its key: prune_decompressed) is not made again here: its path is returned as pending, and need()
+    converts it when a step reads the file (an extraction that is not reused, the build ID lookup on a new update), so a rebuild that reuses its extraction decompresses nothing"""
     paths = [fam['base']] + [p for _, p in fam['updates']] + [p for _, _, p in fam['dlc']]
     todo = [p for p in paths if p.suffix in COMPRESSED]
     if not todo: return fam
     if importlib.util.find_spec('nsz') is None:
         raise BuildError(f'NSZ / XCZ files need the nsz tool in the current Python ({sys.executable}): pip install nsz')
-    out = nsp_dir.absolute() / f'{app:016X}_build' / 'nsp'; logs, tmp = out.parent / 'logs', out / 'partial'
+    out = nsp_dir.absolute() / f'{app:016X}_build' / 'nsp'
     PROG.plan(1); PROG.stage('decompress NSZ', done=0, total=len(todo))
-    conv, made = {}, 0
+    conv, made, pend = {}, 0, 0
+    dlc = {p for _, _, p in fam['dlc']}
     for i, p in enumerate(todo):
         dst = out / (p.stem + COMPRESSED[p.suffix]); keyfile = dst.with_name(dst.name + '.key')
         st = p.stat(); key = fingerprint(p.name, st.st_size, st.st_mtime_ns)
-        if not (dst.is_file() and reused(keyfile, key) is not None):
-            PROG.set(done=i, step=p.name)
-            rmtree(tmp); tmp.mkdir(parents=True); rmtree(dst); keyfile.unlink(missing_ok=True)
-            log = logs / f'nsz_{p.stem}.log'
-            try:
-                # nsz 4.6.1 loads keys.txt beside argv[0] at import time; with argv[0] = 'nsz' that is cwd. That release has no --keys option.
-                (tmp / 'keys.txt').symlink_to(keys.resolve())
-                t0 = time.time()
-                run([sys.executable, '-c', NSZ_MAIN, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
-                if (tmp / dst.name).is_file(): (tmp / dst.name).rename(dst)
-                elif not (dst.is_file() and dst.stat().st_mtime >= t0 - 1):   # nixpkgs' nsz 4.6.1 writes into the output folder's parent; it exits 0 only after a whole, verified file
-                    raise BuildError(f'nsz made no {dst.name} (full output: {log})')
-            finally: rmtree(tmp)
-            keyfile.write_text(key + '\n'); made += 1
+        if p not in dlc and not dst.is_file() and keyfile.is_file() and reused(keyfile, key) is not None:   # converted before and pruned: made again only if a step needs it
+            PENDING[dst] = (p, key, keys, env); pend += 1
+        elif not (dst.is_file() and reused(keyfile, key) is not None):
+            PROG.set(done=i, step=p.name); convert_nsz(p, dst, key, keys, env); made += 1
         conv[p] = dst
-    PROG.end(f'{made} converted, {len(todo) - made} reused ({out})')
+    PROG.end(f'{made} converted, {len(todo) - made - pend} reused' + (f', {pend} deleted after extraction (made again only if needed)' if pend else '') + f' ({out})')
     c = lambda p: conv.get(p, p)
     return {'base': c(fam['base']), 'updates': [(v, c(p)) for v, p in fam['updates']], 'dlc': [(t, v, c(p)) for t, v, p in fam['dlc']]}
+
+
+def convert_nsz(p, dst, key, keys, env):   # one NSZ / XCZ → dst (nsz -D), its key written once the file is whole
+    keyfile, tmp, logs = dst.with_name(dst.name + '.key'), dst.parent / 'partial', dst.parent.parent / 'logs'
+    rmtree(tmp); tmp.mkdir(parents=True); rmtree(dst); keyfile.unlink(missing_ok=True)
+    log = logs / f'nsz_{p.stem}.log'
+    try:
+        # nsz 4.6.1 loads keys.txt beside argv[0] at import time; with argv[0] = 'nsz' that is cwd. That release has no --keys option.
+        (tmp / 'keys.txt').symlink_to(keys.resolve())
+        t0 = time.time()
+        run([sys.executable, '-c', NSZ_MAIN, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
+        if (tmp / dst.name).is_file(): (tmp / dst.name).rename(dst)
+        elif not (dst.is_file() and dst.stat().st_mtime >= t0 - 1):   # nixpkgs' nsz 4.6.1 writes into the output folder's parent; it exits 0 only after a whole, verified file
+            raise BuildError(f'nsz made no {dst.name} (full output: {log})')
+    finally: rmtree(tmp)
+    keyfile.write_text(key + '\n')
+
+
+def file_size(p):   # a game file's size; a pruned conversion's (decompress_nsz), its source's: an estimate is all it serves
+    return p.stat().st_size if p.exists() else PENDING[p][0].stat().st_size if p in PENDING else 0
+
+
+def need(p):   # the file at p, converted again first when it was pruned after its extraction (decompress_nsz)
+    if p is not None and p in PENDING and not p.is_file():
+        src, key, keys, env = PENDING.pop(p)
+        say(f'decompressing {src.name} again (its conversion was deleted after the last extraction)')
+        convert_nsz(src, p, key, keys, env)
+    return p
+
+
+def prune_decompressed(work, fam):   # after a whole Linux import: the base game's and updates' converted NSPs go (the extraction holds what runs; DLC conversions stay, extract_aoc
+    d = work / 'nsp'                    # fingerprints them); their keys stay, so the next build knows them (decompress_nsz)
+    if not d.is_dir(): return
+    freed = 0
+    for f in [fam['base']] + [p for _, p in fam['updates']]:
+        if f is not None and f.parent == d and f.is_file() and f.with_name(f.name + '.key').is_file(): freed += f.stat().st_size; f.unlink()
+    if freed: say(f'deleted the decompressed copies in {d} ({amount(freed, "B")}): a later build decompresses again only if it has to extract again')
 
 
 def vnum(ver):   # 'v655360' → 655360
@@ -537,15 +570,39 @@ def same_build(nsp_dir, app, fam, keys, repo, env):
     Only the code modules are extracted (a RomFS manifest, no game files written). Returns (profile, version, main build ID) or None"""
     import game as gamemod   # dm/games (main put it on the path)
     work = nsp_dir / f'{app:016X}_survey'; logs = work / 'logs'
+    # main's build IDs are kept for these exact files (a converted file by its conversion's key: it may have been pruned), so a rebuild reads no game file here; matching them
+    # against the profiles is redone every time (a profile added since is found)
+    ident = lambda p: p.with_name(p.name + '.key').read_text().strip() if p.with_name(p.name + '.key').is_file() else [p.name, p.stat().st_size, p.stat().st_mtime_ns]
+    ck = fingerprint([ident(fam['base'])] + [ident(p) for _, p in fam['updates']])
+    cache = work / 'build_id_lookup.json'
+    try: bids = json.loads(cache.read_text()) if json.loads(cache.read_text()).get('key') == ck else None
+    except (OSError, ValueError): bids = None
+    if bids:
+        PROG.plan(1); PROG.stage('build ID lookup')
+        for bid in bids['bids']:
+            g = gamemod.by_build(bid) if bid else None
+            if g:
+                ver = next(ver for ver, b in g.builds().items() if b.get('main') == bid)
+                PROG.end(f'main {bid} is game profile {g.id}\'s {ver} (build IDs as at the last build)'); return g, ver, bid
+        PROG.end('no profile registers its main build (build IDs as at the last build)'); return None
+    seen = []
+    r = same_build_lookup(work, logs, fam, keys, repo, env, gamemod, seen)
+    try: work.mkdir(parents=True, exist_ok=True); cache.write_text(json.dumps({'key': ck, 'bids': seen}))
+    except OSError: pass
+    return r
+
+
+def same_build_lookup(work, logs, fam, keys, repo, env, gamemod, seen):   # seen: each main build ID read, in the order tried
     PROG.plan(1); PROG.stage('build ID lookup', step='build nx_extract')
     nx = build_nx_extract(repo, work, logs, env)
     ups = sorted(fam['updates'], key=lambda u: u[0] or 0)
     for v, upd in ([ups[-1]] if ups else []) + [(0, None)]:
         PROG.set(step=f'main of {"the base game" if upd is None else "update v" + str(v)}')
         tmp = work / 'exefs.partial'; rmtree(tmp)
-        run([nx, keys, fam['base'], upd or '-', tmp, '--manifest'] + (['--allow-damaged'] if ALLOW_DAMAGED else []), logs / 'exefs.log')
+        run([nx, keys, need(fam['base']), need(upd) or '-', tmp, '--manifest'] + (['--allow-damaged'] if ALLOW_DAMAGED else []), logs / 'exefs.log')
         main = tmp / 'ExeFS/main'
         bid = build_id(main) if main.exists() else None
+        seen.append(bid)
         g = gamemod.by_build(bid) if bid else None
         rmtree(tmp)
         if g:
@@ -568,14 +625,14 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
         except OSError: return None
     PROG.stage('survey: RomFS manifest', poll=listed)
     say(f'extracting the code modules and a RomFS manifest (no game files written) → {ex}')
-    run([nx, keys, fam['base'], upd or '-', tmp, '--manifest'] + (['--allow-damaged'] if ALLOW_DAMAGED else []), logs / 'extract.log')
+    run([nx, keys, need(fam['base']), need(upd) or '-', tmp, '--manifest'] + (['--allow-damaged'] if ALLOW_DAMAGED else []), logs / 'extract.log')
     swap_in(tmp, ex)
     PROG.stage('survey: code modules', step='reading')
     xlog = (logs / 'extract.log').read_text(errors='replace')
     dv = re.search(r'display version (\S+)', xlog)
     F = pg.facts_of(ex / 'ExeFS', ex / 'romfs_manifest.tsv'); mods, rom = F['mods'], F['romfs']   # dm/games/profile_guess.py: what the code modules and the RomFS show
-    R = [f'# Survey: {nacp.name(ex / "control.nacp") or "?"} ({app:016X})', '', f'- display version: {dv.group(1) if dv else "?"}', f'- base: `{fam["base"].name}` ({fam["base"].stat().st_size / 2**30:.2f} GB)']
-    R += [f'- update: `{p.name}` (v{v}, {p.stat().st_size / 2**30:.2f} GB){" (used for this survey)" if p == upd else ""}' for v, p in ups]
+    R = [f'# Survey: {nacp.name(ex / "control.nacp") or "?"} ({app:016X})', '', f'- display version: {dv.group(1) if dv else "?"}', f'- base: `{fam["base"].name}` ({file_size(fam["base"]) / 2**30:.2f} GB)']
+    R += [f'- update: `{p.name}` (v{v}, {file_size(p) / 2**30:.2f} GB){" (used for this survey)" if p == upd else ""}' for v, p in ups]
     R += [f'- DLC: `{p.name}` ({p.stat().st_size / 1024:.0f} KB{", licence only, no content" if p.stat().st_size < 1 << 20 else ""})' for _, _, p in fam['dlc']]
 
     # Code modules
@@ -857,6 +914,7 @@ def extract(nx, keys, ex, name, base, upd, cmp_dir, logs, g):   # the build IDs 
         say(f'reusing the extracted {name}: {dst}')
         PROG.end('reused')
         return dst
+    base, upd = need(base), need(upd)   # converted again if they were pruned after the last extraction
     tmp = ex / (name + '.partial'); rmtree(tmp)
     last = extracted(log)   # the last extraction of this version (its log is about to be overwritten) has the exact size; without one, the NSPs' size is the estimate
     def poll():
@@ -1786,8 +1844,44 @@ def linux_shader_cache(work, host, env, logs):
     log = logs / 'shader_cache.log'
     try: run([host], log, env=henv, cwd=m['cwd'], on_line=line)
     except BuildError as e: say(f'[RED] shader cache not filled ({e}); the game compiles its shaders while it runs'); return
-    r = re.search(r'precompile done: (\d+) compiled into the cache in ([\d.]+) s \((\d+) shaders', log.read_text(errors='replace'))
-    PROG.end(f'{int(r[1]):,} compiled ({int(r[3]):,} shaders) in {float(r[2]):.0f} s' if r else '')
+    text = log.read_text(errors='replace')
+    r = re.search(r'precompile done: (\d+) compiled into the cache in ([\d.]+) s \((\d+) shaders', text)
+    c = re.search(r'shader binaries cached in (\S+)', text)
+    freed = prune_shader_cache(Path(c[1])) if c and r else 0
+    PROG.end((f'{int(r[1]):,} compiled ({int(r[3]):,} shaders) in {float(r[2]):.0f} s' if r else '') + (f'; {amount(freed, "B")} of this game\'s older caches deleted' if freed else ''))
+
+
+def prune_shader_cache(cur):   # this game's other folders in the host's shader cache: same descriptor layout (its hash, the name's third part), another chain, driver or rewrite version
+    parts = cur.name.split('-')   # spv-<chain>-<layout hash>-<driver UUID>-<driver version>[-f<rewrites>] (vk_draw.c shc_init); no other host will read the others again
+    if len(parts) < 5 or not cur.parent.is_dir(): return 0
+    freed = 0
+    for d in cur.parent.iterdir():
+        q = d.name.split('-')
+        if d != cur and d.is_dir() and len(q) >= 5 and q[0] == 'spv' and q[2] == parts[2]:
+            freed += sum(f.stat().st_size for f in d.rglob('*') if f.is_file()); rmtree(d)
+    return freed
+
+
+def prune_linux(work, fam, versions, spv):
+    """After a whole Linux import, what no later step or run reads: the base game's and updates' decompressed copies (prune_decompressed), the extractions and rewritten modules of
+    versions this build does not use (left from an earlier build: a game imported before its update kept its base extraction beside the merged one, 14 GB for Super Smash Bros.
+    Ultimate), the SPIR-V of other chain versions, and in the current one the translation's intermediates (the host reads <key>.vk.spv, .vkb and .job.json)"""
+    prune_decompressed(work, fam)
+    freed = 0
+    def drop(p):
+        nonlocal freed
+        if p.is_dir(): freed += sum(f.stat().st_size for f in p.rglob('*') if f.is_file() and not f.is_symlink()); rmtree(p)
+        elif p.is_file(): freed += p.stat().st_size; p.unlink()
+    for d in (work / 'extract').iterdir() if (work / 'extract').is_dir() else ():
+        if d.is_dir() and d.name not in versions: drop(d)
+    for d in work.glob('patched_*'):
+        if d.name.split('_', 1)[1].split('.')[0] not in versions: drop(d)
+    out = spv.parent
+    for d in out.glob('spv-*'):
+        if d.name not in (spv.name, spv.name + '.key'): drop(d)
+    for f in spv.iterdir():
+        if (f.name.endswith('.spv') and not f.name.endswith('.vk.spv')) or f.name.endswith(('.res.json', '.vk.json')): drop(f)
+    if freed: say(f'deleted {amount(freed, "B")} no later step or run reads (old versions\' files, the shader translation\'s intermediates)')
 
 
 MTL_ARCH_M = '''#import <Metal/Metal.h>
@@ -2033,7 +2127,7 @@ def main(args=None):
     picks = pick_nsps(fam, have, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
-    gb = sum({p.stat().st_size for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6   # extraction + shader cache + slack
+    gb = sum({file_size(p) for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6   # extraction + shader cache + slack
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
     PROG.plan(1 + len(versions) + bool(fam['dlc']) + 4 - (prepare_xcode or (mac and not mac_pack)))   # prepare Xcode (a Mac-only build: the Mac host) replaces app build + IPA pack with one stage (a Mac app: Mac host + Mac app)
@@ -2137,6 +2231,7 @@ def main(args=None):
         if SHADER_CACHE if args.shader_cache is None else args.shader_cache: linux_shader_cache(work, host, env, logs)
         else: say('shader cache: not filled (--no-shader-cache); the game compiles its shaders while it runs')
         rmtree(work / 'tmp')
+        prune_linux(work, fam, versions, Path(ios))
         say(f'done: the game runs on Linux with this command (its save in {work / "run/save"}, kept from run to run):')
         PROG.say(cmd)
         report_profile_status(g, reg, pkg_ver, derived, provisional, 'Linux build')

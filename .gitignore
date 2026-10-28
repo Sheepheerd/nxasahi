@@ -9,3 +9,4 @@ dm/games/*/c1_full.tsv
 dm/games/*/cb_extent.tsv
 # direnv (nix develop through .envrc): its local cache
 .direnv/
+result

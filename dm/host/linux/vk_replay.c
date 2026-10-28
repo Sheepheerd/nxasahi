@@ -434,7 +434,78 @@ static VkImageView att_view_n(vtex *t, uint32_t level, uint32_t layer, uint32_t 
     v->next = t->views; t->views = v; return v->view;
 }
 static VkImageView att_view(vtex *t, uint32_t level, uint32_t layer, VkImageAspectFlags asp) { return att_view_n(t, level, layer, 1, asp); }
-static void rp_end(VkCommandBuffer c) { if (!g_rp_on) return; vkCmdEndRendering(c); g_rp_on = 0; full_barrier(c); }
+// ---- uniform updates inside a render pass (UpdateUniformBuffer) ----
+// vkCmdUpdateBuffer cannot run inside a render pass, so each update used to end the pass, and Unity updates a uniform buffer before nearly every draw: Pokemon Shining
+// Pearl's town drew 531 draws in 506 passes, each loading and storing its 4x 1280x720 targets on this tiled GPU (55 ms of GPU a frame). As the Mac replay (nvn_mtl.m, ubd):
+// inside a pass an update is deferred; a draw whose uniform binding overlaps a deferred update reads a shadow (vkr_ub_shadow); the deferred updates are made in order when
+// the pass ends, so later passes, copies and the CPU see the memory as before. A shadow is the binding as the GPU would read it at that draw: guest memory with every update
+// the GPU has not executed yet laid over it in order (g_ulog keeps a copy of each until its submission's fence is passed; memory alone missed the ones still queued).
+// Open: storage, vertex or index reads of deferred bytes in the same pass read memory without them (the Mac ends the pass for those). DM_VK_UB_DEFER=0 turns it off
+typedef struct { uint64_t dst, n, after; uint8_t *data; } ulog_t;
+static ulog_t *g_ulog; static size_t g_nulog, g_culog;   // the updates the GPU may not have executed yet, in order (under the replay's thread)
+typedef struct { uint64_t dst, n; const uint8_t *data; } ubd_t;
+static ubd_t *g_ubd; static size_t g_nubd, g_cubd;      // deferred in the pass in progress (data: in the command memory being replayed)
+static uint64_t g_ub_deferred, g_ub_shadows;
+static stage_buf *g_shr, *g_shr_all; static uint8_t *g_shr_map; static size_t g_shr_off, g_shr_cap; static uint64_t g_shr_after;   // the shadows' ring for this submission
+static int ub_defer_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_UB_DEFER"); on = !e || atoi(e) != 0; } return on; }
+static void ulog_add(uint64_t dst, uint64_t n, const uint8_t *data) {
+    uint64_t done = done_value(); size_t k = 0;
+    for (size_t i = 0; i < g_nulog; i++) { if (g_ulog[i].after <= done) free(g_ulog[i].data); else g_ulog[k++] = g_ulog[i]; }   // executed: in memory now
+    g_nulog = k;
+    if (g_nulog == g_culog) { size_t nc = g_culog ? 2 * g_culog : 256; ulog_t *nl = realloc(g_ulog, nc * sizeof *nl); if (!nl) return; g_ulog = nl; g_culog = nc; }
+    uint8_t *cp = malloc(n); if (!cp) return; memcpy(cp, data, n);
+    g_ulog[g_nulog++] = (ulog_t){dst, n, atomic_load(&g_fence) + 1, cp};
+}
+static void ubd_land(VkCommandBuffer c) {   // the deferred updates, in order, outside the pass
+    for (size_t i = 0; i < g_nubd; i++) {
+        VkBuffer b; VkDeviceSize off; VkDeviceAddress g;
+        if (vkm_lookup((const void *)(uintptr_t)g_ubd[i].dst, g_ubd[i].n, &b, &off, &g)) vkCmdUpdateBuffer(c, b, off, g_ubd[i].n, g_ubd[i].data);
+    }
+    g_nubd = 0;
+}
+static void rp_end(VkCommandBuffer c) { if (!g_rp_on) return; vkCmdEndRendering(c); g_rp_on = 0; ubd_land(c); full_barrier(c); }
+// A uniform binding [addr, addr + size) for the draw being prepared (vk_draw.c stage_set): 1 and a shadow in *b / *off when a deferred update overlaps it, else 0 (memory as bound)
+int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off) {
+    int hit = 0;
+    for (size_t i = 0; i < g_nubd && !hit; i++) hit = g_ubd[i].dst < addr + size && addr < g_ubd[i].dst + g_ubd[i].n;
+    if (!hit || !size || size > 65536) return 0;
+    size_t need = (size + 255) & ~(size_t)255;
+    uint64_t after = atomic_load(&g_fence) + 1;
+    if (!g_shr || g_shr_after != after || g_shr_off + need > g_shr_cap) {   // a new ring piece: one submission's, freed once the GPU is past it
+        uint64_t done = done_value();
+        for (stage_buf **q = &g_shr_all; *q;) { stage_buf *o = *q; if (o->after <= done && o != g_shr) { *q = o->next; vkDestroyBuffer(g_vkd.dev, o->buf, NULL); vkFreeMemory(g_vkd.dev, o->mem, NULL); free(o); } else q = &o->next; }
+        size_t cap = need > (1u << 20) ? need : (1u << 20);
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+        stage_buf *sb = calloc(1, sizeof *sb); if (!sb) return 0;
+        if (vkCreateBuffer(g_vkd.dev, &bi, NULL, &sb->buf)) { free(sb); return 0; }
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vkd.dev, sb->buf, &mr);
+        VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = pick_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        void *map = NULL;
+        if (ma.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_vkd.dev, &ma, NULL, &sb->mem) || vkBindBufferMemory(g_vkd.dev, sb->buf, sb->mem, 0) || vkMapMemory(g_vkd.dev, sb->mem, 0, VK_WHOLE_SIZE, 0, &map)) {
+            vkDestroyBuffer(g_vkd.dev, sb->buf, NULL); if (sb->mem) vkFreeMemory(g_vkd.dev, sb->mem, NULL); free(sb); return 0; }
+        sb->after = after; sb->next = g_shr_all; g_shr_all = sb;   // a list of their own: the draw path may hold g_tmu here (the staging list's lock)
+        g_shr = sb; g_shr_map = map; g_shr_off = 0; g_shr_cap = cap; g_shr_after = after;
+    }
+    uint8_t *dst = g_shr_map + g_shr_off;
+    memcpy(dst, (const void *)(uintptr_t)addr, size);   // memory as the CPU sees it, then every update not executed yet, in order (the deferred ones are among them)
+    for (size_t i = 0; i < g_nulog; i++) {
+        const ulog_t *u = &g_ulog[i]; uint64_t lo = u->dst > addr ? u->dst : addr, hi = u->dst + u->n < addr + size ? u->dst + u->n : addr + size;
+        if (lo < hi) memcpy(dst + (lo - addr), u->data + (lo - u->dst), hi - lo);
+    }
+    *b = g_shr->buf; *off = g_shr_off; g_shr_off += need; g_ub_shadows++;
+    return 1;
+}
+static uint64_t g_rp_kept;   // target sets that kept the pass going (rt_same)
+static int rt_same(const p_set_rt *s) {   // s binds exactly the targets of the pass in progress: the same images (by serial), views and depth
+    int n = s->n < 0 ? 0 : s->n > 8 ? 8 : s->n;
+    if (n != g_rt_n) return 0;
+    for (int i = 0; i < n; i++) {
+        const tex_t *a = s->color[i], *b = g_rt[i];
+        if (!a != !b || (a && a->serial != b->serial) || s->has_cview[i] != g_rt_has_view[i] || (s->has_cview[i] && memcmp(&s->cview[i], &g_rt_view[i], sizeof s->cview[i]))) return 0;
+    }
+    const tex_t *a = s->depth, *b = g_rt_depth;
+    return !a == !b && (!a || a->serial == b->serial) && s->has_dview == g_rt_has_dview && (!s->has_dview || !memcmp(&s->dview, &g_rt_dview, sizeof s->dview));
+}
 static int rp_begin(VkCommandBuffer c) {
     if (g_rp_on) return 1;
     VkRenderingAttachmentInfo ca[8], da, sa; int nc = 0, have = 0, samples = 1; uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1;
@@ -619,8 +690,12 @@ void mtl_exec(const uint8_t *handle) {
         case OP_JUMP: memcpy(&p, a, 8); continue;
         case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (nret == 16) { LOG("[RED] vulkan replay: command buffer calls nested deeper than 16"); return; } ret[nret++] = p + h.size; p = t; continue; }
         case OP_SET_RT: {
+            const p_set_rt *s = a;
+            // The targets already bound, views and all: the pass goes on. Unity sets its targets before nearly every draw (Pokemon Shining Pearl's town: 531 draws in 506
+            // passes), and each pass loads and stores its attachments on this tiled GPU (a 4x 1280x720 colour and depth, a 4096x4096 shadow map): 55 ms of GPU a frame
+            if (g_rp_on && rt_same(s)) { g_rp_kept++; break; }
             rp_end(c);
-            const p_set_rt *s = a; g_rt_n = s->n < 0 ? 0 : s->n > 8 ? 8 : s->n;
+            g_rt_n = s->n < 0 ? 0 : s->n > 8 ? 8 : s->n;
             for (int i = 0; i < 8; i++) { g_rt[i] = i < g_rt_n ? s->color[i] : NULL; g_rt_view[i] = s->cview[i]; g_rt_has_view[i] = s->has_cview[i]; }
             g_rt_depth = s->depth; g_rt_dview = s->dview; g_rt_has_dview = s->has_dview;
             break;
@@ -653,6 +728,11 @@ void mtl_exec(const uint8_t *handle) {
             uint64_t dst, n; memcpy(&dst, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
             VkBuffer b; VkDeviceSize off; VkDeviceAddress g;
             if (n && n <= 65536 && !(n & 3) && !(dst & 3) && vkm_lookup((const void *)(uintptr_t)dst, n, &b, &off, &g)) {
+                ulog_add(dst, n, (const uint8_t *)a + 16);
+                if (g_rp_on && ub_defer_on()) {   // inside a pass: deferred to its end, the draws until then read shadows (vkr_ub_shadow)
+                    if (g_nubd == g_cubd) { size_t nc = g_cubd ? 2 * g_cubd : 64; ubd_t *nd = realloc(g_ubd, nc * sizeof *nd); if (nd) { g_ubd = nd; g_cubd = nc; } }
+                    if (g_nubd < g_cubd) { g_ubd[g_nubd++] = (ubd_t){dst, n, (const uint8_t *)a + 16}; g_ub_deferred++; g_ub_updates++; break; }
+                }
                 rp_end(c); vkCmdUpdateBuffer(c, b, off, n, (const uint8_t *)a + 16); full_barrier(c); g_ub_updates++;
                 if (g_passlog) { const float *f = (const float *)((const uint8_t *)a + 16); LOG("[pass] uniform update %#llx + %llu bytes; first %g %g %g %g", (unsigned long long)dst, (unsigned long long)n, n >= 16 ? f[0] : 0.f, n >= 16 ? f[1] : 0.f, n >= 16 ? f[2] : 0.f, n >= 16 ? f[3] : 0.f);
                     static unsigned seq; const char *dd = getenv("DM_VK_SBUFDUMP");   // the update's bytes too, in order: <dir>/u<sequence>_<address>.bin

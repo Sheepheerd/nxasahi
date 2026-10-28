@@ -16,6 +16,8 @@ Where things go: `~/.local/share/nxasahi/games/<title ID>/` (links to the game f
 
 The flake's package (`nix build`, `nix profile install`) holds the source read-only: its wrapper sets `NXASAHI_STATE` (default `~/.local/share/nxasahi/build`), where an import builds each game's host (`make -f Makefile.linux GEN=<dir> OUT=<file>`), and `NXASAHI_NX_EXTRACT`, the package's own build of `nx_extract` (its NuGet dependency pinned in `dm/tools/nx_extract/deps.json`). Without them, as in a source checkout, both build in the repository as before.
 
+A Linux import keeps only what later steps and runs read (`prune_linux` in the script): the base game's and updates' decompressed NSZ / XCZ copies go once extracted (their keys stay, so a rebuild that reuses the extraction decompresses nothing; `need` converts again when one has to re-extract), as do the extractions and rewritten modules of versions the build no longer uses, the SPIR-V of other chain versions and the translation's intermediates (the host reads `<key>.vk.spv`, `.vkb` and `.job.json`). The shader cache stage deletes the game's older folders in `~/.cache/nxasahi/vkshaders`. The build-ID lookup keeps the IDs it read (`<id>_survey/build_id_lookup.json`).
+
 The same import from a terminal, for one game's folder of NSPs: `python3 scripts/build_ipa_from_nsp.py <folder> -k ~/.switch/prod.keys --platform linux` (inside `nix develop`); it ends with the command that runs the game and writes `<id>_build/linux_game.json`. NVN games only so far, and not those whose shaders are captured or decoded at run time (the Mac host boots them for that).
 
 ## Build
