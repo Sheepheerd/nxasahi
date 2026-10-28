@@ -6,13 +6,37 @@ nxasahi is not an emulator: the game's own code runs directly on the M-series CP
 
 ## Status
 
-This is an early port. **One game has been tested on Linux so far:**
+This is an early port. **Ten games have been played on Linux so far**, each as far as the rating says:
+
+| Rating | Meaning |
+|---|---|
+| 🏆 **Perfect** | Played through with no known issues |
+| 🥇 **Gold** | Plays well; nothing wrong seen in play so far |
+| 🥈 **Silver** | Playable, with a known limit (frame rate, or only played a short way) |
+| 🥉 **Bronze** | Boots and gets into the game, but not played far yet |
 
 <table>
 <tr>
-<td align="center" valign="top" width="33%"><img src="docs/images/super-mario-bros-wonder.jpg" width="256" alt="Super Mario Bros. Wonder"><br><a href="dm/games/010015100B514000/README.md">Super Mario Bros. Wonder</a><br><sub>60 fps on an M1 · title, world map and levels render correctly · sound</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/super-mario-bros-wonder.jpg" width="256" alt="Super Mario Bros. Wonder"><br><a href="dm/games/010015100B514000/README.md">Super Mario Bros. Wonder</a><br><b>🥇 Gold</b><br><sub>Title, world map and levels at 60 fps, with sound</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/super-smash-bros-ultimate.jpg" width="256" alt="Super Smash Bros. Ultimate"><br><a href="dm/games/01006A800016E000/README.md">Super Smash Bros. Ultimate</a><br><b>🥇 Gold</b><br><sub>Plays well</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/cuphead.jpg" width="256" alt="Cuphead"><br><a href="dm/games/0100A5C00D162000/README.md">Cuphead</a><br><b>🥇 Gold</b><br><sub>Plays well</sub></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/dark-souls-remastered-creation.jpg" width="256" alt="DARK SOULS: REMASTERED"><br><a href="dm/games/01004AB00A260000/README.md">DARK SOULS: REMASTERED</a><br><b>🥈 Silver</b><br><sub>Opening movie, character creation and the Undead Asylum · 30 fps on the base game (60 with update 1.0.3)</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/pokemon-shining-pearl.jpg" width="256" alt="Pokémon Shining Pearl"><br>Pokémon Shining Pearl<br><b>🥈 Silver</b><br><sub>Intro and the opening scenes · capped at 30 fps</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/pokemon-lets-go-eevee.jpg" width="256" alt="Pokémon: Let's Go, Eevee!"><br>Pokémon: Let's Go, Eevee!<br><b>🥈 Silver</b><br><sub>Intro, Oak's speech and the 3D bedroom</sub></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/hollow-knight.jpg" width="256" alt="Hollow Knight"><br><a href="dm/games/0100633007D48000/README.md">Hollow Knight</a><br><b>🥈 Silver</b><br><sub>Title, intro movies and King's Pass at 60 fps</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/balatro.jpg" width="256" alt="Balatro"><br><a href="dm/games/0100CD801CE5E000/README.md">Balatro</a><br><b>🥈 Silver</b><br><sub>Intro, title and a run's tutorial at about 59 fps, with sound · OpenGL</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/pokemon-firered.jpg" width="256" alt="Pokémon FireRed Version"><br>Pokémon FireRed Version<br><b>🥉 Bronze</b><br><sub>Builds and renders; not played far</sub></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/super-mario-party-jamboree.jpg" width="256" alt="Super Mario Party Jamboree"><br><a href="dm/games/0100965017338000/README.md">Super Mario Party Jamboree</a><br><b>🥉 Bronze</b><br><sub>Boots to its title screen at 60 fps</sub></td>
 </tr>
 </table>
+
+Screenshots are from Linux, except Wonder, Smash, Cuphead, Dark Souls and Balatro, which are nxnative's from the Mac.
 
 What works so far:
 
