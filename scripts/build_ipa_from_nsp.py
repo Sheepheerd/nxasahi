@@ -637,6 +637,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     PROG.stage('survey: code modules', step='reading')
     xlog = (logs / 'extract.log').read_text(errors='replace')
     dv = re.search(r'display version (\S+)', xlog)
+    if pg.aarch32(ex / 'ExeFS/main.npdm'): raise BuildError(f'{app:016X} {dv.group(1) if dv else ""} is a 32-bit (AArch32) program, which Apple silicon cannot run; a 64-bit update may exist')
     F = pg.facts_of(ex / 'ExeFS', ex / 'romfs_manifest.tsv'); mods, rom = F['mods'], F['romfs']   # dm/games/profile_guess.py: what the code modules and the RomFS show
     R = [f'# Survey: {nacp.name(ex / "control.nacp") or "?"} ({app:016X})', '', f'- display version: {dv.group(1) if dv else "?"}', f'- base: `{fam["base"].name}` ({file_size(fam["base"]) / 2**30:.2f} GB)']
     R += [f'- update: `{p.name}` (v{v}, {file_size(p) / 2**30:.2f} GB){" (used for this survey)" if p == upd else ""}' for v, p in ups]
@@ -2146,6 +2147,10 @@ def main(args=None):
         b, u = picks[ver]
         dirs[ver] = extract(nx, keys, ex, ver, b, u, clone, logs, g)
         if u is None and clone is None and can_clone(ex): clone = dirs[ver] / 'RomFS'
+    arm32 = [v for v in versions if pg.aarch32(dirs[v] / 'ExeFS/main.npdm')]   # the game's code runs on the CPU as it is, and Apple silicon has no AArch32: a 32-bit build cannot run
+    if arm32:
+        regs = ', '.join(f'{v} {b["display"]}' for v, b in builds.items())
+        raise BuildError(f'{", ".join(arm32)} of {g.id} is a 32-bit (AArch32) program, which Apple silicon cannot run; put a 64-bit update in the folder' + (f' (game profile {g.id} registers {regs})' if regs else ''))
     bad = [] if derived else [f'{v}: {x}' for v in versions for x in build_mismatch(dirs[v], v, g)]   # every module's build ID must be the one the profile registers for its version
     if bad and provisional: raise BuildError(f'not the builds provisional game profile {g.id} registers: {"; ".join(bad)}')
     if bad:   # files of other builds under a registered version's tag: packed like any other version

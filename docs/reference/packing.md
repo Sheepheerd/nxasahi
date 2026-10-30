@@ -9,6 +9,15 @@
 - **Fix:** `scripts/build_ipa_from_nsp.py` `configure_dotnet` derives the root from the `Microsoft.NETCore.App` entry in `dotnet --list-runtimes`, using the build's environment, before any extraction or survey. It exports `DOTNET_ROOT` both to that environment and to `os.environ`, for tools launched with an explicit environment and those that inherit it. Caller-supplied roots, including architecture-specific overrides, retain precedence. A failed or malformed probe leaves the environment unchanged rather than guessing the wrapper's directory.
 - **Found on:** [Balatro](../../dm/games/0100CD801CE5E000/README.md), first extraction with Homebrew .NET ([PR #284](https://github.com/seedds/nxnative/pull/284)). Applies to every game's build on that installation setup.
 
+## Game builds
+
+### A 32-bit build crashes the build with `KeyError: 6`
+
+- **Symptom:** the NSP script stops right after extracting (or after `derived game profile for …`) with `[RED] KeyError: 6` in `nso_syms.py` `dynsyms`, called from `profile_guess.py` `build_sources` or `facts_of`.
+- **Cause:** the packed version is a 32-bit (AArch32) program: its `main.npdm` flags (byte 0xc) have bit 0 (64-bit instructions) clear, and its NSOs carry ELF32 dynamic sections (8-byte entries), which `dynsyms` reads as ELF64 and finds no `DT_SYMTAB`. The extraction is sound (the segments match their SHA-256 hashes). Apple silicon has no AArch32 mode and the game's code runs on the CPU as it is, so such a build cannot run at all.
+- **Fix:** `profile_guess.py` `aarch32` reads the flag, and `scripts/build_ipa_from_nsp.py` stops after extraction (and in the survey) with `… is a 32-bit (AArch32) program, which Apple silicon cannot run; put a 64-bit update in the folder`, naming the builds the profile registers. Pack a 64-bit update instead.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md), packing its base game (1.0.0, v0) without an update. Applies to any 32-bit build of any game.
+
 ## IPA archives
 
 ### A streamed file changes size and the IPA fails its CRC check

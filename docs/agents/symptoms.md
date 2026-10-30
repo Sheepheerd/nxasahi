@@ -5,6 +5,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 ## Packing
 
 - the first extraction stops with `nx_extract exit code 131` and `.NET location: Not found`, even though `dotnet` is on `PATH`. The shader translator can fail the same way. → [Homebrew .NET is on PATH but apphosts cannot find the runtime](../reference/packing.md#homebrew-net-is-on-path-but-apphosts-cannot-find-the-runtime)
+- the NSP script stops right after extracting (or after `derived game profile for …`) with `[RED] KeyError: 6` in `nso_syms.py` `dynsyms`, called from `profile_guess.py` `build_sources` or `facts_of`. → [A 32-bit build crashes the build with `KeyError: 6`](../reference/packing.md#a-32-bit-build-crashes-the-build-with-keyerror-6)
 - packing succeeds, but `unzip -t` or Python's `ZipFile.testzip()` reports a bad CRC for a large deflated file. → [A streamed file changes size and the IPA fails its CRC check](../reference/packing.md#a-streamed-file-changes-size-and-the-ipa-fails-its-crc-check)
 - `decompress NSZ` stops immediately with `nsz: error: unrecognized arguments: --keys …`. → [NSZ decompression rejects `--keys`](../reference/packing.md#nsz-decompression-rejects---keys)
 
