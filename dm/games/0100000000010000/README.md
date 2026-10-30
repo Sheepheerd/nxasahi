@@ -54,6 +54,7 @@ No `patches.py`. `op_mode` stays docked: Odyssey only takes its motion moves in 
 
 General host and tool changes first needed here; each applies to every game:
 
+- **Resolved: 1.0.0 crashed at boot** in `oe::EnableGamePlayRecording` (SDK 3.5.1, called from `main+0x536f7c` with a 96 MB buffer): [Gameplay recording buffer](../../../docs/reference/services.md#gameplay-recording-buffer). With the hook, 1.0.0 runs on Linux at 60 fps (40 s boot test, no `[RED]` lines).
 - **Resolved: NSZ decompression rejected `--keys`** when packing v0: [NSZ decompression rejects `--keys`](../../../docs/reference/packing.md#nsz-decompression-rejects---keys).
 
 - **Largest point size at `c0 + 0x610`**: [04, section 3](../../../docs/agents/04-graphics.md#3-find-the-binding-layout-by-census) and [Graphics `c0 + 0x610`: the largest point size](../../../docs/reference/shaders.md#graphics-c0--0x610-the-largest-point-size).

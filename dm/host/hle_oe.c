@@ -112,6 +112,9 @@ HLE_FORCE("_ZN2nn2oe43GetUserInactivityDetectionTimeExtensionModeEv", "auto scre
 // Hyrule Warriors: Age of Calamity (SDK 9.6.0, main+0x8d1238): the copyright frame buffer, an overlay the system draws only into screenshots and recordings. The SDK hands the buffer to am as transfer memory
 // (svcCreateTransferMemory, then a null applet proxy). The host has no system capture, so it keeps nothing
 HLE_FORCE("_ZN2nn2oe30InitializeCopyrightFrameBufferEPvm", "copyright overlay buffer (for screenshots / recording, through am); the host has no system screenshot", void, h_oe_CopyrightInit, void *buf, size_t n) { (void)buf; (void)n; }
+// Super Mario Odyssey 1.0.0 (SDK 3.5.1, main+0x536f7c), at boot: a 96 MB buffer for the system's gameplay recording. The SDK hands it to am the same way (svcCreateTransferMemory,
+// then the null applet proxy: null read at sdk+0x14f778). The host has no system capture, so it keeps nothing; the game never reads the buffer back
+HLE_FORCE("_ZN2nn2oe23EnableGamePlayRecordingEPvm", "gameplay recording buffer (through am); the host has no system capture", void, h_oe_Recording, void *buf, size_t n) { (void)buf; (void)n; }
 HLE_FORCE("_ZN2nn2oe17SetCopyrightImageEPKvmiiiiNS0_16WindowOriginModeE", "copyright overlay image; the host has no system screenshot", void, h_oe_CopyrightImage, const void *p, size_t n, int x, int y, int w, int h, int origin) { (void)p; (void)n; (void)x; (void)y; (void)w; (void)h; (void)origin; }
 HLE_FORCE("_ZN2nn2oe22SetCopyrightVisibilityEb", "copyright overlay visibility; the host has no system screenshot", void, h_oe_CopyrightVisible, int on) { (void)on; }
 

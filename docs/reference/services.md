@@ -374,6 +374,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** `InitializeCopyrightFrameBuffer`, `SetCopyrightImage` and `SetCopyrightVisibility` are host no-ops (`hle_oe.c`).
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) (SDK 9.6).
 
+### Gameplay recording buffer
+
+- **Symptom:** `SVC 0x15 … (placeholder returns success)` for a large buffer at the heap start (96 MB at boot), then a null read in `oe::EnableGamePlayRecording` (SDK 3.5.1: `sdk+0x14f778`).
+- **Cause:** the game gives the system a buffer for its gameplay video capture; the SDK makes it transfer memory (`svcCreateTransferMemory`) and passes it to am through the applet proxy the host never made.
+- **Fix:** `oe::EnableGamePlayRecording` is a host no-op (`hle_oe.c`), like [the copyright frame buffer](#copyright-frame-buffer-overlay): the host has no system capture, and the game never reads the buffer back.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) 1.0.0 (SDK 3.5.1), at boot (1.4.1, the profile's build, booted without the hook).
+
 ### Applet resource user ID, launch parameters and VR mode
 
 - **Symptom:** SDK 20 calls that reach a service, each one boot; SDK 20's `OpenAudioRenderer` aborts on an ARUID of 0.
