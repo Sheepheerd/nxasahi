@@ -370,10 +370,16 @@ def build_nx_extract(repo, work, logs, env):
         if not os.access(pre, os.X_OK): raise BuildError(f'NXASAHI_NX_EXTRACT names no executable: {pre}')
         return Path(pre)
     nx = work / 'tools/nx_extract/nx_extract'
+    # dotnet build takes about a second even when it has nothing to do: reused while its sources and the .NET SDK it ran with are unchanged
+    src = repo / 'dm/tools/nx_extract'; dn = shutil.which('dotnet', path=env.get('PATH'))
+    kf = nx.parent.with_name('nx_extract.key')
+    key = fingerprint(('files', [src / f for f in ('Program.cs', 'nx_extract.csproj', 'deps.json')]), os.path.realpath(dn) if dn else None, env.get('DOTNET_ROOT'))
+    if nx.exists() and reused(kf, key) is not None: return nx
     with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
         run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
         if not (Path(t) / 'nx_extract').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-        rmtree(nx.parent); shutil.copytree(t, nx.parent)
+        rmtree(kf); rmtree(nx.parent); shutil.copytree(t, nx.parent)
+    kf.write_text(f'{key}\n')
     return nx
 
 
@@ -865,8 +871,8 @@ def reused(keyfile, key):   # the note the stage's last successful run wrote bes
     return note.strip() if k == key else None
 
 
-def tool_files(repo):   # what the shader stages run: dm/gfx/tools' scripts and the lock of the translator's fingerprints, the profile reader, the iOS compile convention, the NSO reader
-    return sorted((repo / 'dm/gfx/tools').glob('*.py')) + [repo / p for p in ('dm/gfx/tools/dmsh_chain.lock', 'dm/games/game.py', 'dm/ios/tools/ios_metal.py')]
+def tool_files(repo):   # what the shader stages run: dm/gfx/tools' scripts (and the split's C Yaz0 decoder) and the lock of the translator's fingerprints, the profile reader, the iOS compile convention, the NSO reader
+    return sorted((repo / 'dm/gfx/tools').glob('*.py')) + [repo / p for p in ('dm/gfx/tools/yaz0.c', 'dm/gfx/tools/dmsh_chain.lock', 'dm/games/game.py', 'dm/ios/tools/ios_metal.py')]
 
 
 def chain_files(repo):   # what the iOS shaders run: dmsh_build.py and every repository module it imports, at any depth (dmsh_*.py, ios_metal.py, game.py), and the translator's lock; not the split's readers (shader_split.py, unityfs.py, uepak.py)
@@ -1845,7 +1851,25 @@ def linux_shader_cache(work, host, env, logs):
     frames while its cache filled). Shaders already cached are skipped. A failure is reported and the build goes on: the game then fills the cache while it runs"""
     m = json.loads((work / 'linux_game.json').read_text())
     henv = linux_boot_env(dict(env, **m['env'])); henv['DM_VK_PRECOMPILE_ONLY'] = '1'
-    PROG.add(1); PROG.stage('Shader cache', step='compiling for this GPU')
+    PROG.add(1); PROG.stage('Shader cache', step='checking the inputs')
+    # Starting the host to find every shader cached takes about a second. The cache folder's name is the host's digest of the shaders, the driver and the settings that change the
+    # compiled code (vk_draw.c), so the stage is skipped while the host, the SPIR-V shaders, the Vulkan driver and the game's environment are unchanged and that folder still has
+    # at least the files the last run left in it (a cleared cache is filled again)
+    kf = work / 'shader_cache.key'
+    icd = [Path(f) for f in henv.get('VK_DRIVER_FILES', '').split(':') if f]
+    drivers = []
+    for f in icd:
+        try: drivers.append(json.loads(f.read_text())['ICD']['library_path'])
+        except (OSError, ValueError, KeyError): pass
+    spv = Path(henv.get('DM_VK_SPV', '')); spk = spv.with_name(spv.name + '.key')   # the SPIR-V shaders by the key linux_shaders wrote for them (a walk over ~100,000 files took 0.7 s)
+    key = fingerprint(('files', [host] + icd + [spk]) if spk.is_file() else ('files', [host] + icd), () if spk.is_file() else ('stat', spv), drivers, sorted(m['env'].items()))
+    note = reused(kf, key)
+    if note:
+        summary, _, rest = note.partition('\t'); cdir, _, n = rest.partition('\t')
+        try: have = len(os.listdir(cdir)) if cdir else -1   # a count of names, without a stat of each
+        except OSError: have = -1
+        if n.isdigit() and have >= int(n): PROG.end(f'{summary}, reused (inputs unchanged)'); return
+    PROG.set(step='compiling for this GPU')
     def line(l):
         r = re.fullmatch(r'precompile: (\d+) / (\d+)', l)
         if r: PROG.set(done=int(r[1]), total=int(r[2]))
@@ -1856,6 +1880,8 @@ def linux_shader_cache(work, host, env, logs):
     r = re.search(r'precompile done: (\d+) compiled into the cache in ([\d.]+) s \((\d+) shaders', text)
     c = re.search(r'shader binaries cached in (\S+)', text)
     freed = prune_shader_cache(Path(c[1])) if c and r else 0
+    rmtree(kf)
+    if c and r: kf.write_text(f'{key}\n{int(r[3]):,} shaders cached\t{c[1]}\t{len(os.listdir(c[1]))}\n')
     PROG.end((f'{int(r[1]):,} compiled ({int(r[3]):,} shaders) in {float(r[2]):.0f} s' if r else '') + (f'; {amount(freed, "B")} of this game\'s older caches deleted' if freed else ''))
 
 

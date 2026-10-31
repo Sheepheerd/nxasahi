@@ -16,6 +16,7 @@
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_dirty.h"
+#include "../gfx/nvn/nvn_timestamp.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include <stdatomic.h>
 
@@ -92,6 +93,44 @@ static int wait_value(uint64_t v, uint64_t timeout_ns) {
     return 1;
 }
 
+// ---- values the GPU writes ----
+// Event signals (CommandBufferSignalEvent, ReportValue) and counter reports (ReportCounter) write guest memory when the GPU reaches them; the game reads that memory itself, with no
+// host call. They are queued with the timeline value of the submission part that recorded them and written once the GPU is done with that part, in order, as nvn_mtl.m's post_run
+// does in its completion handler: by a thread that waits on the timeline, and by any host wait that sees the value first, so a sync wait returns with them written. Mario Kart 8
+// Deluxe's "Select a Mii" waited for such values to build its list: with them dropped, it stayed empty and took no input
+typedef struct { uint64_t at; int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; } gpost;   // kind 1: event (mode 1 adds), 2: counter report
+static gpost *g_gp; static size_t g_gpn, g_gpcap; static pthread_mutex_t g_gpmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gpcv = PTHREAD_COND_INITIALIZER;
+static void gp_run(uint64_t done) {   // writes everything the GPU is done with
+    pthread_mutex_lock(&g_gpmu);
+    size_t k = 0;
+    for (; k < g_gpn && g_gp[k].at <= done; k++) {
+        const gpost *o = &g_gp[k];
+        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
+        else { uint64_t t = nvn_timestamp_from_ns(guest_ns()), rec[2] = {o->type == 0 || o->type == 0x10 ? t : 0, t}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }
+    }
+    if (k) { memmove(g_gp, g_gp + k, (g_gpn - k) * sizeof *g_gp); g_gpn -= k; }
+    pthread_mutex_unlock(&g_gpmu);
+}
+static void *gp_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_gpmu);
+        while (!g_gpn) pthread_cond_wait(&g_gpcv, &g_gpmu);
+        uint64_t at = g_gp[0].at;
+        pthread_mutex_unlock(&g_gpmu);
+        if (wait_value(at, 100000000)) gp_run(done_value());   // a value not submitted yet is waited for again
+    }
+    return NULL;
+}
+static void gp_add(gpost o) {   // on the replay thread, in recording order
+    static int started; if (!started) { started = 1; pthread_t t; if (!pthread_create(&t, NULL, gp_thread, NULL)) pthread_detach(t); else LOG("[RED] vulkan replay: no thread for GPU-written values"); }
+    o.at = atomic_load(&g_fence) + 1;   // the part being recorded signals this value (sub_submit)
+    pthread_mutex_lock(&g_gpmu);
+    if (g_gpn == g_gpcap) { g_gpcap = g_gpcap ? g_gpcap * 2 : 256; g_gp = realloc(g_gp, g_gpcap * sizeof *g_gp); }
+    g_gp[g_gpn++] = o; pthread_cond_signal(&g_gpcv);
+    pthread_mutex_unlock(&g_gpmu);
+}
+
 // ---- textures ----
 static void tex_ready(VkCommandBuffer c, vtex *t);
 static VkCommandBuffer up_cb(void);
@@ -140,7 +179,10 @@ static vtex *tex_get(const tex_t *o) {
     // a 3D image that can be a render target is rendered slice by slice through 2D-array views of it (2D_ARRAY_COMPATIBLE)
     VkImageCreateFlags cf = (tg == NVN_TEXTURE_TARGET_CUBEMAP || tg == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) && layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     if (tg == NVN_TEXTURE_TARGET_3D && (use & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
-    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = cf,
+    VkFormat twin[2] = {f, vkr_srgb_twin(f)};
+    VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = 2, .pViewFormats = twin};
+    if (twin[1]) cf |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // views in the twin format (vkr_srgb_twin), each with only the usage it needs
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = twin[1] ? &fl : NULL, .flags = cf,
         .imageType = tg == NVN_TEXTURE_TARGET_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = f, .extent = {d->width ? d->width : 1, h, depth},
         .mipLevels = d->levels ? d->levels : 1, .arrayLayers = layers, .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = use, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
@@ -398,9 +440,9 @@ uint64_t mtl_sub_commit(void) {
     return v;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
-int mtl_wait(uint64_t fence, uint64_t timeout_ns) { return g_on > 0 ? wait_value(fence, timeout_ns) : 1; }
+int mtl_wait(uint64_t fence, uint64_t timeout_ns) { if (g_on <= 0) return 1; if (!wait_value(fence, timeout_ns)) return 0; gp_run(done_value()); return 1; }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
-void mtl_finish(void) { if (g_on > 0) wait_value(atomic_load(&g_fence), UINT64_MAX); }
+void mtl_finish(void) { if (g_on > 0) { wait_value(atomic_load(&g_fence), UINT64_MAX); gp_run(done_value()); } }
 void mtl_drain(void) { mtl_finish(); }
 
 // ---- the record stream ----
@@ -422,18 +464,19 @@ static VkImageSubresourceRange view_range(const vtex *t, const view_t *v, int ha
 // ---- render passes over the bound render targets (step 3.4c) ----
 // Dynamic rendering begins at the first draw after the targets were set, and ends before anything that cannot be inside it (a clear, a target change, a barrier, the
 // submission's end), each end followed by a full barrier so the next pass or a sampling sees what was drawn
-static int g_rp_on, g_rp_ncolor, g_rp_samples; static uint32_t g_rp_w, g_rp_h; static uint64_t g_passes; static uint64_t g_ub_updates; static int g_passlog; static uint64_t g_pass0; static long g_passstop;
-static VkImageView att_view_n(vtex *t, uint32_t level, uint32_t layer, uint32_t n, VkImageAspectFlags asp) {   // under g_tmu; n layers (a 3D image's depth slices)
-    uint32_t key = 0x80000000u | (level & 0xff) | (layer & 0xfff) << 8 | (n & 0x7ff) << 20;
+static int g_rp_on, g_rp_ncolor, g_rp_samples; static uint32_t g_rp_w, g_rp_h, g_rp_layers; static uint64_t g_passes; static uint64_t g_ub_updates; static int g_passlog; static uint64_t g_pass0; static long g_passstop;
+static VkImageView att_view_n(vtex *t, uint32_t level, uint32_t layer, uint32_t n, VkImageAspectFlags asp, int twin) {   // under g_tmu; n layers (a 3D image's depth slices); twin: in vkr_srgb_twin's format
+    uint64_t key = 0x80000000u | (level & 0xff) | (layer & 0xfff) << 8 | (n & 0x7ff) << 20 | (uint64_t)(twin != 0) << 32;
     for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
     if (t->d > 1 && !(t->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return VK_NULL_HANDLE;
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = n > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = t->fmt,
-        .subresourceRange = {asp, level, 1, layer, n}};   // of a 3D image (2D_ARRAY_COMPATIBLE), the layers are depth slices of the level
+    VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = twin ? &vu : NULL, .image = t->img, .viewType = n > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+        .format = twin ? vkr_srgb_twin(t->fmt) : t->fmt, .subresourceRange = {asp, level, 1, layer, n}};   // of a 3D image (2D_ARRAY_COMPATIBLE), the layers are depth slices of the level
     vkview *v = calloc(1, sizeof *v); v->key = key;
     if (vkCreateImageView(g_vkd.dev, &vi, NULL, &v->view)) { free(v); return VK_NULL_HANDLE; }
     v->next = t->views; t->views = v; return v->view;
 }
-static VkImageView att_view(vtex *t, uint32_t level, uint32_t layer, VkImageAspectFlags asp) { return att_view_n(t, level, layer, 1, asp); }
+static VkImageView att_view(vtex *t, uint32_t level, uint32_t layer, VkImageAspectFlags asp) { return att_view_n(t, level, layer, 1, asp, 0); }
 // ---- uniform updates inside a render pass (UpdateUniformBuffer) ----
 // vkCmdUpdateBuffer cannot run inside a render pass, so each update used to end the pass, and Unity updates a uniform buffer before nearly every draw: Pokemon Shining
 // Pearl's town drew 531 draws in 506 passes, each loading and storing its 4x 1280x720 targets on this tiled GPU (55 ms of GPU a frame). As the Mac replay (nvn_mtl.m, ubd):
@@ -506,8 +549,29 @@ static int rt_same(const p_set_rt *s) {   // s binds exactly the targets of the 
     const tex_t *a = s->depth, *b = g_rt_depth;
     return !a == !b && (!a || a->serial == b->serial) && s->has_dview == g_rt_has_dview && (!s->has_dview || !memcmp(&s->dview, &g_rt_dview, sizeof s->dview));
 }
+// The colour slots to leave unattached for the draw about to be made: a slot whose texture, level and layer repeat an earlier slot, and of which the channel mask writes
+// nothing. On the Switch two slots on one texture do not interfere (the ROP writes only the masked channels); on this tiled GPU each attachment is stored back whole at the
+// end of the pass, so an unwritten duplicate (loaded, never written) overwrites what the other slot wrote. Breath of the Wild's G-buffer passes attach the albedo and another
+// buffer twice each (c1 = c2, c3 = c4), the second at mask 0: attached, Link and the shrine came out flat and dark. A written duplicate stays attached: dropping every one
+// took the blue out of Mario Kart 8 Deluxe's race picture. The set is part of the pass: a draw that needs another set ends the pass (vk_replay's OP_DRAW), as nvn_mtl.m's
+// rt_dup_slot leaves such slots out of its passes
+static uint32_t g_rp_drop;
+static uint32_t rp_drop_set(void) {
+    uint32_t m = vkx_chmask(), drop = 0;
+    for (int i = 1; i < g_rt_n && i < 8; i++) {
+        if (!g_rt[i] || (m >> (4 * i) & 0xf)) continue;
+        uint32_t li = g_rt_has_view[i] && g_rt_view[i].set_levels ? g_rt_view[i].base_level : 0, yi = g_rt_has_view[i] && g_rt_view[i].set_layers ? g_rt_view[i].min_layer : 0;
+        for (int j = 0; j < i; j++) {
+            if (!g_rt[j] || g_rt[j]->serial != g_rt[i]->serial) continue;
+            uint32_t lj = g_rt_has_view[j] && g_rt_view[j].set_levels ? g_rt_view[j].base_level : 0, yj = g_rt_has_view[j] && g_rt_view[j].set_layers ? g_rt_view[j].min_layer : 0;
+            if (lj == li && yj == yi) { drop |= 1u << i; break; }
+        }
+    }
+    return drop;
+}
 static int rp_begin(VkCommandBuffer c) {
     if (g_rp_on) return 1;
+    g_rp_drop = rp_drop_set();
     VkRenderingAttachmentInfo ca[8], da, sa; int nc = 0, have = 0, have_c = 0, samples = 1; uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1;
     memset(ca, 0, sizeof ca); memset(&da, 0, sizeof da); memset(&sa, 0, sizeof sa);
     pthread_mutex_lock(&g_tmu);
@@ -517,11 +581,12 @@ static int rp_begin(VkCommandBuffer c) {
         vtex *t = g_rt[i] ? tex_get(g_rt[i]) : NULL;
         if (!t || !(t->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) continue;
         VkImageSubresourceRange r = view_range(t, &g_rt_view[i], g_rt_has_view[i], VK_IMAGE_ASPECT_COLOR_BIT);
+        if (g_rp_drop >> i & 1) continue;   // a duplicate slot this draw does not write (rp_drop_set)
         if (t->d > 1) {   // a 3D target: the view's slices (all of the level's without one), drawn as layers (the shaders' layer output picks the slice)
             uint32_t dl = t->d >> r.baseMipLevel ? t->d >> r.baseMipLevel : 1, z0 = 0, nz = dl;
             if (g_rt_has_view[i] && g_rt_view[i].set_layers) { z0 = g_rt_view[i].min_layer < dl ? g_rt_view[i].min_layer : dl - 1; nz = g_rt_view[i].nlayers ? g_rt_view[i].nlayers : 1; if (z0 + nz > dl) nz = dl - z0; }
-            ca[i].imageView = att_view_n(t, r.baseMipLevel, z0, nz, VK_IMAGE_ASPECT_COLOR_BIT); if (nz > layers) layers = nz;
-        } else ca[i].imageView = att_view(t, r.baseMipLevel, r.baseArrayLayer, VK_IMAGE_ASPECT_COLOR_BIT);
+            ca[i].imageView = att_view_n(t, r.baseMipLevel, z0, nz, VK_IMAGE_ASPECT_COLOR_BIT, vkr_view_twin(t->fmt, &g_rt_view[i], g_rt_has_view[i])); if (nz > layers) layers = nz;
+        } else ca[i].imageView = att_view_n(t, r.baseMipLevel, r.baseArrayLayer, 1, VK_IMAGE_ASPECT_COLOR_BIT, vkr_view_twin(t->fmt, &g_rt_view[i], g_rt_has_view[i]));
         if (!ca[i].imageView) continue;
         t->gpu_owned = 1; have = have_c = 1; samples = (int)t->samples;
         uint32_t lw = t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, lh = t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1;
@@ -548,11 +613,45 @@ static int rp_begin(VkCommandBuffer c) {
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = layers, .colorAttachmentCount = (uint32_t)nc, .pColorAttachments = ca,
         .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     vkCmdBeginRendering(c, &ri);
-    g_rp_on = 1; g_rp_ncolor = nc; g_rp_w = w; g_rp_h = h; g_rp_samples = samples; g_passes++;
-    if (g_passlog) LOG("[pass] %llu: %ux%u, %d colour (first serial %llu), depth %s", (unsigned long long)g_passes, w, h, nc, g_rt[0] ? (unsigned long long)g_rt[0]->serial : 0ull, has_d || has_s ? "yes" : "no");
+    g_rp_on = 1; g_rp_ncolor = nc; g_rp_w = w; g_rp_h = h; g_rp_layers = layers; g_rp_samples = samples; g_passes++;
+    if (g_passlog) {   // each colour slot: the texture's serial, '-' when the slot is empty, '!' after it when no view could be attached
+        char sl[256]; int o = 0; for (int i = 0; i < nc && o < (int)sizeof sl - 24; i++) o += snprintf(sl + o, sizeof sl - o, " %d:%s%llu%s", i, g_rt[i] ? "" : "-", g_rt[i] ? (unsigned long long)g_rt[i]->serial : 0ull, g_rt[i] && !ca[i].imageView ? "!" : "");
+        LOG("[pass] %llu: %ux%u, %d colour (first serial %llu), depth %s; slots%s", (unsigned long long)g_passes, w, h, nc, g_rt[0] ? (unsigned long long)g_rt[0]->serial : 0ull, has_d || has_s ? "yes" : "no", sl);
+    }
+    return 1;
+}
+// NVN's clears are limited to the scissor rectangle, as the Mac's are (nvn_mtl.m's scissored clears); a whole-image clear would also wipe what a game drew outside it.
+// A clear whose scissor leaves part of the level (w x h) uncovered runs inside the render pass with vkCmdClearAttachments over that rectangle: 1 = cleared there or nothing
+// to clear (empty), 0 = clear the whole image
+static int scissored(uint32_t w, uint32_t h, VkRect2D *rc) {
+    int sc[4]; if (!vkx_scissor_get(sc)) return 0;
+    int64_t x0 = sc[0] < 0 ? 0 : sc[0], y0 = sc[1] < 0 ? 0 : sc[1], x1 = (int64_t)sc[0] + sc[2], y1 = (int64_t)sc[1] + sc[3];
+    if (x1 > (int64_t)w) x1 = w; if (y1 > (int64_t)h) y1 = h;
+    if (x0 == 0 && y0 == 0 && x1 >= (int64_t)w && y1 >= (int64_t)h) return 0;   // covers the whole level
+    *rc = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {x1 > x0 ? (uint32_t)(x1 - x0) : 0, y1 > y0 ? (uint32_t)(y1 - y0) : 0}};
+    return 1;
+}
+static int clear_in_pass(VkCommandBuffer c, VkImageAspectFlags asp, uint32_t att, const VkClearValue *v, VkRect2D rc) {   // 1 = done
+    if (!rc.extent.width || !rc.extent.height) return 1;
+    if (!rp_begin(c)) return 0;
+    if (rc.offset.x + rc.extent.width > g_rp_w) rc.extent.width = (uint32_t)rc.offset.x < g_rp_w ? g_rp_w - (uint32_t)rc.offset.x : 0;
+    if (rc.offset.y + rc.extent.height > g_rp_h) rc.extent.height = (uint32_t)rc.offset.y < g_rp_h ? g_rp_h - (uint32_t)rc.offset.y : 0;
+    if (!rc.extent.width || !rc.extent.height) return 1;
+    VkClearAttachment ca = {.aspectMask = asp, .colorAttachment = att, .clearValue = *v};
+    VkClearRect cr = {rc, 0, g_rp_layers ? g_rp_layers : 1};
+    vkCmdClearAttachments(c, 1, &ca, 1, &cr); g_clears++;
     return 1;
 }
 static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
+    if (p->index >= 0 && p->index < g_rt_n && g_rt[p->index]) {
+        pthread_mutex_lock(&g_tmu); vtex *t = tex_get(g_rt[p->index]); VkImageSubresourceRange r = {0};
+        if (t) r = view_range(t, &g_rt_view[p->index], g_rt_has_view[p->index], VK_IMAGE_ASPECT_COLOR_BIT);
+        pthread_mutex_unlock(&g_tmu);
+        VkRect2D rc; VkClearValue v; memcpy(v.color.float32, p->rgba, sizeof v.color.float32);
+        if (t && (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && (t->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+            && scissored(t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1, &rc)
+            && clear_in_pass(c, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)p->index, &v, rc)) return;
+    }
     rp_end(c);
     if (p->index < 0 || p->index >= g_rt_n || !g_rt[p->index]) return;
     pthread_mutex_lock(&g_tmu);
@@ -571,8 +670,20 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
     pthread_mutex_unlock(&g_tmu);
 }
 static void op_clear_ds(VkCommandBuffer c, const p_clear_ds *p) {
+    if (!g_rt_depth) { rp_end(c); return; }
+    {   // a scissored clear (see scissored)
+        pthread_mutex_lock(&g_tmu); vtex *t = tex_get(g_rt_depth); VkImageSubresourceRange r = {0};
+        if (t) r = view_range(t, &g_rt_dview, g_rt_has_dview, t->aspect);
+        pthread_mutex_unlock(&g_tmu);
+        VkImageAspectFlags asp = 0;
+        if (t && (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && p->depth_mask) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        if (t && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && p->stencil_mask) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        VkRect2D rc; VkClearValue v = {.depthStencil = {p->depth < 0 ? 0 : p->depth > 1 ? 1 : p->depth, (uint32_t)p->stencil}};
+        if (t && asp && !(t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && (t->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+            && scissored(t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1, &rc)
+            && clear_in_pass(c, asp, 0, &v, rc)) return;
+    }
     rp_end(c);
-    if (!g_rt_depth) return;
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt_depth);
     if (g_passlog) LOG("[pass] clear depth %g (mask %d) stencil %d (mask %#x) serial %llu%s", p->depth, p->depth_mask, p->stencil, p->stencil_mask, t ? (unsigned long long)t->serial : 0ull, t ? "" : ": no image");
@@ -719,6 +830,7 @@ void mtl_exec(const uint8_t *handle) {
         case OP_BIND_SSBO: vkx_bind_buf(1, a); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: vkx_set_pool(h.op == OP_SET_TEX_POOL, nvn_dpool_base(((const p_set_pool *)a)->pool, h.op == OP_SET_TEX_POOL)); break;
         case OP_DRAW: case OP_DRAW_IDX: if (g_passlog && g_passstop && g_passes - g_pass0 > (uint64_t)g_passstop) break;   // DM_VK_PASSSTOP: the traced frame's later passes draw nothing
+            if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
             if (rp_begin(c)) vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples); g_flush_draws++; break;
         case OP_BARRIER: rp_end(c); full_barrier(c); break;
         case OP_COPY_T2T: op_copy_t2t(c, a); break;
@@ -758,11 +870,25 @@ void mtl_exec(const uint8_t *handle) {
         case OP_STENCIL: vkx_stencil(a); break;
         case OP_POLY_OFFSET: vkx_poly_offset(a); break;
         case OP_BLEND_COLOR: vkx_blend_color(a); break;
+        case OP_RAST_DISCARD: vkx_rast_discard(((const p_rast_discard *)a)->on); break;
         case OP_DEPTH_CLAMP: vkx_depth_clamp(((const p_depth_clamp *)a)->on); break;
         case OP_PRIM_RESTART: vkx_prim_restart((int)((const p_prim_restart *)a)->on); break;
         case OP_BIND_VATTR: vkx_vattr(a); break;
         case OP_BIND_VSTREAM: vkx_vstream(a); break;
         case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tv; vkx_vbuf(vbuf_rec(h.op, a, &tv)); break; }
+        case OP_SIGNAL_EVENT: { gpost o = {.kind = 1}; memcpy(&o.val, a, 8); memcpy(&o.mode, (const uint8_t *)a + 8, 4); memcpy(&o.v, (const uint8_t *)a + 12, 4); gp_add(o); break; }
+        case OP_REPORT_COUNTER: { gpost o = {.kind = 2}; memcpy(&o.type, a, 8); memcpy(&o.addr, (const uint8_t *)a + 8, 8);
+            // samples passed is counted by occlusion queries the replay does not make yet: left unwritten, as before
+            if (o.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { static int w; if (!w++) LOG("[RED] vulkan replay: samples-passed counter reports are not written (no occlusion queries)"); break; }
+            gp_add(o); break; }
+        case OP_FENCE_SYNC: { sync_t *sy; memcpy(&sy, a, 8); sy->fence = atomic_load(&g_fence) + 1; sy->fenced = 1; break; }   // done when the part being recorded is
+        case OP_CLEAR_BUF: {   // ClearBuffer: the range filled with a 32-bit value on the GPU
+            const p_clear_buf *cb = a; VkBuffer db; VkDeviceSize dof; VkDeviceAddress g;
+            if (cb->size && !(cb->size & 3) && vkm_lookup((const void *)(uintptr_t)cb->addr, cb->size, &db, &dof, &g)) {
+                rp_end(c); vkCmdFillBuffer(c, db, dof, cb->size, cb->value); full_barrier(c);
+            } else { static int w; if (!w++) LOG("[RED] vulkan replay: buffer clear of %llu bytes at %#llx not made (not 4-aligned or not in GPU-visible memory)", (unsigned long long)cb->size, (unsigned long long)cb->addr); }
+            break;
+        }
         default: break;   // counted only, for now
         }
         if (h.size < 8) { LOG("[RED] vulkan replay: record of op %u with size %u: the stream is broken", h.op, h.size); return; }

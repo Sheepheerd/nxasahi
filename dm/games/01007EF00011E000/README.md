@@ -186,6 +186,7 @@ Before publishing, the fixes were integrated with main's pipeline archive and GP
 
 General host changes first needed here; each applies to every game:
 
+- **Resolved: on Linux the 3D scene was flat and dark** (1.9.0, the Shrine of Resurrection): the G-buffer attaches the albedo twice and the Linux replay stored the unwritten copy over it: [Linux: the same texture attached at two colour slots](../../../docs/reference/rendering.md#linux-the-same-texture-attached-at-two-colour-slots).
 - **Shared performance work, checked independently of prewarm data:** [CPU deswizzle copies use slice and row offsets](../../../docs/reference/nvn-objects.md#cpu-deswizzle-copies-use-slice-and-row-offsets) and [Host symbol indexes avoid repeated name scans](../../../docs/reference/services.md#host-symbol-indexes-avoid-repeated-name-scans). [PR #261](https://github.com/seedds/nxnative/pull/261) reports M2 iPad Pro gameplay on update 1.9.0; local verification covers synthetic correctness and CPU microbenchmarks, without a new game/device run.
 - **Final #158/#213 gameplay validation:** [Current results](#final-synchronization-and-pass-validation-2026-10-26-current) distinguish the retained pass savings from the timing gains not demonstrated on this Mac.
 

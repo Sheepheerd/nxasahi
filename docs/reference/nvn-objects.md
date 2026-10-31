@@ -163,6 +163,13 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** a record (`OP_FENCE_SYNC`) fences the sync at replay with the fence value of the submission segment being encoded, so it signals once everything before it has completed (the replay fences the sync with the submission that reaches it).
 - **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11; one boot); [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (new with Unreal).
 
+### Linux: values the GPU writes were dropped
+
+- **Symptom:** on Linux only, a screen that waits on the GPU never finishes and takes no input, with no `[RED]` line and no host call while it is open: Mario Kart 8 Deluxe's "Select a Mii" showed 18 empty slots and page dots, with a different page lit each run.
+- **Cause:** the Linux replay (`mtl_exec` in `dm/host/linux/vk_replay.c`) only counted `OP_SIGNAL_EVENT` (`SignalEvent`, `ReportValue`), `OP_REPORT_COUNTER`, `OP_FENCE_SYNC` and `OP_CLEAR_BUF`, so event values and counter reports never reached guest memory, a sync fenced in a command buffer was never fenced, and cleared buffers kept their bytes. The Mac writes them in its completion handler (`post_run` in `nvn_mtl.m`).
+- **Fix:** events and counter reports are queued with the timeline value of the submission part that recorded them and written once the GPU is done with it, in order: by a thread that waits on the timeline semaphore, and by `mtl_wait` / `mtl_finish` when they see the value first, so a sync wait returns with them written. A timestamp report writes the guest clock at completion in 19.2 MHz ticks, as on the Mac (one time per write, not the GPU's own). `OP_FENCE_SYNC` takes the timeline value of the part being recorded; `OP_CLEAR_BUF` is a `vkCmdFillBuffer`. Samples-passed reports stay unwritten (open: the replay makes no occlusion queries yet; logged red once).
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) 3.0.5 and 4.0.0 on Linux; on the Mac the same pick worked.
+
 ### Submissions from two queues on two threads
 
 - **Symptom:** `FATAL submit re-entered` in the first frames.

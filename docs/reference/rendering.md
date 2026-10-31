@@ -347,6 +347,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** the depth's sample count is taken whenever no colour target is actually bound.
 - **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (the Undead Asylum cell: a depth pre-pass over the 4x scene target, then the materials).
 - **Check:** `DM_VK_SKIPSH=<shader key>[,…]` (`vk_draw.c`) leaves out the draws of those vertex or pixel shaders: skipping the pass's materials turned the whole scene that flat colour, and the resolved target after the material pass (`DM_VK_PASSSTOP`, `DM_VK_RTFLOAT`) already held it. Ruled out on the way: deferred uniform updates (`DM_VK_UB_DEFER=0`), face culling (`DM_VK_NOCULL`), fused multiply-adds in the vertex shaders (`NoContraction` changed nothing) and a small depth bias.
+### Linux: the same texture attached at two colour slots
+
+- **Symptom:** on Linux, the 3D scene drawn as flat, dark silhouettes with no surface colour or texture (Link and the Shrine of Resurrection at the start of Breath of the Wild); the HUD and the light shafts are fine; no `[RED]` line. The G-buffer's albedo target holds only its clear value.
+- **Cause:** as on the Mac ([The same texture attached at two colour slots](#the-same-texture-attached-at-two-colour-slots)): the G-buffer passes attach the albedo and another buffer twice each (c1 = c2, c3 = c4), the second at write mask 0, and on the M1's tiled GPU each attachment is stored back whole at the end of the pass, so the unwritten duplicate overwrote the written one. `rp_begin` (`dm/host/linux/vk_replay.c`) never had the Mac's fix.
+- **Fix:** a colour slot whose texture, level and layer repeat an earlier slot, and of which the current channel mask writes nothing, is left unattached (no view, so Vulkan drops nothing it needed), as `rt_dup_slot` does on the Mac (`rp_drop_set` in `vk_replay.c`). The set is part of the render pass: a draw that needs another set ends the pass first. A duplicate that is written stays attached: dropping every duplicate took the blue out of [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md)'s whole race picture.
+- **Check:** `DM_VK_PASSLOG=<present>` now lists each pass's colour slots (`slots 0:<serial> 1:<serial> …`, `!` for one not attached); `DM_VK_RTDUMP` images keep the targets' alpha, so a target with alpha 0 shows as white in an image viewer: measure the channels before reading it as white.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) 1.9.0 on Linux, the opening in the Shrine of Resurrection.
+
 ## Blend, depth and stencil
 
 ### No writes to colour outputs the shader does not write

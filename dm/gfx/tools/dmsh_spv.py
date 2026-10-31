@@ -189,9 +189,12 @@ def vk_canon(key):
         main = next((e for e in es if not e['name'].endswith('Smplr')), es[0])
         smp = next((e for e in es if e['name'].endswith('Smplr')), None)
         cb = canon_binding(main, seq)
-        if cb in used: raise ValueError(f'bindings {used[cb]} and {b} both map to canonical binding {cb} ({main["kind"]} reg {main.get("reg")})')
-        used[cb] = b; remap[b] = cb
         desc = {'uniform': 'u', 'storage': 's', 'texture': 't', 'image': 'i', 'texel_buffer': 'b', 'sampler': 'p'}.get(main['vk'], '?')
+        # A second variable on a slot that already has one (a texture register sampled through two samplers or image types, e.g. plain and depth compare) gets a binding
+        # of its own from 600 on, 32 per descriptor type so the host's union layout keeps one type per binding; its row names the same slot, so the host binds the same
+        # resource there. These shaders used to be dropped whole: 3,174 of Breath of the Wild's, 4,501 of Mario Kart 8 Deluxe's
+        if cb in used: cb = seq('dup' + desc, 600 + 32 * 'ustibp?'.index(desc), 32)
+        used[cb] = b; remap[b] = cb
         dim, arr, ms, dep, cnt = info.get(b, (0, 0, 0, 0, 1))
         sreg = smp.get('reg') if smp else ''
         rows.append('\t'.join(str(x) for x in (cb, desc, main['kind'], '' if main.get('reg') is None else main['reg'], main.get('off', '') if main.get('off') is not None else '',
@@ -215,7 +218,7 @@ except Translated: pass
 import collections as _c
 _kinds, _noreg = _c.Counter(), 0
 for f in sorted(os.listdir(OUT)):
-    if not f.endswith('.spv') or '.reader.' in f: continue
+    if not f.endswith('.spv') or '.reader.' in f or f.endswith('.vk.spv'): continue   # <key>.vk.spv is vk_canon's output from an earlier run, not a shader
     try:
         bs = vk_reflect(f[:-4])
         vk_canon(f[:-4])

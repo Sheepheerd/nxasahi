@@ -349,13 +349,14 @@ static VkImageView view_get(vtex *t, const vkbind *b, const tex_t *o, const view
                        : b->arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     if ((vt == VK_IMAGE_VIEW_TYPE_3D) != (t->d > 1)) return VK_NULL_HANDLE;   // the image is not of this kind
     if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && t->layers % 6) return VK_NULL_HANDLE;
-    VkComponentMapping sw = tex_swizzle(o, ov, has_v);
-    uint32_t key = (uint32_t)vt | (uint32_t)sw.r << 4 | (uint32_t)sw.g << 8 | (uint32_t)sw.b << 12 | (uint32_t)sw.a << 16;   // the view type and the components (below 0x80000000: attachment views)
+    VkComponentMapping sw = tex_swizzle(o, ov, has_v); int twin = vkr_view_twin(t->fmt, ov, has_v);
+    uint64_t key = (uint32_t)vt | (uint32_t)sw.r << 4 | (uint32_t)sw.g << 8 | (uint32_t)sw.b << 12 | (uint32_t)sw.a << 16 | (uint64_t)twin << 32;   // the view type, the components and the twin format (below 0x80000000: attachment views)
     for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
     VkImageAspectFlags asp = t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : t->aspect;   // a depth-stencil image samples its depth
     uint32_t layers = vt == VK_IMAGE_VIEW_TYPE_2D || vt == VK_IMAGE_VIEW_TYPE_3D ? 1 : vt == VK_IMAGE_VIEW_TYPE_CUBE ? 6 : vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY ? t->layers - t->layers % 6 : t->layers;
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = vt, .format = t->fmt, .components = sw,
-        .subresourceRange = {asp, 0, t->levels, 0, layers}};
+    VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = twin ? &vu : NULL, .image = t->img, .viewType = vt, .format = twin ? vkr_srgb_twin(t->fmt) : t->fmt,
+        .components = sw, .subresourceRange = {asp, 0, t->levels, 0, layers}};
     vkview *v = calloc(1, sizeof *v); v->key = key;
     if (vkCreateImageView(g_vkd.dev, &vi, NULL, &v->view)) { free(v); return VK_NULL_HANDLE; }
     v->next = t->views; t->views = v;
@@ -437,7 +438,7 @@ static VkImageView image_view(vtex *t, const vkbind *b) {
     if (!(t->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return VK_NULL_HANDLE;
     VkImageViewType vt = b->dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : (b->arr || b->dim == 4) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;   // a cube is written as its 6 layers
     if ((vt == VK_IMAGE_VIEW_TYPE_3D) != (t->d > 1)) return VK_NULL_HANDLE;
-    uint32_t key = 0x40000000u | (uint32_t)vt;
+    uint64_t key = 0x40000000u | (uint32_t)vt;
     for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = vt, .format = t->fmt,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, vt == VK_IMAGE_VIEW_TYPE_2D || vt == VK_IMAGE_VIEW_TYPE_3D ? 1 : t->layers}};
@@ -698,7 +699,7 @@ static struct {
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     float vp[16][6]; int nvp; float dn, df; int has_dr; int sc[4], has_sc;
     int st_vmask[2], st_wmask[2], st_ref[2];
-    float pof, pou, poc; float bc[4]; int clamp, restart;
+    float pof, pou, poc; float bc[4]; int clamp, restart, discard;
     va_st attr[16]; vs_st stream[16]; NVNbufferRange vbuf[16];
     int origin_ll, depth_zero;
 } D = {.df = 1, .chmask = {0xffffffff}, .poly = {.cull = 0, .front = 1, .mode = 2}, .st_vmask = {0xff, 0xff}, .st_wmask = {0xff, 0xff}};
@@ -729,6 +730,7 @@ void vkx_bind_state(const p_bind_state *s) {
 }
 void vkx_viewports(const p_viewports *v) { for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(D.vp[v->first + i], v->v[i], sizeof D.vp[0]); if (v->first + v->n > D.nvp) D.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; }
 int vkx_scissor_get(int r[4]) { memcpy(r, D.sc, sizeof D.sc); return D.has_sc; }   // the scissor rectangle, and whether one was set
+uint32_t vkx_chmask(void) { return D.chmask.mask; }
 void vkx_scissor(const p_scissor *s) { D.sc[0] = s->x; D.sc[1] = s->y; D.sc[2] = s->w; D.sc[3] = s->h; D.has_sc = 1; }
 void vkx_depth_range(const p_depth_range *r) { D.dn = r->n; D.df = r->f; D.has_dr = 1; }
 void vkx_stencil(const p_stencil *s) {
@@ -737,6 +739,9 @@ void vkx_stencil(const p_stencil *s) {
 void vkx_poly_offset(const p_poly_offset *p) { D.pof = p->factor; D.pou = p->units; D.poc = p->clamp; }
 void vkx_blend_color(const p_blend_color *b) { memcpy(D.bc, b->rgba, sizeof D.bc); }
 void vkx_depth_clamp(int on) { D.clamp = on; }
+// SetRasterizerDiscard: draws made while it is on rasterize nothing. Their only output on hardware is transform feedback, which this backend does not capture, so they are skipped,
+// as nvn_mtl.m does without a capture. Drawn, Mario Kart 8 Deluxe's discarded geometry showed in its race scene as a dark box around the player's kart
+void vkx_rast_discard(int on) { D.discard = on; }
 void vkx_prim_restart(int on) { D.restart = on; }
 void vkx_vattr(const p_bind_vattr *a) { for (int i = 0; i < a->n && a->first + i < 16; i++) memcpy(&D.attr[a->first + i], &a->st[i], sizeof(va_st)); }
 void vkx_vstream(const p_bind_vstream *s) { for (int i = 0; i < s->n && s->first + i < 16; i++) D.stream[s->first + i] = s->st[i]; }
@@ -889,7 +894,7 @@ static int set_vertex(VkCommandBuffer c) {
 static int lookup_buf(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) { VkDeviceAddress g; return addr && vkm_lookup((const void *)(uintptr_t)addr, len ? len : 1, b, o, &g); }
 // A draw record (OP_DRAW / OP_DRAW_IDX), inside the render pass; ncolor, rt_w, rt_h, samples: the pass's colour attachments, size and sample count
 void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int ncolor, uint32_t rt_w, uint32_t rt_h, int samples) {
-    if (!draw_init()) return;
+    if (D.discard || !draw_init()) return;
     dyn_init();
     p_draw td; p_draw_idx ti; int ok;
     const p_draw *d = op == OP_DRAW ? draw_rec(a, size, &td) : NULL;

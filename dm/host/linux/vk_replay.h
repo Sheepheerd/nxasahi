@@ -3,7 +3,24 @@
 #include "../gfx/nvn/nvn_obj.h"
 #include <pthread.h>
 #include <vulkan/vulkan.h>
-typedef struct vkview { uint32_t key; VkImageView view; struct vkview *next; } vkview;   // views of an image, by vkr_view's key
+#include "vk_fmt.h"
+// The sRGB / linear twin of an 8-bit RGBA or BGRA format (UNDEFINED for any other). Images of these formats are made mutable with both in their format list, so a texture view
+// of the other one (TextureViewSetFormat) is honoured: Breath of the Wild writes and reads its picture through sRGB views of RGBA8 textures, and the views in the image's own
+// format skipped the sRGB encoding, so the whole picture came out too dark (the Mac's "Render-target views that change the format")
+static inline VkFormat vkr_srgb_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// 1 when a view of the image is to be made in the twin format: the view sets a format, and it is the twin of the image's
+static inline int vkr_view_twin(VkFormat img_fmt, const view_t *v, int has_v) {
+    if (!has_v || !v->set_format) return 0;
+    VkFormat t = vkr_srgb_twin(img_fmt);
+    return t != VK_FORMAT_UNDEFINED && vkf_from_nvn(v->format, NULL, NULL) == t;
+}
+typedef struct vkview { uint64_t key; VkImageView view; struct vkview *next; } vkview;   // views of an image, by vkr_view's key (bit 32: in the sRGB / linear twin format)
 typedef struct vtex {
     uint64_t serial; struct vtex *next;
     VkImage img; VkDeviceMemory mem; VkFormat fmt; VkImageAspectFlags aspect;

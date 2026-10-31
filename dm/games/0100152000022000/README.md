@@ -57,6 +57,7 @@ The game builds Mii heads from the console's MiiModel system data, starting at b
 
 ## Found on this game
 
+- **Resolved: "Select a Mii" was empty and took no input on Linux** (3.0.5 and 4.0.0): the Linux replay dropped the values the GPU writes. [Linux: values the GPU writes were dropped](../../../docs/reference/nvn-objects.md#linux-values-the-gpu-writes-were-dropped). With them written, the list shows "Create a Mii" and the six default Miis (bodies and colours, no heads), and Right, A takes the first default Mii to the main menu.
 - **Save-write failure isolation (resolved; host regression):** the separate device and account saves make this game a relevant two-save case. Failure state, recovery and commit synchronization now belong to each backing transaction: [Save-write failures stay with their backing transaction](../../../docs/reference/services.md#save-write-failures-stay-with-their-backing-transaction).
 
 - **1.0.0 is a 32-bit program (current):** the base game (v0) is AArch32 (`main.npdm` 64-bit flag clear), which Apple silicon cannot run; only a 64-bit update can be packed (the profile's is 4.0.0). Packing v0 alone used to crash the NSP script with `KeyError: 6`; it now stops with a clear message: [A 32-bit build crashes the build with `KeyError: 6`](../../../docs/reference/packing.md#a-32-bit-build-crashes-the-build-with-keyerror-6).

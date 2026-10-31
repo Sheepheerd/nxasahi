@@ -1543,8 +1543,39 @@ def ue_inline_shaders(d, label, out):
             except Exception: continue
             if len(s) == raw and s[:4] == b'LSLG': take(s, j); break
 
+_yaz0c = None
+def yaz0_native():
+    """yaz0.c's decoder, built once into the user's cache (keyed by the source's hash) with the system C compiler ($CC, else cc); None when it cannot be built or loaded.
+    main() calls it before the worker processes start, so they find the library built"""
+    global _yaz0c
+    if _yaz0c is None:
+        _yaz0c = False
+        import ctypes
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaz0.c')
+        try:
+            h = hashlib.sha256(open(src, 'rb').read()).hexdigest()[:16]
+            d = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'nxasahi')
+            lib = os.path.join(d, f'yaz0-{h}' + ('.dylib' if sys.platform == 'darwin' else '.so'))
+            if not os.path.exists(lib):
+                os.makedirs(d, exist_ok=True); tmp = f'{lib}.{os.getpid()}'
+                subprocess.run([os.environ.get('CC') or 'cc', '-O2', '-shared', '-fPIC', '-o', tmp, src], check=True, capture_output=True); os.replace(tmp, lib)
+            f = ctypes.CDLL(lib).yaz0_decode; f.restype = ctypes.c_int; f.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+            _yaz0c = f
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f'[RED] the C Yaz0 decoder could not be built ({e}): the pure-Python one is used, many times slower', flush=True)
+    return _yaz0c or None
+
 def yaz0(s):
-    """Yaz0 decompression (Super Mario 3D World + Bowser's Fury: almost all of RomFS is .szs = SARC wrapped in Yaz0). Pure Python runs at about 20–45 MB/s per core, under a minute for the whole 4.7 GB RomFS in parallel, and needs no extra dependency.
+    """Yaz0 decompression: yaz0.c's when it is built (yaz0_native), else yaz0_py; the C decoder hands malformed input to yaz0_py, whose error is the one raised"""
+    f = yaz0_native()
+    if f:
+        import ctypes
+        n = int.from_bytes(s[4:8], 'big'); out = ctypes.create_string_buffer(n or 1)
+        if not f(bytes(s), len(s), out, n): return out.raw[:n]
+    return yaz0_py(s)
+
+def yaz0_py(s):
+    """The Python Yaz0 decoder (Super Mario 3D World + Bowser's Fury: almost all of RomFS is .szs = SARC wrapped in Yaz0): about 5 MB/s per core on an M1 under Linux, the fallback when yaz0.c cannot be built.
     Group header bits: 1 = one literal byte; 0 = back-reference, 2 bytes {length high nibble, 12-bit distance} (distance + 1); length 0 reads one more byte + 0x12, else + 2. Overlapping copies are expanded by their period"""
     n = int.from_bytes(s[4:8], 'big'); out = bytearray(); si = 16
     while len(out) < n:
@@ -1949,6 +1980,7 @@ def main():
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
     J = int(os.environ.get('J', '8'))
+    yaz0_native()   # built here, once, before the workers each look for it
     big = [j for p, r in files for j in (linkdata_jobs(p, r) or [])]   # Three Houses' 6.9 GB DATA1.bin: one job per range of entries, not one read of the whole file
     pak_jobs, paks = kpka_jobs(files)   # Monster Hunter Rise's PAKs: the newest copy of each path, in ranges of entries
     tr_jobs, trp = trpfs_jobs(files)   # Pokémon Legends: Z-A's Trinity packs (data.trpfs and its index data.trpfd), decoded by the game's own Oodle in the Mac host
