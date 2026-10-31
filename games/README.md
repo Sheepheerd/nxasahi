@@ -7,7 +7,8 @@ The twenty best-selling Nintendo Switch games, by Nintendo's worldwide sales as 
 <td align="center" valign="top" width="25%"><img src="covers/mario-kart-8-deluxe.jpg" height="200" alt="Mario Kart 8 Deluxe"><br><b>1.</b> <a href="../dm/games/0100152000022000/README.md">Mario Kart 8 Deluxe</a><br><i>Hasn't been tested</i><br><sub>Needs a 64-bit update (the profile's is 4.0.0): the base game, 1.0.0, is a 32-bit program, which Apple silicon cannot run</sub></td>
 <td align="center" valign="top" width="25%"><img src="covers/animal-crossing-new-horizons.jpg" height="200" alt="Animal Crossing: New Horizons"><br><b>2.</b> Animal Crossing: New Horizons<br><i>Hasn't been tested</i></td>
 <td align="center" valign="top" width="25%"><img src="covers/super-smash-bros-ultimate.jpg" height="200" alt="Super Smash Bros. Ultimate"><br><b>3.</b> <a href="../dm/games/01006A800016E000/README.md">Super Smash Bros. Ultimate</a><br>🥇 Gold<br><sub>Plays well</sub></td>
-<td align="center" valign="top" width="25%"><img src="covers/zelda-breath-of-the-wild.jpg" height="200" alt="The Legend of Zelda: Breath of the Wild"><br><b>4.</b> The Legend of Zelda: Breath of the Wild<br><i>🥉 Bronze</i><sub>Low frame rate. needs optimizations</sub></td>
+<td align="center" valign="top" width="25%"><img src="covers/zelda-breath-of-the-wild.jpg" height="200" alt="The Legend of Zelda: Breath of the Wild"><br><b>4.</b> The Legend of Zelda: Breath of the Wild<br>🥉 Bronze<br><sub>Low frame rate. Needs optimizations</sub></td>
+<td align="center" valign="top" width="25%"><img src="covers/pokemon-bdsp.png" height="200" alt="Pokémon Brilliant Diamond / Shining Pearl"><br><b
 </tr>
 <tr>
 <td align="center" valign="top" width="25%"><img src="covers/super-mario-odyssey.jpg" height="200" alt="Super Mario Odyssey"><br><b>5.</b> Super Mario Odyssey<br><i>🥈 Silver</i></td>
