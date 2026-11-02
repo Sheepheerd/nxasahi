@@ -4,6 +4,8 @@
 #include <pthread.h>
 #include <vulkan/vulkan.h>
 #include "vk_fmt.h"
+// Command buffers in flight: a submission is flushed in parts (vkr_flush), so several per frame; the draw path keeps its descriptor pools, set cache and arena per slot (vk_draw.c)
+#define CB_RING 16
 // The sRGB / linear twin of an 8-bit RGBA or BGRA format (UNDEFINED for any other). Images of these formats are made mutable with both in their format list, so a texture view
 // of the other one (TextureViewSetFormat) is honoured: Breath of the Wild writes and reads its picture through sRGB views of RGBA8 textures, and the views in the image's own
 // format skipped the sRGB encoding, so the whole picture came out too dark (the Mac's "Render-target views that change the format")

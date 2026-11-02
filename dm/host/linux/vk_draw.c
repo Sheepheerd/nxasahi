@@ -370,8 +370,8 @@ typedef struct { VkDescriptorPool p[256]; int n, cur; } pool_chain;
 // writing a set per stage per draw was the host's largest cost after the dirty checks). Emptied with the slot's pools
 #define SETC 4096
 typedef struct { uint64_t h; VkDescriptorSet set; } setc_ent;
-static setc_ent g_setc[16][SETC]; static uint64_t g_setc_hit, g_setc_miss;
-static pool_chain g_pools[16]; static int g_pool_slot = -1;
+static setc_ent g_setc[CB_RING][SETC]; static uint64_t g_setc_hit, g_setc_miss;
+static pool_chain g_pools[CB_RING]; static int g_pool_slot = -1;
 static VkDescriptorPool pool_new(void) {
     VkDescriptorPoolSize ps[5]; uint32_t np = 0;
     static const VkDescriptorType T[5] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -396,7 +396,7 @@ void vkx_sub_begin(int slot, VkCommandBuffer c) {
 // c2: the handle tables: combined texture slots from 0x20 (slots 32-39 are the image slots, 0x120), separate textures from 0x168, samplers from 0x568
 enum { DRV_SIZE = 0xA00, ARENA = 8 << 20 };
 typedef struct { VkBuffer b[64]; VkDeviceMemory m[64]; uint8_t *p[64]; int n, cur; size_t off; } arena_t;
-static arena_t g_arena[16]; static uint32_t g_dispatch[3]; static uint32_t g_binst;
+static arena_t g_arena[CB_RING]; static uint32_t g_dispatch[3]; static uint32_t g_binst;
 static int arena_get(size_t n, VkBuffer *b, VkDeviceSize *off, uint8_t **p) {
     arena_t *a = &g_arena[g_pool_slot];
     for (;;) {
@@ -408,7 +408,7 @@ static int arena_get(size_t n, VkBuffer *b, VkDeviceSize *off, uint8_t **p) {
         a->cur = a->n++; a->off = 0;
     }
 }
-static uint64_t g_arena_gen[16];   // +1 when the slot's arena is reset (drv_fill's reuse is for the arena's current contents only)
+static uint64_t g_arena_gen[CB_RING];   // +1 when the slot's arena is reset (drv_fill's reuse is for the arena's current contents only)
 static void arena_reset(int slot) { g_arena[slot].cur = 0; g_arena[slot].off = 0; g_arena_gen[slot]++; }
 // The last fill of each stage's bank in this ring slot: a fill with the same bytes reuses it (most draws change none of what the banks hold), which also lets their
 // descriptor sets be reused (stage_set)
@@ -460,10 +460,15 @@ static int buf_desc(uint64_t addr, uint64_t size, uint64_t align, uint64_t maxr,
     return 1;
 }
 // The descriptor set of one stage's shader for the draw now: 0 when nothing could be allocated
+static uint64_t g_prof_ns[8];   // DM_VK_PROF: shaders + sets, state, vertex input, the draw call; set writes listed, sets allocated + written, set cache hits, misses (counts)
+void vkx_prof_take(uint64_t out[8]) { memcpy(out, g_prof_ns, sizeof g_prof_ns); memset(g_prof_ns, 0, sizeof g_prof_ns); }
+static int g_dprof = -1;
 static uint64_t mix64(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
 static VkDescriptorSet stage_set(int st, vks *s) {
     VkDescriptorSet set = VK_NULL_HANDLE; pool_chain *pc = &g_pools[g_pool_slot];
     VkWriteDescriptorSet wr[NBIND_MAX]; VkDescriptorBufferInfo bi[NBIND_MAX]; VkDescriptorImageInfo ii[NBIND_MAX]; int nw = 0;
+    if (g_dprof < 0) g_dprof = getenv("DM_VK_PROF") != NULL;
+    uint64_t pt0 = g_dprof ? mk_now() : 0;
     pthread_mutex_lock(&g_tmu);
     for (int i = 0; i < s->nb; i++) {
         const vkbind *b = &s->bd[i]; VkWriteDescriptorSet *w = &wr[nw];
@@ -536,7 +541,8 @@ static VkDescriptorSet stage_set(int st, vks *s) {
     }
     if (!h) h = 1;
     setc_ent *tab = g_setc[g_pool_slot], *e = NULL;
-    for (int k = 0; k < 8; k++) { setc_ent *x = &tab[(h + (uint64_t)k) % SETC]; if (x->h == h) { g_setc_hit++; return x->set; } if (!x->h) { e = x; break; } }   // e: where a new one goes
+    uint64_t pt1 = g_dprof ? mk_now() : 0; if (g_dprof) g_prof_ns[4] += pt1 - pt0;
+    for (int k = 0; k < 8; k++) { setc_ent *x = &tab[(h + (uint64_t)k) % SETC]; if (x->h == h) { g_setc_hit++; g_prof_ns[6]++; return x->set; } if (!x->h) { e = x; break; } }   // e: where a new one goes
     for (;;) {
         if (pc->cur == pc->n) { if (pc->n == 256 || !(pc->p[pc->n] = pool_new())) { static int w; if (!w++) LOG("[RED] vulkan draws: no more descriptor pools"); return VK_NULL_HANDLE; } pc->n++; }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pc->p[pc->cur], .descriptorSetCount = 1, .pSetLayouts = &g_dsl};
@@ -545,7 +551,7 @@ static VkDescriptorSet stage_set(int st, vks *s) {
     }
     for (int i = 0; i < nw; i++) wr[i].dstSet = set;
     if (nw) vkUpdateDescriptorSets(g_vkd.dev, (uint32_t)nw, wr, 0, NULL);
-    g_st_sets++; g_setc_miss++;
+    g_st_sets++; g_setc_miss++; if (g_dprof) { g_prof_ns[5] += mk_now() - pt1; g_prof_ns[7]++; }
     if (e) *e = (setc_ent){h, set};
     return set;
 }
@@ -917,11 +923,15 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
         for (int i = 0; i < 16; i++) if (D.attr[i].fmt) LOG("[pass]     attr %d: NVN format %#x (vk %d) offset %u stream %u; stream stride %u divisor %u, buffer %#llx size %llu", i, (unsigned)D.attr[i].fmt, (int)vfmt((int)D.attr[i].fmt),
             (unsigned)D.attr[i].offset, (unsigned)D.attr[i].stream, D.stream[D.attr[i].stream].stride, D.stream[D.attr[i].stream].divisor, (unsigned long long)D.vbuf[D.attr[i].stream].address, (unsigned long long)D.vbuf[D.attr[i].stream].size); }
     static int slow = -1; if (slow < 0) slow = getenv("DM_VK_SLOWDRAW") != NULL;   // diagnostic: draws whose recording took over 1 ms, by part
-    uint64_t sd0 = slow ? mk_now() : 0;
+    static int prof = -1; if (prof < 0) prof = getenv("DM_VK_PROF") != NULL;   // DM_VK_PROF: the parts' totals (vkx_prof_take)
+    uint64_t sd0 = slow || prof ? mk_now() : 0;
     if (!vkx_prepare_draw(c)) { g_st_skip[SK_PREP]++; return; }
-    uint64_t sd1 = slow ? mk_now() : 0;
+    uint64_t sd1 = slow || prof ? mk_now() : 0;
     set_state(c, ncolor, rt_w, rt_h, tp, samples);
+    uint64_t sd1b = prof ? mk_now() : 0;
     if (!set_vertex(c)) return;
+    uint64_t sd1c = prof ? mk_now() : 0;
+    if (prof) { g_prof_ns[0] += sd1 - sd0; g_prof_ns[1] += sd1b - sd1; g_prof_ns[2] += sd1c - sd1b; }
     if (d) {
         if (ok == 2) { vkCmdBindIndexBuffer(c, g_quad_ib, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c, (uint32_t)d->count / 4 * 6, (uint32_t)(d->instances ? d->instances : 1), 0, (int32_t)d->first, (uint32_t)d->base_instance); }
         else if (d->ind) { VkBuffer b; VkDeviceSize o; if (!lookup_buf(d->ind, 16, &b, &o)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndirect(c, b, o, 1, 16); }
@@ -935,6 +945,7 @@ void vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int 
         if (x->ind) { VkBuffer ib; VkDeviceSize io; if (!lookup_buf(x->ind, 20, &ib, &io)) { g_st_skip[SK_INDIRECT]++; return; } vkCmdDrawIndexedIndirect(c, ib, io, 1, 20); }
         else vkCmdDrawIndexed(c, (uint32_t)x->count, (uint32_t)(x->instances ? x->instances : 1), 0, x->base_vertex, (uint32_t)x->base_instance);
     }
+    if (prof) g_prof_ns[3] += mk_now() - sd1c;
     if (slow) { uint64_t sd2 = mk_now(); if (sd2 - sd0 > 1000000) LOG("[slowdraw] %.2f ms: shaders + sets %.2f, state + draw %.2f", (sd2 - sd0) / 1e6, (sd1 - sd0) / 1e6, (sd2 - sd1) / 1e6); }
     g_st_drawn++;
     if (drawlog() && !(g_st_drawn & (g_st_drawn - 1))) {

@@ -20,7 +20,6 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool
 #include "../gfx/tex/nvn_deswizzle.h"
 #include <stdatomic.h>
 
-#define CB_RING 16   // command buffers in flight: a submission is flushed in parts (vkr_flush), so several per frame
 #include "vk_replay.h"
 pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
 // Images are shared by storage, as nvn_mtl.m's sharing table does: an NVN texture object is only a descriptor, and an object rebuilt over the same storage with the same description
@@ -462,11 +461,26 @@ void mtl_sub_begin(void) {
 // command buffer, so the GPU works on a frame's first passes while the rest is replayed (one command buffer per submission left the GPU idle for the whole replay, about
 // 10 ms of Mario Wonder's 24 ms frame, and the CPU idle while the GPU ran). Fences stay in order: each part signals the next timeline value
 #define FLUSH_DRAWS 128
-static void vkr_flush(void) { sub_submit(); g_flushes++; sub_open(); }
+// DM_VK_PROF=1 (diagnostic): the replay's time by record kind (nvn_obj.h's OP_ numbers), mid-submission flushes (64) and submission ends (65), logged as milliseconds a frame
+// every 300 frames: where the submit thread's time goes
+static int g_prof = -1; static uint64_t g_opns[66], g_prof_f0;
+static void prof_log(void) {
+    uint64_t f = vkh_frame(); if (!g_prof_f0) g_prof_f0 = f; if (f < g_prof_f0 + 300) return;
+    double nf = (double)(f - g_prof_f0), tot = 0; char b[700]; int o = 0; int idx[66]; for (int i = 0; i < 66; i++) { idx[i] = i; tot += g_opns[i]; }
+    for (int i = 0; i < 66; i++) for (int j = i + 1; j < 66; j++) if (g_opns[idx[j]] > g_opns[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    for (int i = 0; i < 12 && g_opns[idx[i]] && o < (int)sizeof b - 32; i++) o += snprintf(b + o, sizeof b - o, " %d:%.2f", idx[i], g_opns[idx[i]] / 1e6 / nf);
+    uint64_t dp[8]; vkx_prof_take(dp);
+    LOG("vulkan replay profile, %.0f frames: %.2f ms a frame; by record (ms a frame):%s; draws: shaders + sets %.2f (set writes listed %.2f, sets made %.2f; %.0f cache hits, %.0f misses a frame), state %.2f, vertex %.2f, call %.2f",
+        nf, tot / 1e6 / nf, b, dp[0] / 1e6 / nf, dp[4] / 1e6 / nf, dp[5] / 1e6 / nf, dp[6] / nf, dp[7] / nf, dp[1] / 1e6 / nf, dp[2] / 1e6 / nf, dp[3] / 1e6 / nf);
+    memset(g_opns, 0, sizeof g_opns); g_prof_f0 = f;
+}
+static void vkr_flush(void) { uint64_t t0 = g_prof > 0 ? mono_ns() : 0; sub_submit(); uint64_t t1 = g_prof > 0 ? mono_ns() : 0; g_flushes++; sub_open(); if (g_prof > 0) { g_opns[60] += t1 - t0; g_opns[61] += mono_ns() - t1; } }   // DM_VK_PROF: 60 the submit, 61 the next part's start
 uint64_t mtl_sub_commit(void) {
     if (!g_on) return atomic_fetch_add(&g_fence, 1) + 1;
+    uint64_t ct = g_prof > 0 ? mono_ns() : 0;
     rp_end(g_cb[g_cb_i]);
     uint64_t v = sub_submit(); g_subs++;
+    if (g_prof > 0) { g_opns[65] += mono_ns() - ct; prof_log(); }
     static int opslog = -1; if (opslog < 0) opslog = getenv("DM_VK_OPS") != NULL;
     if (opslog && !(g_subs & (g_subs - 1))) {
         char b[600]; int q = 0;
@@ -831,12 +845,14 @@ static void op_clear_tex(VkCommandBuffer c, const p_clear_tex *p) {
 
 void mtl_exec(const uint8_t *handle) {
     if (!g_on || !g_open) return;
+    if (g_prof < 0) g_prof = getenv("DM_VK_PROF") != NULL;
     VkCommandBuffer c = g_cb[g_cb_i];
     const uint8_t *p = handle, *ret[16]; int nret = 0;
     for (uint64_t guard = 0; p && guard < 50000000; guard++) {
-        if (g_flush_draws >= FLUSH_DRAWS && !g_rp_on && !g_noflush) { vkr_flush(); c = g_cb[g_cb_i]; }   // between render passes: the part so far to the GPU
+        if (g_flush_draws >= FLUSH_DRAWS && !g_rp_on && !g_noflush) { uint64_t ft = g_prof ? mono_ns() : 0; vkr_flush(); c = g_cb[g_cb_i]; if (g_prof) g_opns[64] += mono_ns() - ft; }   // between render passes: the part so far to the GPU
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
         if (h.op < 64) g_ops[h.op]++;
+        uint64_t pt = g_prof ? mono_ns() : 0;
         switch (h.op) {
         case OP_END: if (nret) { p = ret[--nret]; continue; } return;
         case OP_JUMP: memcpy(&p, a, 8); continue;
@@ -932,6 +948,7 @@ void mtl_exec(const uint8_t *handle) {
         }
         default: break;   // counted only, for now
         }
+        if (g_prof) g_opns[h.op < 64 ? h.op : 63] += mono_ns() - pt;
         if (h.size < 8) { LOG("[RED] vulkan replay: record of op %u with size %u: the stream is broken", h.op, h.size); return; }
         p += h.size;
     }
