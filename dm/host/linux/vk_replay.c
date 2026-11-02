@@ -98,15 +98,27 @@ static int wait_value(uint64_t v, uint64_t timeout_ns) {
 // host call. They are queued with the timeline value of the submission part that recorded them and written once the GPU is done with that part, in order, as nvn_mtl.m's post_run
 // does in its completion handler: by a thread that waits on the timeline, and by any host wait that sees the value first, so a sync wait returns with them written. Mario Kart 8
 // Deluxe's "Select a Mii" waited for such values to build its list: with them dropped, it stayed empty and took no input
-typedef struct { uint64_t at; int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; } gpost;   // kind 1: event (mode 1 adds), 2: counter report
+typedef struct { uint64_t at; int kind, slot; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; } gpost;   // kind 1: event (mode 1 adds), 2: counter report; slot: the command buffer recorded in
 static gpost *g_gp; static size_t g_gpn, g_gpcap; static pthread_mutex_t g_gpmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gpcv = PTHREAD_COND_INITIALIZER;
+// A counter report's time is the GPU time of the submission part it was recorded in, as nvn_mtl.m's segment clock gives it: TIMESTAMP_TOP (0x10) the part's start, any other
+// type its end, from the part's timestamp queries (g_qp), placed on the guest clock against the newest part written now. Breath of the Wild measures its GPU time with a top
+// report at the start of a frame and another at its end, and scales its resolution down when that passes 175% of a 60 Hz frame (main+0x1267070): with one time for all of
+// them it read about 0 and stayed at its largest resolution however long the GPU took. Without the queries (or before a part's are ready) the report takes the time now
+static int gp_span(int slot, uint64_t *t0, uint64_t *t1) {   // the part's GPU start / end in device ticks
+    if (!g_qp || slot < 0) return 0;
+    uint64_t q[2]; if (vkGetQueryPoolResults(g_vkd.dev, g_qp, (uint32_t)(2 * slot), 2, sizeof q, q, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || q[1] < q[0]) return 0;
+    *t0 = q[0]; *t1 = q[1]; return 1;
+}
 static void gp_run(uint64_t done) {   // writes everything the GPU is done with
     pthread_mutex_lock(&g_gpmu);
-    size_t k = 0;
+    size_t k = 0; uint64_t now = guest_ns(), ref = 0; double per = g_vkd.props.limits.timestampPeriod;   // ref: the latest part end among these, read as now
+    for (size_t i = 0; i < g_gpn && g_gp[i].at <= done; i++) { uint64_t a, b; if (g_gp[i].kind == 2 && gp_span(g_gp[i].slot, &a, &b) && b > ref) ref = b; }
     for (; k < g_gpn && g_gp[k].at <= done; k++) {
         const gpost *o = &g_gp[k];
-        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
-        else { uint64_t t = nvn_timestamp_from_ns(guest_ns()), rec[2] = {o->type == 0 || o->type == 0x10 ? t : 0, t}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }
+        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; continue; }
+        uint64_t ns = now, a, b;
+        if (ref && gp_span(o->slot, &a, &b)) { uint64_t at = o->type == 0x10 ? a : b, back = (uint64_t)((double)(ref - at) * per); ns = back < now ? now - back : 0; }
+        uint64_t t = nvn_timestamp_from_ns(ns), rec[2] = {(o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);   // render_cond: a timestamp's counter field is 0, as on the GPU (rc_value)
     }
     if (k) { memmove(g_gp, g_gp + k, (g_gpn - k) * sizeof *g_gp); g_gpn -= k; }
     pthread_mutex_unlock(&g_gpmu);
@@ -124,11 +136,36 @@ static void *gp_thread(void *arg) {
 }
 static void gp_add(gpost o) {   // on the replay thread, in recording order
     static int started; if (!started) { started = 1; pthread_t t; if (!pthread_create(&t, NULL, gp_thread, NULL)) pthread_detach(t); else LOG("[RED] vulkan replay: no thread for GPU-written values"); }
-    o.at = atomic_load(&g_fence) + 1;   // the part being recorded signals this value (sub_submit)
+    o.at = atomic_load(&g_fence) + 1; o.slot = g_cb_i;   // the part being recorded signals this value (sub_submit), from this ring slot
     pthread_mutex_lock(&g_gpmu);
     if (g_gpn == g_gpcap) { g_gpcap = g_gpcap ? g_gpcap * 2 : 256; g_gp = realloc(g_gp, g_gpcap * sizeof *g_gp); }
     g_gp[g_gpn++] = o; pthread_cond_signal(&g_gpcv);
     pthread_mutex_unlock(&g_gpmu);
+}
+// ---- conditional rendering (profile render_cond) ----
+// SetRenderEnableConditional(mode, rec) draws only while the 64-bit counters at rec and rec + 16 compare equal (mode 0) or not equal (mode 1), until SetRenderEnable(true), as
+// nvn_mtl.m's OP_RENDER_COND evaluates it: on the CPU at replay, from the reports in memory. Animal Crossing: New Horizons and Tears of the Kingdom wrap their clears this way,
+// with a TIMESTAMP_TOP report into rec after each clear (its counter field 0) so a target is not cleared again until the CPU sets rec: with the condition ignored (as this
+// replay did) every clear ran, four clear-only passes wiped Animal Crossing's composite before the window copy, and every frame was black. A report still queued (g_gp) counts
+// with the value it will write: 0 for a timestamp, unknown for another counter. A condition on an address a samples-passed report ever targeted (never written here: no
+// occlusion queries) is unknown too, and an unknown condition draws, as before
+static int g_rc_skip;   // a render-enable block evaluated false is active (draws and clears dropped)
+static uint64_t g_rc_occ[4096];   // addresses ever given a non-timestamp report (open addressing)
+static void rc_occ_add(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return; if (!g_rc_occ[i]) { g_rc_occ[i] = a; return; } } }
+static int rc_occ_has(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return 1; if (!g_rc_occ[i]) return 0; } return 0; }
+static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown now
+    if (rc_occ_has(a)) return 0;
+    int r = -1;
+    pthread_mutex_lock(&g_gpmu);
+    for (size_t i = g_gpn; i-- > 0;) if (g_gp[i].kind == 2 && g_gp[i].addr == a) { r = g_gp[i].type == 0 || g_gp[i].type == 0x10; *v = 0; break; }
+    if (r < 0) { *v = *(const volatile uint64_t *)(uintptr_t)a; r = 1; }   // read under the lock: gp_run writes the queued ones under it
+    pthread_mutex_unlock(&g_gpmu);
+    return r;
+}
+static void rc_eval(const p_render_cond *rc) {
+    if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; return; }
+    uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
+    g_rc_skip = known && (rc->mode ? x == y : x != y);
 }
 
 // ---- textures ----
@@ -390,6 +427,7 @@ static void dump_uploads(uint64_t fence);
 static void sub_open(void) {   // the next ring slot's command buffer, begun (its last use waited for)
     g_cb_i = (g_cb_i + 1) % CB_RING;
     wait_value(g_cb_val[g_cb_i], UINT64_MAX);   // its last use is done
+    gp_run(done_value());   // its reports written while its timestamp queries still hold that use's times (they are reset below)
     if (g_qp) { pthread_mutex_lock(&g_tmu); gpu_harvest(g_cb_i); pthread_mutex_unlock(&g_tmu); }
     vkResetCommandBuffer(g_cb[g_cb_i], 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -418,7 +456,7 @@ static uint64_t sub_submit(void) {   // the open command buffer (after its uploa
 void mtl_sub_begin(void) {
     if (!vkr_on()) return;
     if (g_noflush < 0) g_noflush = getenv("DM_VK_NOFLUSH") != NULL;   // diagnostic: one command buffer per submission, as before
-    sub_open();
+    sub_open(); g_rc_skip = 0;
 }
 // A long submission goes to the GPU in parts: when enough draws are recorded and no render pass is open, what there is is submitted and recording goes on in the next
 // command buffer, so the GPU works on a frame's first passes while the rest is replayed (one command buffer per submission left the GPU idle for the whole replay, about
@@ -814,8 +852,9 @@ void mtl_exec(const uint8_t *handle) {
             g_rt_depth = s->depth; g_rt_dview = s->dview; g_rt_has_dview = s->has_dview;
             break;
         }
-        case OP_CLEAR_COLOR: op_clear_color(c, a); break;
-        case OP_CLEAR_DS: op_clear_ds(c, a); break;
+        case OP_CLEAR_COLOR: if (!g_rc_skip) op_clear_color(c, a); break;
+        case OP_CLEAR_DS: if (!g_rc_skip) op_clear_ds(c, a); break;
+        case OP_RENDER_COND: rc_eval(a); break;   // recorded only with the profile key render_cond (hle_nvn.c)
         case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: {   // textures are made ready to sample now; the handles go to the draw state
             p_bind_handles t1; const p_bind_handles *b = bind_rec(h.op, a, &t1);
             if (b->n < 0 || b->n > 32) break;
@@ -829,7 +868,8 @@ void mtl_exec(const uint8_t *handle) {
         case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tb; vkx_bind_buf(0, bind_buf_rec(h.op, a, &tb)); break; }
         case OP_BIND_SSBO: vkx_bind_buf(1, a); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: vkx_set_pool(h.op == OP_SET_TEX_POOL, nvn_dpool_base(((const p_set_pool *)a)->pool, h.op == OP_SET_TEX_POOL)); break;
-        case OP_DRAW: case OP_DRAW_IDX: if (g_passlog && g_passstop && g_passes - g_pass0 > (uint64_t)g_passstop) break;   // DM_VK_PASSSTOP: the traced frame's later passes draw nothing
+        case OP_DRAW: case OP_DRAW_IDX: if (g_rc_skip) break;
+            if (g_passlog && g_passstop && g_passes - g_pass0 > (uint64_t)g_passstop) break;   // DM_VK_PASSSTOP: the traced frame's later passes draw nothing
             if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
             if (rp_begin(c)) vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples); g_flush_draws++; break;
         case OP_BARRIER: rp_end(c); full_barrier(c); break;
@@ -878,6 +918,7 @@ void mtl_exec(const uint8_t *handle) {
         case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tv; vkx_vbuf(vbuf_rec(h.op, a, &tv)); break; }
         case OP_SIGNAL_EVENT: { gpost o = {.kind = 1}; memcpy(&o.val, a, 8); memcpy(&o.mode, (const uint8_t *)a + 8, 4); memcpy(&o.v, (const uint8_t *)a + 12, 4); gp_add(o); break; }
         case OP_REPORT_COUNTER: { gpost o = {.kind = 2}; memcpy(&o.type, a, 8); memcpy(&o.addr, (const uint8_t *)a + 8, 8);
+            if (DM_GAME_RENDER_COND && o.type != 0 && o.type != 0x10) rc_occ_add(o.addr);   // its value is not known at replay (rc_value)
             // samples passed is counted by occlusion queries the replay does not make yet: left unwritten, as before
             if (o.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { static int w; if (!w++) LOG("[RED] vulkan replay: samples-passed counter reports are not written (no occlusion queries)"); break; }
             gp_add(o); break; }

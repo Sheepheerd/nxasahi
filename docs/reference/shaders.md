@@ -725,6 +725,13 @@ Cross/helper lowering and the optional Metal checks. Shader acceptance does not
 imply admission of every native host layout. None of these tests executes a
 shader on a GPU.
 
+### Linux: two variables on one texture slot
+
+- **Symptom:** `dmsh_spv.log` reports `reflection failed: bindings N and M both map to canonical binding … (tex reg …)`, and in play `[RED] vulkan draws: no translated shader …`: the shader's draws are skipped (3,174 of Breath of the Wild's 19,592 shaders, 4,501 of Mario Kart 8 Deluxe's 29,650).
+- **Cause:** `vk_canon` (`dm/gfx/tools/dmsh_spv.py`) gives each texture register one fixed binding (64 + register). A shader that reads one register through two variables (two samplers or image types, such as a plain and a depth-compare read) had nowhere to put the second, and the shader was dropped whole.
+- **Fix:** a second variable on a slot already taken gets a binding of its own from 600 on, 32 per descriptor type so the host's union layout keeps one type per binding; its `.vkb` row names the same register, so the host binds the same texture there. The reflection loop also no longer takes an earlier run's `<key>.vk.spv` outputs for shaders (thousands of `.vk.res.json` red lines on a rebuild).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) and [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) on Linux: every shader translates since.
+
 ## Shaders compiled at run time
 
 ### Built-in shaders compiled with the game's own GLSLC

@@ -347,6 +347,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** the depth's sample count is taken whenever no colour target is actually bound.
 - **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md) (the Undead Asylum cell: a depth pre-pass over the 4x scene target, then the materials).
 - **Check:** `DM_VK_SKIPSH=<shader key>[,…]` (`vk_draw.c`) leaves out the draws of those vertex or pixel shaders: skipping the pass's materials turned the whole scene that flat colour, and the resolved target after the material pass (`DM_VK_PASSSTOP`, `DM_VK_RTFLOAT`) already held it. Ruled out on the way: deferred uniform updates (`DM_VK_UB_DEFER=0`), face culling (`DM_VK_NOCULL`), fused multiply-adds in the vertex shaders (`NoContraction` changed nothing) and a small depth bias.
+### Linux: sRGB views of RGBA8 textures
+
+- **Symptom:** on Linux the whole picture too dark; with the change below off, Mario Kart 8 Deluxe's race averaged 14 / 9 / 2 (red / green / blue) against 81 / 79 / 66 with it.
+- **Cause:** the Linux replay made every attachment and sampled view in the texture's own format (`att_view_n` in `vk_replay.c`, `view_get` in `vk_draw.c`), so a view that sets the sRGB twin (`TextureViewSetFormat`) skipped the sRGB encoding on write or decoding on read, as the Mac once did ([Render-target views that change the format](#render-target-views-that-change-the-format)).
+- **Fix:** images of an 8-bit RGBA / BGRA format are made mutable with both twins in their format list (`vkr_srgb_twin` in `vk_replay.h`), and a view that sets the twin is made in it (`VkImageViewUsageCreateInfo` limits it to the use it is made for). Other format reinterpretations are still made in the image's own format.
+- **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) on Linux (the race).
+
 ### Linux: the same texture attached at two colour slots
 
 - **Symptom:** on Linux, the 3D scene drawn as flat, dark silhouettes with no surface colour or texture (Link and the Shrine of Resurrection at the start of Breath of the Wild); the HUD and the light shafts are fine; no `[RED]` line. The G-buffer's albedo target holds only its clear value.
