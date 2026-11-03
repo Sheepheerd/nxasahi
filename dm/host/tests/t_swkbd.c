@@ -4,6 +4,8 @@
 #include <stdio.h>
 
 Result swkbd_show(void *out, const void *arg, int (*input)(const char *, const char *, const char *, const char *, int, char *, int));
+void hle_applet_begin(const char *what) { (void)what; }
+void hle_applet_end(void) {}
 int front_text_input(const char *t, const char *s, const char *g, const char *i, int m, char *o, int c) { (void)t; (void)s; (void)g; (void)i; (void)m; (void)o; (void)c; return -1; }
 
 static int fails, checks;

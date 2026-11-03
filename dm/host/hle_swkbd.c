@@ -98,7 +98,8 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
 
 HLE_FORCE("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", "software keyboard applet → host native input box (DM_KBD gives the text directly)",
           Result, h_swkbd_Show, void *out, const void *arg) {
-    return swkbd_show(out, arg, front_text_input);
+    hle_applet_begin("the software keyboard"); Result r = swkbd_show(out, arg, front_text_input); hle_applet_end();
+    return r;
 }
 
 // ---------- InlineKeyboard (Super Mario 3D World + Bowser's Fury) ----------

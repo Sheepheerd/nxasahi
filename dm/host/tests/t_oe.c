@@ -24,6 +24,9 @@ static int empty(void) { uint32_t m = 999; return !h_oe_TryPopMsg(&m) && m == 99
 static int child_kind;
 static void abort_exit(int sig) { (void)sig; dprintf(2, "[RED] t_oe child kind=%d: 10 s watchdog timeout\n", child_kind); _exit(97); } // the old-version die in the child process can be checked, avoiding a crash report or core
 static void *focus_burst(void *p) { (void)p; for (int i = 0; i < 17; i++) { dm_focus_set(2); dm_focus_set(1); } return NULL; }
+// The game's notification poll for hle_applet_begin: pops the focus notification once the applet has taken the focus, reading the state it finds
+static int applet_seen = -1;
+static void *applet_poll(void *p) { (void)p; uint32_t m; for (int i = 0; i < 2000; i++) { if (h_oe_TryPopMsg(&m)) { applet_seen = m == 15 ? h_oe_GetFocus() : -2; return NULL; } usleep(500); } return NULL; }
 static void *mode_burst(void *p) { (void)p; for (int i = 0; i < 17; i++) dm_set_opmode(i % 2); return NULL; }
 static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stage_cond = PTHREAD_COND_INITIALIZER;
@@ -123,5 +126,22 @@ int main(void) {
     CHECK(pop_is(15) && empty(), "focus mode 2: focus notification 15");
     h_oe_SetFocusMode(1); dm_focus_set(2);
     CHECK(pop_is(15) && empty(), "focus mode 1: focus notification 15");
+    // A library applet the host answers (the controller applet): out of focus while it is shown, with notification 15 when it starts and when it ends. Mario Kart 8 Deluxe held
+    // its menus' input until it had seen both; begin returns only after the game has taken the first notification, so the game reads OutOfFocus
+    reset(); h_oe_SetFocusMode(2);
+    pthread_t th; pthread_create(&th, NULL, applet_poll, NULL);
+    hle_applet_begin("a test applet");
+    CHECK(applet_seen == 2 && h_oe_GetFocus() == 2 && empty(), "applet: begin returns after the game popped 15 and read OutOfFocus");
+    pthread_join(th, NULL);
+    hle_applet_end();
+    CHECK(pop_is(15) && empty() && h_oe_GetFocus() == 1, "applet: end gives the focus back with a second 15");
+    reset(); h_oe_SetFocusMode(3);
+    hle_applet_begin("a test applet");
+    CHECK(empty() && h_oe_GetFocus() == 2, "applet: focus mode 3 is not waited for and gets no 15");
+    hle_applet_end();
+    CHECK(empty() && h_oe_GetFocus() == 1, "applet: focus mode 3, the focus is back after the applet");
+    reset(); h_oe_SetFocusMode(2); dm_focus_set(3); pop_is(15);
+    hle_applet_begin("a test applet"); hle_applet_end();
+    CHECK(empty() && h_oe_GetFocus() == 3, "applet: an app in the background stays there");
     printf("== oe %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }

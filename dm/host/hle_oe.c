@@ -5,6 +5,7 @@
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
+#include <unistd.h>
 static _Atomic int g_opmode = -1;
 int dm_opmode(void) {
     int m = g_opmode;
@@ -71,6 +72,32 @@ void dm_focus_set(int st) {
     if (atomic_exchange(&g_focus, st) == st) return;
     LOG("oe focus state → %d", st);
     if (focus_notifies()) mq_push(MSG_FOCUS);
+}
+// A library applet the host answers in place of the system's (the controller applet, the software keyboard, the user selector): on Horizon the application is out of focus
+// while the applet is shown and gets focus notification 15 both when it starts and when it ends. Mario Kart 8 Deluxe's Multiplayer starts the controller applet on a job thread
+// and holds every menu's input until it has seen the focus leave and come back: with the host's applet answering at once and no notification, its character selection took no
+// input from any controller. hle_applet_begin takes the focus and waits (at most a second, the thread blocked as in a kernel wait) until the game has popped that notification,
+// so a game that polls the queue once a frame reads OutOfFocus; hle_applet_end gives it back. A game that set no focus notifications (mode 0 or 3) is not waited for, and a
+// focus the front end changed meanwhile (the app sent to the background) is left as it is
+static _Atomic int g_applet_took;
+static int focus_queued(void) {
+    pthread_mutex_lock(&g_mq_lock);
+    int q = 0; for (int i = 0; i < g_mqn; i++) q |= g_mq[(g_mqh + i) % MQ] == MSG_FOCUS;
+    pthread_mutex_unlock(&g_mq_lock);
+    return q;
+}
+void hle_applet_begin(const char *what) {
+    atomic_store(&g_applet_took, 0);
+    if (atomic_load(&g_focus) != 1) return;
+    LOG("oe: %s takes the focus while it is shown", what);
+    dm_focus_set(2); atomic_store(&g_applet_took, 1);
+    if (!focus_notifies()) return;
+    dm_thread_native_wait(1);
+    for (int i = 0; i < 500 && focus_queued(); i++) usleep(2000);
+    dm_thread_native_wait(0);
+}
+void hle_applet_end(void) {
+    if (atomic_exchange(&g_applet_took, 0) && atomic_load(&g_focus) == 2) dm_focus_set(1);
 }
 static int opmode(void) { return dm_opmode(); }
 

@@ -31,6 +31,10 @@ void dm_ctl_cvar_i32(uint64_t off, int32_t v) { (void)off; (void)v; }
 void dm_ctl_cvar_f32(uint64_t off, float v) { (void)off; (void)v; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_passdump_next(long n) { (void)n; }
+void svc_thread_dump(void) {}
+static int applet_begins, applet_ends;
+void hle_applet_begin(const char *what) { (void)what; applet_begins++; }
+void hle_applet_end(void) { applet_ends++; }
 
 static uint64_t buttons_of(uint32_t id, uint32_t style) { NpadState s; fill(&s, id, style); return s.attributes ? s.buttons & 0xffff : 0; }
 static int32_t lx_of(uint32_t id) { NpadState s; fill(&s, id, STYLE_FULLKEY); return s.lx; }
@@ -81,8 +85,12 @@ static void t_npads(void) {
     CHECK(h_hid_Led(&(uint32_t){0}) == 0x1 && h_hid_Led(&(uint32_t){1}) == 0x3 && h_hid_Led(&(uint32_t){7}) == 0x6, "player LED patterns");
     int32_t info[2]; int8_t arg[8] = {1, 4};
     CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 2 && info[1] == 0, "the controller applet reports two players, player 1 selected");
+    CHECK(applet_begins == 1 && applet_ends == 1, "the controller applet takes the focus and gives it back");
     arg[1] = 1; h_hid_ShowCtrl(info, arg);
     CHECK(info[0] == 1, "the applet's count is capped at the game's maximum");
+    arg[0] = 3; arg[1] = 3; info[0] = -1;
+    CHECK(h_hid_ShowCtrl(info, arg) == RES_CONTROLLER_SUPPORT_CANCELED && info[0] == -1, "fewer players than the minimum: cancelled, no result written");
+    CHECK(h_hid_ShowCtrl0(arg) == RES_CONTROLLER_SUPPORT_CANCELED, "the overload without a result is cancelled too");
     CHECK(six_connected(0x0100 | 0) && !six_connected(0x0200 | 0), "player 2 has a six-axis sensor, No3 none");
 
     // A one-player game ({No1, Handheld}): player 2's controller plays as player 1, No2 reads as not connected

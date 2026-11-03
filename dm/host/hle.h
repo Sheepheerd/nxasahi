@@ -61,6 +61,9 @@ int dm_opmode(void);
 void dm_set_opmode(int m);          // On change, push notification 30 / 31 according to the switches the game has turned on
 // Focus (1 foreground / 2 focus lost / 3 background): called by the front end on lifecycle changes; a change pushes notification 15
 void dm_focus_set(int st);
+// A library applet answered by the host (hle_oe.c): the application is out of focus while it is shown, as on Horizon; begin waits until the game has taken the notification
+void hle_applet_begin(const char *what);
+void hle_applet_end(void);
 // Audio pause / resume following the lifecycle (called by the front end on going to background / returning to foreground)
 extern uint8_t *dm_fps_state;   // frame step state page (loader.c install_fps_state): +0 float target fps, +4 movie flag, +0x10 float render scale, +0x18 double game seconds stepped; NULL when the build has none
 void dm_audio_suspend(int on);

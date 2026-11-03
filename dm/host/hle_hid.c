@@ -121,14 +121,16 @@ void hid_keys_init(void) {
 }
 
 // DM_CTL=<file> (Mac, for driving a game step by step from a shell): the host reads the lines appended to the file (polled every 100 ms) and acts on each at once:
-//   "key[+key][~hold]" presses as a DM_KEYS step does (hold 0.15 s by default), "shot <path>" saves the next presented frame as a PNG (dm_gfx_shot_at), "passdump <n>" dumps the
+//   "key[+key][~hold]" presses as a DM_KEYS step does (hold 0.15 s by default; "p2 key…" on player 2's controller, as far as p8), "shot <path>" saves the next presented frame as a PNG (dm_gfx_shot_at), "passdump <n>" dumps the
 //   render passes of the next n frames as DM_NVN_PASSDUMP does (to stderr, the run's log), "texdump <path with %d>" saves the colour targets of the next frame as DM_NVN_TEXDUMP does,
 //   "env KEY=VALUE" sets a switch read at the time of use (DM_NVN_SNAPRAW for the next texdump), "cvarf <main offset> <value>" sets an Unreal float console variable
 //   (hle_fpslock.c dm_ctl_cvar_f32; "cvari" an int one), "peek <address> <count>" logs that many floats of guest memory, "memdump <address> <bytes> <path>" saves guest memory
 //   to a file (a buffer texture's storage, which the pass dump's tbuf lines print, holds what the GPU wrote: buffer textures are views of the pool), "texlist <NVN target>" logs the
 //   registered textures of that target (2 = 3D) with storage address and block-linear layout (nvn_mtl.m dm_gfx_texlist), "texraw <serial> <path>"
 //   saves a host texture's level 0 raw (nvn_mtl.m dm_gfx_texraw), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
-//   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "#…" is ignored.
+//   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "players <mask>" reports the players with a controller as the front end does
+//   (dm_pad_players, bit p = player p + 1: a controller plugged in or pulled out), "threads" logs every guest thread as a crash does (svc_thread_dump: what it
+//   waits on, its last SVC, its backtrace; a game that still presents but no longer moves), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
@@ -147,6 +149,8 @@ static void *ctl_main(void *arg) {
                                                      while (*e3 == ' ') e3++; dm_ctl_memdump(a, n, e3); continue; }
                 if (!strncmp(line, "cvari ", 6)) { void dm_ctl_cvar_i32(uint64_t off, int32_t v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_i32(off, (int32_t)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "cvarf ", 6)) { void dm_ctl_cvar_f32(uint64_t off, float v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_f32(off, strtof(e2, NULL)); continue; }
+                if (!strcmp(line, "threads")) { void svc_thread_dump(void); LOG("DM_CTL: guest threads"); svc_thread_dump(); continue; }
+                if (!strncmp(line, "players ", 8)) { uint32_t m = (uint32_t)strtoul(line + 8, NULL, 0); LOG("DM_CTL: players with a controller %#x", m); dm_pad_players(m); continue; }
                 if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1); } continue; }
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
@@ -157,11 +161,12 @@ static void *ctl_main(void *arg) {
                     for (int i = 0; i <= n; i++) { dm_touch t = {0, x0 + (x1 - x0) * (float)i / (float)n, y0 + (y1 - y0) * (float)i / (float)n}; dm_touch_set(&t, 1); usleep((useconds_t)(s * 1e6f / (float)n)); }
                     dm_touch_set(NULL, 0); continue;
                 }
-                key_step st = {0, 0.15, 0}; char *h = strchr(line, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
-                parse_keys(line, &st);
-                LOG("DM_CTL: press %#llx (hold %.2f s)", (unsigned long long)st.btn, st.hold);
+                int pl = 0; char *keys = line; if (line[0] == 'p' && line[1] >= '1' && line[1] <= '8' && line[2] == ' ') { pl = line[1] - '1'; keys = line + 3; }
+                key_step st = {0, 0.15, 0}; char *h = strchr(keys, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
+                parse_keys(keys, &st);
+                LOG("DM_CTL: player %d presses %#llx (hold %.2f s)", pl + 1, (unsigned long long)st.btn, st.hold);
                 if (st.tap) { dm_touch t = {0, st.tx, st.ty}; dm_touch_set(&t, 1); }
-                dm_pad_set(st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); dm_pad_set(0, 0, 0, 0, 0);
+                dm_pad_set_player(pl, st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); dm_pad_set_player(pl, 0, 0, 0, 0, 0);
                 if (st.tap) dm_touch_set(NULL, 0);
             }
         }
@@ -306,15 +311,24 @@ HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assi
 HLE_FORCE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", "swap controller ids; ignored by the host", void, h_hid_Swap, const uint32_t *a, const uint32_t *b) { (void)a; (void)b; }
 HLE_FORCE("_ZN2nn3hid21StartLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStart, void) {}
 HLE_FORCE("_ZN2nn3hid20StopLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStop, void) {}
-// Controller applet (system UI): report the connected players right away, with player 1's controller selected. ControllerSupportResultInfo = { int playerCount; uint32_t selectedId; };
-// ControllerSupportArg starts with { int8 playerCountMin, playerCountMax }: the count is capped at the maximum (a min the connected players do not reach is not waited for, as before)
-HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", "controller applet; the host reports the connected players right away",
-          Result, h_hid_ShowCtrl, int32_t *info, const int8_t *arg) {
+// Controller applet (system UI): report the connected players right away, with player 1's controller selected. ControllerSupportResultInfo = { int8 playerCount; uint32_t selectedId; }
+// (Mario Kart 8 Deluxe reads the count with ldrsb, main+0x871560). ControllerSupportArg starts with { int8 playerCountMin, playerCountMax }: the count is capped at the maximum. With
+// fewer players than the minimum the system's applet stays open until enough controllers connect or the player cancels; the host cannot wait for that, so it answers as a cancel
+// (hid 202-3101, ResultControllerSupportCanceled in yuzu's hid errors). Mario Kart 8 Deluxe's Multiplayer asks for exactly the player count chosen on its menu; answered "OK, 1 player"
+// for 2 its character selection had a panel for a player it could not drive and took no input. The applet takes the focus while it is shown (hle_applet_begin)
+#define RES_CONTROLLER_SUPPORT_CANCELED (202u | 3101u << 9)
+static Result ctrl_support(int32_t *info, const int8_t *arg) {
     int count = 0; for (int p = 0; p < DM_PLAYERS; p++) count += reported(p);
+    hle_applet_begin("the controller applet");
     if (arg && arg[1] > 0 && count > arg[1]) count = arg[1];
-    if (info) { info[0] = count; info[1] = (int32_t)connected_id(); }
-    return RES_OK;
+    Result r = arg && count < arg[0] ? RES_CONTROLLER_SUPPORT_CANCELED : RES_OK;
+    LOG("hid: controller applet for %d to %d players: %d connected%s", arg ? arg[0] : 0, arg ? arg[1] : 0, count, r ? ", too few: cancelled" : "");
+    if (info && !r) { info[0] = count; info[1] = (int32_t)connected_id(); }
+    hle_applet_end();
+    return r;
 }
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", "controller applet; the host reports the connected players right away",
+          Result, h_hid_ShowCtrl, int32_t *info, const int8_t *arg) { return ctrl_support(info, arg); }
 // Six-axis sensor (accelerometer + gyroscope) of the connected controller. SixAxisSensorState (0x60): acceleration in G, angular velocity in revolutions / s, angle in revolutions,
 // direction = the controller's three axes. At rest it lies flat: gravity (0, 0, -1), no rotation, the identity direction. While shaking (DM_BTN_SHAKE: the iPhone shaken, DmGamepad.m;
 // Space on the Mac; DM_KEYS Shake) it moves side to side, x acceleration ±SHAKE_G with a yaw of ±SHAKE_REV, in whole cycles that end where they began. Samples are 5 ms apart on the
@@ -476,7 +490,7 @@ HLE_FORCE("_ZN2nn3hid19GetPlayerLedPatternERKj", "player LED: the Switch's patte
 static void ctrl_color(uint32_t *c) { c[0] = 0xff828282u; c[1] = 0xff0f0f0fu; }
 HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj", "controller color", Result, h_hid_Color, uint32_t *c, const uint32_t *id) { (void)id; ctrl_color(c); return RES_OK; }
 HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj", "left and right Joy-Con colors", Result, h_hid_Color2, uint32_t *l, uint32_t *r, const uint32_t *id) { (void)id; ctrl_color(l); ctrl_color(r); return RES_OK; }
-HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host reports a selection right away", Result, h_hid_ShowCtrl0, const void *arg) { (void)arg; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host reports a selection right away", Result, h_hid_ShowCtrl0, const int8_t *arg) { return ctrl_support(NULL, arg); }
 HLE_FORCE("_ZN2nn3hid24ShowControllerStrapGuideEv", "strap guide applet; not shown by the host", Result, h_hid_Strap, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpdateArgE", "controller firmware update applet; not shown by the host", Result, h_hid_FwUpd, const void *arg) { (void)arg; return RES_OK; }
 
