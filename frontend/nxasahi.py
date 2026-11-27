@@ -2,7 +2,7 @@
 # nxasahi: the game library, a console-style home screen (Qt 6 / QML: frontend/qml) over frontend/library.py (games, imports, builds, launching) through
 # frontend/backend.py. Drop NSP / XCI / NSZ files on the window or press +: a base game is imported (scripts/build_ipa_from_nsp.py --platform linux, its progress on
 # the game's tile and in a card); an update or DLC joins its game and the game is built again with it. A controller drives it as the keyboard does.
-# Run it through frontend/nxasahi.sh (inside nix develop) or the installed nxasahi command. Files given on the command line are added.
+# Run it through frontend/nxasahi.sh (native Python / .venv; --nix is optional) or the installed nxasahi command. Files given on the command line are added.
 # NXASAHI_SHOT=<png> (testing): render the home screen once, write it to that file and quit; NXASAHI_SHOT_PAGE=<page>[:<title ID>] opens a page first
 import os, sys
 from pathlib import Path

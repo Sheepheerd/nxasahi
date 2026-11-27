@@ -1744,13 +1744,13 @@ def linux_arm64():
     return sys.platform.startswith('linux') and os.uname().machine in ('aarch64', 'arm64')
 
 
-def check_prereqs_linux(env, xlate):   # the dev shell (nix develop) has all of them
+def check_prereqs_linux(env, xlate):   # native dependencies (README.md), or the Nix dev shell
     missing = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)] + ([] if _importable('compression.zstd') or _importable('backports.zstd') else ['backports.zstd'])
-    if missing: raise BuildError(f'the current Python ({sys.executable}) is missing modules: {", ".join(missing)} (run inside nix develop)')
-    gone = [t for t in ('dotnet', 'zstd', 'make', 'clang', 'pkg-config') if not shutil.which(t, path=env['PATH'])]
-    if gone: raise BuildError('tools not found: ' + ', '.join(gone) + ' (run inside nix develop)')
+    if missing: raise BuildError(f'the current Python ({sys.executable}) is missing modules: {", ".join(missing)} (activate the native virtual environment, or use nix develop)')
+    gone = [t for t in ('dotnet', 'zstd', 'make', 'clang', 'ld.lld', 'ar', 'pkg-config', 'spirv-cross', 'glslangValidator') if not shutil.which(t, path=env['PATH'])]
+    if gone: raise BuildError('tools not found: ' + ', '.join(gone) + ' (see README.md for native dependencies, or use nix develop)')
     if not xlate.parent.is_dir(): raise BuildError(f'the shader translator is missing from the repository: {xlate.parent}')
-    if not linux_font_dir(): raise BuildError('no DejaVu fonts for the shared-font stand-ins: NXASAHI_FONT_DIR (set by nix develop) names their folder')
+    if not linux_font_dir(): raise BuildError('no DejaVu fonts for the shared-font stand-ins: install DejaVu Sans or set NXASAHI_FONT_DIR to their folder')
 
 
 def linux_font_dir():

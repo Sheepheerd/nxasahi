@@ -7,8 +7,11 @@ Upstream is the `upstream` remote. The port keeps the shared sources almost unch
 ## Play: the game library
 
 ```sh
-frontend/nxasahi.sh          # the game library (Qt 6 / QML), in the dev shell
+frontend/nxasahi.sh          # native Python / .venv, no Nix required
+# frontend/nxasahi.sh --nix  # optional Nix dev shell
 ```
+
+Install the [native Fedora dependencies](README.md#fedora-without-nix) first, or use the Nix alternative. The native launcher adds `~/.local/bin` to PATH and selects the active virtual environment, the checkout's `.venv`, or system Python (`NXASAHI_PYTHON` overrides the choice).
 
 Drag NSP, XCI or NSZ files onto the window (or use **+**): a base game is imported (`scripts/build_ipa_from_nsp.py --platform linux`, its progress shown as it builds, a few minutes the first time), an update or DLC joins its game and the game is built again with it. Double-click a tile to play; its menu (or a right-click) has Rebuild, Properties (language, extra environment), the save and log folders, and Remove. Preferences: the keys file (default `~/.switch/prod.keys`), language, fullscreen, sound, fast cores, shader precompile threads. The menu's **Add to App Launcher** writes a desktop entry.
 
@@ -18,12 +21,13 @@ The flake's package (`nix build`, `nix profile install`) holds the source read-o
 
 A Linux import keeps only what later steps and runs read (`prune_linux` in the script): the base game's and updates' decompressed NSZ / XCZ copies go once extracted (their keys stay, so a rebuild that reuses the extraction decompresses nothing; `need` converts again when one has to re-extract), as do the extractions and rewritten modules of versions the build no longer uses, the SPIR-V of other chain versions and the translation's intermediates (the host reads `<key>.vk.spv`, `.vkb` and `.job.json`). The shader cache stage deletes the game's older folders in `~/.cache/nxasahi/vkshaders`. The build-ID lookup keeps the IDs it read (`<id>_survey/build_id_lookup.json`).
 
-The same import from a terminal, for one game's folder of NSPs: `python3 scripts/build_ipa_from_nsp.py <folder> -k ~/.switch/prod.keys --platform linux` (inside `nix develop`); it ends with the command that runs the game and writes `<id>_build/linux_game.json`. NVN games only so far, and not those whose shaders are captured or decoded at run time (the Mac host boots them for that).
+The same import from a terminal, for one game's folder of NSPs: `python3 scripts/build_ipa_from_nsp.py <folder> -k ~/.switch/prod.keys --platform linux` (activate `.venv` and add `~/.local/bin` to PATH, or use `nix develop`); it ends with the command that runs the game and writes `<id>_build/linux_game.json`. NVN games only so far, and not those whose shaders are captured or decoded at run time (the Mac host boots them for that).
 
 ## Build
 
 ```sh
-nix develop                                   # clang, lld, Python with lz4/capstone/fonttools, .NET 10, SPIRV-Cross, glslang, SDL3, Vulkan
+source .venv/bin/activate                    # after the native Fedora setup; alternatively: nix develop
+export PATH="$HOME/.local/bin:$PATH"
 cd dm/host
 make -f Makefile.linux GAME=010015100B514000  # the host, for one game profile
 make -f Makefile.linux linux-tests            # tests of the Linux layer
@@ -33,7 +37,7 @@ Modules must be rewritten for the Linux host: set `DM_THREAD_REG=tpidr_el0` when
 
 ## Run a game headless
 
-Keys in `~/.switch/prod.keys`; one game's NSPs in their own folder (here `~/Games/MarioWonder`), with the work folder `<id>-work` beside them. Inside `nix develop`, from the repository root:
+Keys in `~/.switch/prod.keys`; one game's NSPs in their own folder (here `~/Games/MarioWonder`), with the work folder `<id>-work` beside them. With the native virtual environment activated and `~/.local/bin` on PATH (or inside `nix develop`), from the repository root:
 
 ```sh
 W=~/Games/MarioWonder/010015100B514000-work
@@ -41,7 +45,7 @@ dotnet build dm/tools/nx_extract -c Release -o $W/tools/nx_extract
 $W/tools/nx_extract/nx_extract ~/.switch/prod.keys ~/Games/MarioWonder/*.nsp - $W/data/v0      # - = no update NSP
 for m in main sdk; do DM_GAME=010015100B514000 DM_THREAD_REG=tpidr_el0 python3 dm/tools/patch_nso.py $W/data/v0/ExeFS/$m $W/build/patched_v0 $m; done
 # Fonts: the Mac tools read macOS fonts; DejaVu Sans stands in (English text; CJK needs another font)
-D=$(nix build --no-link --print-out-paths nixpkgs#dejavu_fonts)/share/fonts/truetype
+D=${NXASAHI_FONT_DIR:-/usr/share/fonts/dejavu-sans-fonts}  # Fedora; Nix sets NXASAHI_FONT_DIR
 python3 dm/tools/make_ext_font.py $W/font/nintendo_ext.ttf $D/DejaVuSans-Bold.ttf && cp $D/DejaVuSans.ttf $W/font/standard.ttf
 mkdir -p $W/run/save $W/run/temp
 DM_ROMFS=$W/data/v0/RomFS DM_SAVE=$W/run/save DM_TEMP=$W/run/temp DM_FONT_DIR=$W/font DM_LANG=en-US \
@@ -87,6 +91,7 @@ Add `DM_WINDOW=1` for a window (Vulkan presentation; on NixOS `VK_DRIVER_FILES=/
 - [ ] Milestone 3: SDL3 front end
   - [x] Window, keyboard and controllers (`linux/front_sdl.c`), mapped as the Mac front end: W A S D left stick, J K U I → A B X Y, F G stick presses, Q E Z C → L R ZL ZR, Return / Tab → + / −, arrows d-pad, Space shake; SDL gamepads one player each, buttons by position. Mario Wonder goes from the title through user select and New Game to character select (3D models render) with scripted input (`DM_KEYS`)
   - [x] Audio: the AudioUnit subset `hle_audio.c` uses, on SDL3 audio (`linux/audiounit_sdl.c`; PipeWire, PulseAudio or ALSA through SDL): the render callback pulled by SDL's stream callback, 5 ms device buffers. On by default (`DM_AUDIO=0` for the silent sink); without a device the silent sink stands in and the watchdog retries. Mario Wonder: no underruns
+- [x] Shader-import filename parsing no longer copies/splits entire SARC archive tails per member ([reader fix and validation](docs/reference/shaders.md#sarc-filename-scans-copy-the-archive-tail)); the optimized full-game split has not been rerun yet.
 - [x] Packing script: `--platform linux` (SPIR-V shaders, the Linux host per game, DejaVu stand-ins for the shared fonts, `linux_game.json`)
 - [x] Game library front end (`frontend/nxasahi.py`): drag and drop import with progress, updates and DLC, tiles, properties, preferences
 - [x] Console-style library on Qt 6 / QML (`frontend/qml`, `frontend/backend.py`): a home screen that a controller, the keyboard or the mouse drives; replaces GTK 4 / libadwaita

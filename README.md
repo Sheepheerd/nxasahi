@@ -48,7 +48,44 @@ nxnative's [games table](dm/games/README.md#games) lists the 70-odd games that r
 
 ## Install
 
-You need Asahi Linux (or another Linux on Apple silicon with the Asahi Mesa drivers) and [Nix](https://nixos.org/download) with flakes enabled. nxasahi is one Nix package: the game library, the import tools and everything they run.
+You need Asahi Linux (or another Linux on Apple silicon with the Asahi Mesa drivers). Use the native Fedora setup below, or the optional Nix package. Put your keys in `~/.switch/prod.keys`, or choose another path in the library's Settings.
+
+### Fedora (without Nix)
+
+From a source checkout (`git clone https://github.com/Sheepheerd/nxasahi.git && cd nxasahi`):
+
+```sh
+sudo dnf install \
+  git clang lld llvm gcc-c++ binutils make cmake ninja-build \
+  pkgconf-pkg-config libdispatch-devel SDL3-devel \
+  vulkan-loader-devel vulkan-headers vulkan-tools vulkan-validation-layers \
+  libglvnd-devel libavcodec-free-devel libavutil-free-devel libswscale-free-devel \
+  dotnet-sdk-10.0 python3 python3-devel python3-pip \
+  python3-lz4 python3-capstone python3-fonttools python3-pyside6 \
+  qt6-qtdeclarative qt6-qtwayland qt6-qtsvg \
+  dejavu-sans-fonts zstd glslang spirv-tools
+
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install nsz  # optional: only NSZ / XCZ inputs need it
+scripts/build_spirv_cross.sh       # builds a pinned release into ~/.local/bin
+frontend/nxasahi.sh
+```
+
+These package names are for Fedora 44 ARM64. `libdispatch-devel` supplies `Block.h` and BlocksRuntime; the host uses its own dispatch compatibility layer. SPIRV-Cross is not in the checked Fedora/Aurora repositories, so the build script installs just its executable, without replacing any system libraries or Mesa drivers. It needs network access and uses a temporary build directory; `CMAKE_BUILD_PARALLEL_LEVEL` sets its job count (default 4). An absolute install prefix can be passed as its first argument.
+
+The launcher does not invoke Nix by default. It uses `NXASAHI_PYTHON` when set, otherwise an active virtual environment, the checkout's `.venv`, or system Python, in that order. It adds `~/.local/bin` to PATH, and imports and host builds inherit the selected Python. **Add to App Launcher** in Settings uses the same native launcher. For command-line imports, activate `.venv` and include `~/.local/bin` in PATH:
+
+```sh
+source .venv/bin/activate
+export PATH="$HOME/.local/bin:$PATH"
+python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/.switch/prod.keys --platform linux
+```
+
+The first build restores the extractor's NuGet dependency over the network. The FFmpeg libraries must provide H.264 and AAC decoders for movies; availability depends on the distribution's codec packages.
+
+### Nix (alternative)
+
+With [Nix](https://nixos.org/download) and flakes enabled, nxasahi is one package: the game library, the import tools and everything they run.
 
 ```sh
 nix profile install github:Sheepheerd/nxasahi/main   # installs the nxasahi command and its app launcher entry
@@ -57,16 +94,7 @@ nix run github:Sheepheerd/nxasahi/main               # or try it without install
 
 On NixOS you can add it to your system flake instead: take `github:Sheepheerd/nxasahi/main` as an input and put `inputs.nxasahi.packages.aarch64-linux.default` in `environment.systemPackages`.
 
-The first import of a game compiles that game's host. The package brings the compiler with it; what it builds goes to `~/.local/share/nxasahi/build` (`NXASAHI_STATE` moves it).
-
-Put your keys in `~/.switch/prod.keys`, or choose another path in the library's Preferences.
-
-**From source** (to work on nxasahi): clone the repository and run the library from it, in the dev shell, which has the same tools and the .NET SDK:
-
-```sh
-git clone https://github.com/Sheepheerd/nxasahi.git && cd nxasahi
-frontend/nxasahi.sh  # enters nix develop and starts the library; `nix build` builds the package
-```
+The first import of a game compiles that game's host. The package brings the compiler with it; what it builds goes to `~/.local/share/nxasahi/build` (`NXASAHI_STATE` moves it). From a source checkout, `frontend/nxasahi.sh --nix` explicitly enters the dev shell and starts the library; `nix build` builds the package.
 
 If you use [direnv](https://direnv.net), `direnv allow` loads the shell whenever you enter the folder.
 

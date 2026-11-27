@@ -408,6 +408,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 
 ## Shaders
 
+- `shader_split.py` appears stalled on large nested archives, its log stays empty, one worker uses a full CPU core and other workers wait; stack samples repeatedly show `sarc_members`. → [SARC filename scans copy the archive tail](../reference/shaders.md#sarc-filename-scans-copy-the-archive-tail)
 - `shader_split.py` finds 0 shaders in a RomFS of zstd files named `.zst`. → [Zstd files recognised by their magic](../reference/shaders.md#zstd-files-recognised-by-their-magic)
 - the game asks for shaders the map does not have (`[RED] shader ... is not in the shader map`, hundreds of lines), and the split finds far fewer shaders than the game uses (121 against 27,288 on Kirby and the Forgotten Land). → [HAL's `.cmp` containers: a size-prefixed frame](../reference/shaders.md#hals-cmp-containers-a-size-prefixed-frame)
 - a provisional split finds only a fraction of the shaders (3,126 of Pokémon Sword's 41,516). → [BNSH entries of GFPAK archives](../reference/shaders.md#bnsh-entries-of-gfpak-archives)

@@ -176,7 +176,7 @@ class DeriveProfile(Base):
         self.derive(); g = game.Game(self.pdir); before = g.table('game.tsv').read_bytes()
         logs = self.tmp / 'logs'; logs.mkdir()
         def boot(*args): (logs / 'heap_check.log').write_text('>>> nnMain\n'); return 0
-        with mock.patch.object(nsp, 'build_mac_host'), mock.patch.object(nsp, 'boot_mac', side_effect=boot), \
+        with mock.patch.object(nsp, 'build_mac_host'), mock.patch.object(nsp, 'build_linux_host'), mock.patch.object(nsp, 'boot_mac', side_effect=boot), \
              mock.patch.object(nsp.pg, 'heap_signals', return_value={}), mock.patch.object(nsp.os, 'replace', side_effect=OSError('interrupted replace')):
             with self.assertRaisesRegex(OSError, 'interrupted replace'):
                 nsp.heap_check(REPO, self.ex, self.tmp / 'patched', self.tmp / 'work', {}, logs, g)

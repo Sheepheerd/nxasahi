@@ -184,6 +184,8 @@ Before publishing, the fixes were integrated with main's pipeline archive and GP
 
 ## Found on this game
 
+- **Resolved in the reader; full-game retest pending:** the 1.0.0 shader split appeared stalled on Linux while one worker repeatedly copied/split archive tails to read SARC filenames. The [general SARC filename optimization](../../../docs/reference/shaders.md#sarc-filename-scans-copy-the-archive-tail) is covered by synthetic correctness and performance checks; no new gameplay validation is claimed.
+
 General host changes first needed here; each applies to every game:
 
 - **Resolved: on Linux the 3D scene was flat and dark** (1.9.0, the Shrine of Resurrection): the G-buffer attaches the albedo twice and the Linux replay stored the unwritten copy over it: [Linux: the same texture attached at two colour slots](../../../docs/reference/rendering.md#linux-the-same-texture-attached-at-two-colour-slots).

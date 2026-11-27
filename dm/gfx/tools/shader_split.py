@@ -1598,9 +1598,17 @@ def sarc_members(d):
     hl, bom, size, doff = struct.unpack_from('<HHII', d, 4)
     n = struct.unpack_from('<H', d, hl + 6)[0]
     names = hl + 12 + 16 * n + 8
+    if not names <= doff <= len(d): raise ValueError('SARC: invalid filename table bounds')
     for i in range(n):
         h, attr, s, e = struct.unpack_from('<IIII', d, hl + 12 + 16 * i)
-        nm = d[names + (attr & 0xffffff) * 4:].split(b'\0')[0].decode('utf-8', 'replace') if attr >> 24 else f'#{i}'
+        nm = f'#{i}'
+        if attr >> 24:
+            start = names + (attr & 0xffffff) * 4
+            if start >= doff: raise ValueError(f'SARC member {i}: filename offset outside the name table')
+            # Search the original buffer: slicing and splitting its whole tail per name copies the archive repeatedly.
+            end = d.find(b'\0', start, doff)
+            if end < 0: raise ValueError(f'SARC member {i}: unterminated filename in the name table')
+            nm = d[start:end].decode('utf-8', 'replace')
         yield nm, d[doff + s:doff + e]
 
 NV_STAGES = ['vs', 'ps', 'gs', 'hs', 'ds', 'cs']   # NVN stage order

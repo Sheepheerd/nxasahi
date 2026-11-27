@@ -222,7 +222,8 @@ class PassthroughCompiler(unittest.TestCase):
                                       geometry=dict(layout, stride=res['geometry_stride']))
                     (work / f'pass{t}.json').write_text(json.dumps(reflection))
                     metal = work / f'pass{t}.metal'; metal.write_text(src)
-                    for sdk in ('macosx', 'iphoneos'):
+                    # Translation and reflection above are portable; only the Metal compile needs Xcode.
+                    for sdk in (('macosx', 'iphoneos') if shutil.which('xcrun') else ()):
                         air = work / f'pass{t}.{sdk}.air'
                         r = subprocess.run(['xcrun', '-sdk', sdk, 'metal', '-fmodules-cache-path=' + d + '/modules',
                                             '-c', str(metal), '-o', str(air)], capture_output=True, text=True)
